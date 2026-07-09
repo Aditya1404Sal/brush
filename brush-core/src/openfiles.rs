@@ -302,6 +302,109 @@ impl std::io::Write for OpenFile {
     }
 }
 
+/// An in-memory pipe for connecting pipeline stages on `wasm32-wasip2`, where `std::io::pipe()` is
+/// unsupported ("operation not supported on this platform"). Both halves are [`OpenFile::Stream`]s
+/// sharing one buffer; the writer half appends, the reader half drains. EOF is signalled when every
+/// writer clone has been dropped (`writer_count == 0`).
+///
+/// This is sound for shells that run each pipeline stage synchronously to completion in start order
+/// (as brush does on wasm, where there are no threads and stages can't be spawned): stage N writes
+/// its full output before stage N+1 reads, so the reader never blocks on unwritten data. It is NOT a
+/// streaming pipe — the whole intermediate stream is buffered — which is acceptable when stages are
+/// synchronous but not for truly concurrent producers/consumers.
+#[cfg(target_family = "wasm")]
+struct InMemoryPipeInner {
+    buf: std::collections::VecDeque<u8>,
+    writer_count: usize,
+}
+
+/// The write end of an [`in_memory_pipe`]. Appends to the shared buffer; reads yield EOF.
+#[cfg(target_family = "wasm")]
+struct InMemoryPipeWriter(Arc<std::sync::Mutex<InMemoryPipeInner>>);
+
+/// The read end of an [`in_memory_pipe`]. Drains the shared buffer; EOF once all writers are dropped.
+#[cfg(target_family = "wasm")]
+struct InMemoryPipeReader(Arc<std::sync::Mutex<InMemoryPipeInner>>);
+
+#[cfg(target_family = "wasm")]
+impl std::io::Write for InMemoryPipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().buf.extend(buf.iter().copied());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl std::io::Read for InMemoryPipeWriter {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(0) // a writer half is never read
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl Stream for InMemoryPipeWriter {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        // A new writer handle: bump the writer count so EOF is only reached once all are dropped.
+        self.0.lock().unwrap().writer_count += 1;
+        Box::new(InMemoryPipeWriter(Arc::clone(&self.0)))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl Drop for InMemoryPipeWriter {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock().unwrap();
+        inner.writer_count = inner.writer_count.saturating_sub(1);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl std::io::Read for InMemoryPipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut inner = self.0.lock().unwrap();
+        let n = std::cmp::min(buf.len(), inner.buf.len());
+        for slot in buf.iter_mut().take(n) {
+            *slot = inner.buf.pop_front().unwrap();
+        }
+        // n == 0 with data still to come would be a spurious EOF, but on wasm all writers finish
+        // before the reader runs, so an empty buffer means end-of-stream (writer_count is 0 here).
+        Ok(n)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl std::io::Write for InMemoryPipeReader {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len()) // a reader half is never written
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl Stream for InMemoryPipeReader {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        Box::new(InMemoryPipeReader(Arc::clone(&self.0)))
+    }
+}
+
+/// Create an in-memory pipe as a `(reader, writer)` pair of [`OpenFile::Stream`]s, for connecting
+/// pipeline stages on wasm where `std::io::pipe()` is unsupported. See [`InMemoryPipeInner`].
+#[cfg(target_family = "wasm")]
+pub(crate) fn in_memory_pipe() -> (OpenFile, OpenFile) {
+    let inner = Arc::new(std::sync::Mutex::new(InMemoryPipeInner {
+        buf: std::collections::VecDeque::new(),
+        writer_count: 1,
+    }));
+    let reader = OpenFile::Stream(Box::new(InMemoryPipeReader(Arc::clone(&inner))));
+    let writer = OpenFile::Stream(Box::new(InMemoryPipeWriter(inner)));
+    (reader, writer)
+}
+
 /// Tristate representing the an `OpenFile` entry in an `OpenFiles` structure.
 pub enum OpenFileEntry<'a> {
     /// File descriptor is present and has a valid associated `OpenFile`.

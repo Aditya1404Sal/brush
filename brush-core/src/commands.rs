@@ -433,13 +433,31 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     ) -> Result<ExecutionSpawnResult, error::Error> {
         match self.shell {
             ShellForCommand::OwnedShell { target, .. } => {
-                Ok(Self::execute_via_builtin_in_owned_shell(
-                    *target,
-                    self.params,
-                    builtin,
-                    self.command_name,
-                    self.args,
-                ))
+                // On wasm there are no threads, so `spawn_blocking` (used by the owned-shell path)
+                // can't run. Run the builtin inline to completion instead and return `Completed`.
+                // This is correct for pipeline stages because wasm executes them synchronously in
+                // order; the isolation of a cloned (owned) shell is preserved.
+                #[cfg(target_family = "wasm")]
+                {
+                    Self::execute_via_builtin_in_owned_shell_inline(
+                        *target,
+                        self.params,
+                        builtin,
+                        self.command_name,
+                        self.args,
+                    )
+                    .await
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Ok(Self::execute_via_builtin_in_owned_shell(
+                        *target,
+                        self.params,
+                        builtin,
+                        self.command_name,
+                        self.args,
+                    ))
+                }
             }
             ShellForCommand::ParentShell(..) => {
                 self.execute_via_builtin_in_parent_shell(builtin).await
@@ -447,6 +465,29 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         }
     }
 
+    /// wasm-only: run an owned-shell builtin inline to completion (no `spawn_blocking`, which needs
+    /// an OS thread that wasip2 lacks) and return a `Completed` result.
+    #[cfg(target_family = "wasm")]
+    async fn execute_via_builtin_in_owned_shell_inline(
+        mut shell: Shell<SE>,
+        params: ExecutionParameters,
+        builtin: builtins::Registration<SE>,
+        command_name: String,
+        args: Vec<CommandArg>,
+    ) -> Result<ExecutionSpawnResult, error::Error> {
+        let last_arg = Self::take_last_arg(&args);
+        let cmd_context = ExecutionContext {
+            shell: &mut shell,
+            command_name,
+            params,
+        };
+        let result = execute_builtin_command(&builtin, cmd_context, args).await?;
+        // Update $_ after command execution.
+        shell.update_last_arg_variable(last_arg);
+        Ok(ExecutionSpawnResult::Completed(result))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn execute_via_builtin_in_owned_shell(
         mut shell: Shell<SE>,
         params: ExecutionParameters,

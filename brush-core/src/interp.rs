@@ -461,9 +461,17 @@ async fn spawn_pipeline_processes(
         pipe_writers.reserve_exact(pipeline_len - 1);
 
         for _ in 0..(pipeline_len - 1) {
-            let (reader, writer) = std::io::pipe()?;
-            pipe_readers.push(Some(reader.into()));
-            pipe_writers.push(Some(writer.into()));
+            // `std::io::pipe()` is unsupported on wasm32-wasip2; use an in-memory pipe there. Safe
+            // because wasm runs each stage synchronously to completion in order (see `in_memory_pipe`).
+            #[cfg(not(target_family = "wasm"))]
+            let (reader, writer): (openfiles::OpenFile, openfiles::OpenFile) = {
+                let (r, w) = std::io::pipe()?;
+                (r.into(), w.into())
+            };
+            #[cfg(target_family = "wasm")]
+            let (reader, writer) = openfiles::in_memory_pipe();
+            pipe_readers.push(Some(reader));
+            pipe_writers.push(Some(writer));
         }
         // Push `None` to the readers; it will be popped off by the *first* command, which will
         // mean that command gets its stdin from the execution parameters' current stdin.
