@@ -812,27 +812,48 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     let mut params = params.clone();
     params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
 
-    // Set up pipe so we can read the output.
-    let (reader, writer) = std::io::pipe()?;
-    params.set_fd(OpenFiles::STDOUT_FD, writer.into());
+    // On wasm32 (wasip2): `std::io::pipe()` is unsupported and the single-threaded runtime has no
+    // blocking pool for the concurrent spawn-then-read below. Reuse the in-memory pipe and run the
+    // substitution *inline to completion* first — dropping its params drops the pipe writer, so
+    // the buffered output can then be drained with a clean EOF. Mirrors the inline-sequential
+    // pipeline design in `execute_via_builtin_in_owned_shell`/`spawn_pipeline_processes`.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let (mut reader, writer) = openfiles::open_mem_pipe();
+        params.set_fd(OpenFiles::STDOUT_FD, writer);
 
-    let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
+        let cmd_result = run_substitution_command(subshell, params, s).await?;
+        shell.set_last_exit_status(cmd_result.exit_code.into());
 
-    let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
+        let mut output_str = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut output_str)?;
+        Ok(output_str)
+    }
 
-    let output_str = async_reader.read_to_string().await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Set up pipe so we can read the output.
+        let (reader, writer) = std::io::pipe()?;
+        params.set_fd(OpenFiles::STDOUT_FD, writer.into());
 
-    // Now observe the command's completion.
-    let run_result = cmd_join_handle.await?;
-    let cmd_result = run_result?;
+        let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
 
-    // Store the status.
-    shell.set_last_exit_status(cmd_result.exit_code.into());
+        let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
 
-    // Note: $_ is naturally isolated from the parent because we cloned the
-    // shell to run the substitution.
+        let output_str = async_reader.read_to_string().await?;
 
-    Ok(output_str)
+        // Now observe the command's completion.
+        let run_result = cmd_join_handle.await?;
+        let cmd_result = run_result?;
+
+        // Store the status.
+        shell.set_last_exit_status(cmd_result.exit_code.into());
+
+        // Note: $_ is naturally isolated from the parent because we cloned the
+        // shell to run the substitution.
+
+        Ok(output_str)
+    }
 }
 
 async fn run_substitution_command(
