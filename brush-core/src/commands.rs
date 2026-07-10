@@ -432,13 +432,24 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     ) -> Result<ExecutionSpawnResult, error::Error> {
         match self.shell {
             ShellForCommand::OwnedShell { target, .. } => {
-                Ok(Self::execute_via_builtin_in_owned_shell(
+                #[cfg(not(target_arch = "wasm32"))]
+                let spawn_result = Self::execute_via_builtin_in_owned_shell(
                     *target,
                     self.params,
                     builtin,
                     self.command_name,
                     self.args,
-                ))
+                );
+                #[cfg(target_arch = "wasm32")]
+                let spawn_result = Self::execute_via_builtin_in_owned_shell(
+                    *target,
+                    self.params,
+                    builtin,
+                    self.command_name,
+                    self.args,
+                )
+                .await?;
+                Ok(spawn_result)
             }
             ShellForCommand::ParentShell(..) => {
                 self.execute_via_builtin_in_parent_shell(builtin).await
@@ -446,6 +457,13 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         }
     }
 
+    /// Runs an owned-shell builtin stage. Natively this offloads to a blocking task and returns a
+    /// `StartedTask` so pipeline stages run concurrently on real threads. On `wasm32` there is no
+    /// thread pool and a builtin's synchronous I/O cannot yield the single-threaded reactor, so the
+    /// stage is run to completion *inline* (in pipeline order) and returned as `Completed`; the
+    /// upstream stage thus finishes and drops its in-memory pipe writer before the downstream stage
+    /// reads, giving the reader a clean end-of-stream (see `openfiles::open_mem_pipe`).
+    #[cfg(not(target_arch = "wasm32"))]
     fn execute_via_builtin_in_owned_shell(
         mut shell: Shell<SE>,
         params: ExecutionParameters,
@@ -471,6 +489,32 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         });
 
         ExecutionSpawnResult::StartedTask(join_handle)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn execute_via_builtin_in_owned_shell(
+        mut shell: Shell<SE>,
+        params: ExecutionParameters,
+        builtin: builtins::Registration<SE>,
+        command_name: String,
+        args: Vec<CommandArg>,
+    ) -> Result<ExecutionSpawnResult, error::Error> {
+        let last_arg = Self::take_last_arg(&args);
+        let cmd_context = ExecutionContext {
+            shell: &mut shell,
+            command_name,
+            params,
+        };
+
+        let result = execute_builtin_command(&builtin, cmd_context, args).await;
+
+        // Update $_ after command execution (mirrors the native path, which does this regardless of
+        // the builtin's success).
+        shell.update_last_arg_variable(last_arg);
+
+        // Propagate errors the same way the native `StartedTask` does: the error surfaces when the
+        // pipeline waits on this stage, not swallowed into a `Completed` result.
+        Ok(ExecutionSpawnResult::Completed(result?))
     }
 
     async fn execute_via_builtin_in_parent_shell(
