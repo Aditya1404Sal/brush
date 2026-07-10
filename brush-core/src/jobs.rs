@@ -57,7 +57,15 @@ impl JobTask {
                     processes::ProcessWaitResult::Stopped => Ok(JobTaskWaitResult::Stopped),
                 }
             }
-            Self::Internal(handle) => Ok(JobTaskWaitResult::Completed(handle.await??)),
+            Self::Internal(handle) => match handle.await {
+                Ok(r) => Ok(JobTaskWaitResult::Completed(r?)),
+                // An aborted task is a synthetically killed job: report the conventional
+                // 128+SIGKILL status instead of bubbling a join error.
+                Err(e) if e.is_cancelled() => {
+                    Ok(JobTaskWaitResult::Completed(ExecutionResult::new(137)))
+                }
+                Err(e) => Err(e.into()),
+            },
         }
     }
 
@@ -71,10 +79,14 @@ impl JobTask {
                 let check_result = process.poll();
                 check_result.map(|polled_result| polled_result.map(|output| output.into()))
             }
-            Self::Internal(handle) => {
-                let checkable_handle = handle;
-                checkable_handle.now_or_never().and_then(|r| r.ok())
-            }
+            Self::Internal(handle) => match handle.now_or_never() {
+                Some(Ok(inner)) => Some(inner),
+                // A cancelled (aborted) task must still be reapable: report it as killed rather
+                // than pending forever.
+                Some(Err(e)) if e.is_cancelled() => Some(Ok(ExecutionResult::new(137))),
+                // Panicked task: preserve the existing best-effort behavior.
+                Some(Err(_)) | None => None,
+            },
         }
     }
 }
@@ -103,7 +115,9 @@ impl JobManager {
             }
         }
 
-        let id = self.jobs.len() + 1;
+        // Allocate above the highest live id — `len() + 1` collides once jobs are removed out of
+        // order (kill %1 while job 2 lives → the next job would also get id 2).
+        let id = self.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
         job.id = id;
         job.annotation = JobAnnotation::Current;
         self.jobs.push(job);
@@ -420,6 +434,20 @@ impl Job {
         }
 
         Ok(())
+    }
+
+    /// Aborts the job's internal async tasks — the synthetic `kill` on targets with no real
+    /// processes. Each `JobTask::Internal` future is dropped at its next await point (or never
+    /// polled at all if it hadn't started); the task then reports as killed (exit 137) through
+    /// [`JobTask::wait`]/[`JobTask::poll`]. External-process tasks are untouched (use
+    /// [`Job::kill`] for those).
+    pub fn abort(&mut self) {
+        for task in &self.tasks {
+            if let JobTask::Internal(handle) = task {
+                handle.abort();
+            }
+        }
+        self.state = JobState::Done;
     }
 
     /// Kills the job.

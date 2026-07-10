@@ -1,7 +1,10 @@
 use clap::Parser;
+#[cfg(unix)]
 use std::{borrow::Cow, os::unix::process::CommandExt};
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
+use brush_core::{ExecutionResult, builtins};
+#[cfg(unix)]
+use brush_core::{ErrorKind, ExecutionExitCode, commands};
 
 /// Exec the provided command.
 #[derive(Parser)]
@@ -58,26 +61,48 @@ impl builtins::Command for ExecCommand {
             return cmd_cmd.execute(context).await;
         }
 
-        let mut argv0 = Cow::Borrowed(self.name_for_argv0.as_ref().unwrap_or(&self.args[0]));
+        // wasm32: there is no execve and no real process image to replace. Emulate the observable
+        // semantics — run the command in-shell, then exit the shell with its status — via the same
+        // `command` delegation the subshell path uses, followed by an ExitShell control flow.
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
+                return brush_core::error::unimp("exec options are not supported on this platform");
+            }
 
-        if self.exec_as_login {
-            argv0 = Cow::Owned(std::format!("-{argv0}"));
+            let cmd_cmd = crate::command::CommandCommand {
+                command_and_args: self.args.clone(),
+                ..Default::default()
+            };
+
+            let mut result = cmd_cmd.execute(context).await?;
+            result.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
+            Ok(result)
         }
 
-        let mut cmd = commands::compose_std_command(
-            &context,
-            &self.args[0],
-            argv0.as_str(),
-            &self.args[1..],
-            self.empty_environment,
-        )?;
+        #[cfg(unix)]
+        {
+            let mut argv0 = Cow::Borrowed(self.name_for_argv0.as_ref().unwrap_or(&self.args[0]));
 
-        let exec_error = cmd.exec();
+            if self.exec_as_login {
+                argv0 = Cow::Owned(std::format!("-{argv0}"));
+            }
 
-        if exec_error.kind() == std::io::ErrorKind::NotFound {
-            Ok(ExecutionExitCode::NotFound.into())
-        } else {
-            Err(ErrorKind::from(exec_error).into())
+            let mut cmd = commands::compose_std_command(
+                &context,
+                &self.args[0],
+                argv0.as_str(),
+                &self.args[1..],
+                self.empty_environment,
+            )?;
+
+            let exec_error = cmd.exec();
+
+            if exec_error.kind() == std::io::ErrorKind::NotFound {
+                Ok(ExecutionExitCode::NotFound.into())
+            } else {
+                Err(ErrorKind::from(exec_error).into())
+            }
         }
     }
 }

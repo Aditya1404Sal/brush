@@ -38,7 +38,7 @@ mod echo;
 mod enable;
 #[cfg(feature = "builtin.eval")]
 mod eval;
-#[cfg(all(feature = "builtin.exec", unix))]
+#[cfg(all(feature = "builtin.exec", any(unix, target_arch = "wasm32")))]
 mod exec;
 #[cfg(feature = "builtin.exit")]
 mod exit;
