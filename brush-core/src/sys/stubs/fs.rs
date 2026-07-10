@@ -24,20 +24,40 @@ pub fn get_default_standard_utils_paths() -> Vec<std::path::PathBuf> {
     vec![]
 }
 
-/// Opens a null file that will discard all I/O.
+/// The regular file backing the emulated `/dev/null`. Kept under /tmp (created on demand — a
+/// fresh wasm guest may have an empty writable fs) and hidden, so it never surfaces as a real
+/// `/dev` tree the platform doesn't actually have.
+const NULL_BACKING_PATH: &str = "/tmp/.brush-null";
+
+/// Opens a null-like file backed by a truncate-on-open regular file.
 ///
-/// This is a stub implementation that returns an error.
+/// There are no device nodes on this platform, so `/dev/null` is emulated: every open sees an
+/// empty file (reads yield EOF) and bytes written are discarded by the next open. Not
+/// byte-for-byte `/dev/null` (bytes exist until the next open), but the redirect semantics
+/// (`> /dev/null`, `2>/dev/null`, `< /dev/null`) hold.
 pub fn open_null_file() -> Result<std::fs::File, error::Error> {
-    Err(error::ErrorKind::NotSupportedOnThisPlatform("opening null file").into())
+    let _ = std::fs::create_dir_all("/tmp");
+    let f = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(NULL_BACKING_PATH)?;
+    Ok(f)
 }
 
 /// Gives the platform an opportunity to handle a special file path (e.g. `/dev/null`).
-//
-// This is a stub implementation that returns no result.
+///
+/// `/dev/null` maps to the emulated null file (see [`open_null_file`]); `/dev/stdin` and friends
+/// are already handled upstream by the shell's fd-path resolution.
 pub fn try_open_special_file(
-    _path: &std::path::Path,
+    path: &std::path::Path,
 ) -> Option<Result<std::fs::File, std::io::Error>> {
-    None
+    if path == std::path::Path::new("/dev/null") {
+        Some(open_null_file().map_err(std::io::Error::other))
+    } else {
+        None
+    }
 }
 
 /// Returns the path to the system-wide shell profile script.
