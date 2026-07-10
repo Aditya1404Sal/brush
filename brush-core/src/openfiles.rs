@@ -302,6 +302,172 @@ impl std::io::Write for OpenFile {
     }
 }
 
+/// An in-memory, single-thread pipe used to connect pipeline stages on `wasm32` targets, where
+/// `std::io::pipe()` is unsupported ("operation not supported on this platform") and there is no
+/// blocking thread pool to run stages concurrently.
+///
+/// On `wasm32` each non-last pipeline stage runs to completion *inline* and in order (see
+/// `spawn_pipeline_processes`), so the upstream stage always finishes — and drops its writer — before
+/// the downstream stage reads. That means the reader never has to block on not-yet-produced data:
+/// it either finds bytes buffered or observes end-of-stream (all writers dropped). The buffer is
+/// unbounded because there is no concurrent consumer to back-pressure against; it holds one stage's
+/// full output until the next stage drains it. This is correct for any finite pipeline.
+///
+/// The adapter is pure in-memory logic (no wasm-specific APIs), so it also compiles under `cfg(test)`
+/// to be unit-tested natively; only its *use* in the pipeline wiring is `wasm32`-only.
+#[cfg(any(target_arch = "wasm32", test))]
+mod mem_pipe {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// The shared state behind a memory pipe: the byte buffer plus a count of live writer handles.
+    /// End-of-stream is "buffer drained and no writers remain", so the count — not the `Arc`
+    /// strong count (the reader keeps the `Arc` alive) — is what signals EOF.
+    struct Inner {
+        buf: VecDeque<u8>,
+        writers: usize,
+    }
+
+    /// Locks the shared state, recovering from a poisoned mutex: the state is a byte buffer and a
+    /// counter, always left consistent between statements, so a panic elsewhere while holding
+    /// the lock cannot have left it half-updated.
+    fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+        inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The write half. Cloning bumps the live-writer count; dropping decrements it, and reaching
+    /// zero is the EOF signal to the reader.
+    pub(super) struct MemPipeWriter(Arc<Mutex<Inner>>);
+
+    /// The read half. Drains the shared buffer; reports EOF once the buffer is empty and every
+    /// writer handle has been dropped.
+    pub(super) struct MemPipeReader(Arc<Mutex<Inner>>);
+
+    /// Creates a connected (reader, writer) pair sharing one in-memory buffer.
+    pub(super) fn pipe() -> (MemPipeReader, MemPipeWriter) {
+        let inner = Arc::new(Mutex::new(Inner {
+            buf: VecDeque::new(),
+            writers: 1,
+        }));
+        (MemPipeReader(Arc::clone(&inner)), MemPipeWriter(inner))
+    }
+
+    impl Clone for MemPipeWriter {
+        fn clone(&self) -> Self {
+            lock(&self.0).writers += 1;
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    impl Drop for MemPipeWriter {
+        fn drop(&mut self) {
+            lock(&self.0).writers -= 1;
+        }
+    }
+
+    impl std::io::Write for MemPipeWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).buf.extend(data.iter().copied());
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A writer is never read from; surface an EOF rather than an error so generic `copy` loops end.
+    impl std::io::Read for MemPipeWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl super::Stream for MemPipeWriter {
+        fn clone_box(&self) -> Box<dyn super::Stream> {
+            Box::new(self.clone())
+        }
+
+        // An in-memory pipe has no OS descriptor to materialize. These are never invoked on the
+        // wasm pipeline path (they are `#[cfg(unix)]`); implemented for native testability, matching
+        // `FailingReaderWriter`.
+        #[cfg(unix)]
+        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, super::error::Error> {
+            Err(super::error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+
+        #[cfg(unix)]
+        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, super::error::Error> {
+            Err(super::error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+    }
+
+    impl Clone for MemPipeReader {
+        fn clone(&self) -> Self {
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Read for MemPipeReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut inner = lock(&self.0);
+            if inner.buf.is_empty() {
+                // Empty: EOF if no writer remains. If writers still exist the upstream stage has
+                // not run yet — which cannot happen on the inline path — so return EOF rather than
+                // spin-block, which would wedge the single-threaded reactor.
+                return Ok(0);
+            }
+            let n = std::cmp::min(buf.len(), inner.buf.len());
+            for (slot, byte) in buf.iter_mut().zip(inner.buf.drain(..n)) {
+                *slot = byte;
+            }
+            drop(inner);
+            Ok(n)
+        }
+    }
+
+    // A reader is never written to; surface the same "not writable" behavior as a pipe reader by
+    // erroring, matching `OpenFile::PipeReader`'s write arm.
+    impl std::io::Write for MemPipeReader {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(
+                super::error::ErrorKind::OpenFileNotWritable("pipe reader"),
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl super::Stream for MemPipeReader {
+        fn clone_box(&self) -> Box<dyn super::Stream> {
+            Box::new(self.clone())
+        }
+
+        #[cfg(unix)]
+        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, super::error::Error> {
+            Err(super::error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+
+        #[cfg(unix)]
+        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, super::error::Error> {
+            Err(super::error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+    }
+}
+
+/// Creates an in-memory pipe as a connected `(reader, writer)` pair of [`OpenFile`]s, for use on
+/// `wasm32` where `std::io::pipe()` is unsupported. See [`mem_pipe`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn open_mem_pipe() -> (OpenFile, OpenFile) {
+    let (reader, writer) = mem_pipe::pipe();
+    (
+        OpenFile::Stream(Box::new(reader)),
+        OpenFile::Stream(Box::new(writer)),
+    )
+}
+
 /// Tristate representing the an `OpenFile` entry in an `OpenFiles` structure.
 pub enum OpenFileEntry<'a> {
     /// File descriptor is present and has a valid associated `OpenFile`.
@@ -461,5 +627,74 @@ where
     fn from(iter: I) -> Self {
         let files = iter.map(|(fd, file)| (fd, Some(file))).collect();
         Self { files }
+    }
+}
+
+#[cfg(test)]
+mod mem_pipe_tests {
+    use super::mem_pipe;
+    use std::io::{Read, Write};
+
+    /// Bytes written before EOF are read back in order; EOF is reported only once the writer drops.
+    #[test]
+    fn round_trips_bytes_then_reports_eof_on_writer_drop() {
+        let (mut reader, mut writer) = mem_pipe::pipe();
+
+        writer.write_all(b"hello ").unwrap();
+        writer.write_all(b"world").unwrap();
+
+        // Data is readable while the writer is still open.
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 4];
+        loop {
+            let n = reader.read(&mut chunk).unwrap();
+            if n == 0 {
+                break; // buffer drained; writer still open -> EOF-so-far, but nothing more yet
+            }
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(&got, b"hello world");
+
+        // After the writer drops, a further read still reports clean EOF (0), not an error.
+        drop(writer);
+        assert_eq!(reader.read(&mut chunk).unwrap(), 0);
+    }
+
+    /// This is the pipeline shape: the upstream stage's writer is fully written and dropped before
+    /// the downstream stage reads. The reader must see all bytes and a single clean EOF.
+    #[test]
+    fn inline_sequential_stage_handoff() {
+        let (mut reader, mut writer) = mem_pipe::pipe();
+
+        // Stage 1 runs to completion and drops its writer (as `cmd_params` is dropped per-stage).
+        writer.write_all(b"line1\nline2\nline3\n").unwrap();
+        drop(writer);
+
+        // Stage 2 then drains everything and observes EOF.
+        let mut out = String::new();
+        reader.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "line1\nline2\nline3\n");
+    }
+
+    /// Cloning a writer keeps the pipe open until *every* writer handle is dropped (EOF is the live
+    /// writer count reaching zero, not the buffer `Arc`'s strong count).
+    #[test]
+    fn eof_waits_for_all_writer_clones_to_drop() {
+        use super::Stream as _;
+        let (mut reader, writer) = mem_pipe::pipe();
+        let mut writer2 = writer.clone_box();
+
+        writer2.write_all(b"x").unwrap();
+        drop(writer); // one writer gone, one remains
+
+        let mut buf = [0u8; 8];
+        // The single buffered byte is readable...
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(&buf[..1], b"x");
+        // ...but with a writer still alive, an empty read reports 0 (no more data *yet*).
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+
+        drop(writer2); // last writer gone -> genuine EOF, still 0
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
     }
 }
