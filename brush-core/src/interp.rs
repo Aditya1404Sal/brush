@@ -2003,21 +2003,38 @@ fn setup_process_substitution(
 }
 
 fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
-    let (reader, mut writer) = std::io::pipe()?;
-
     let bytes = contents.as_bytes();
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // wasm32-wasip2 has no OS pipes (`std::io::pipe()` errors "operation not supported on this
+    // platform"). A here-document / here-string body is fully known up front, so stage it through the
+    // same in-memory `OpenFile::Stream` the pipeline and `$(...)` paths use: write the bytes, drop
+    // the writer (writers -> 0 => clean EOF for the reader), and hand back the reader. This is the
+    // simplest instance of that pattern (no inline sequencing needed). Mirrors the cfg-split at the
+    // pipeline site (`openfiles::open_mem_pipe`) and command substitution.
+    #[cfg(target_arch = "wasm32")]
     {
-        use std::os::fd::AsFd as _;
-
-        let len = i32::try_from(bytes.len())
-            .map_err(|_err| error::Error::from(error::ErrorKind::TooMuchData))?;
-        nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(len))?;
+        let (reader, mut writer) = openfiles::open_mem_pipe();
+        writer.write_all(bytes)?;
+        drop(writer);
+        Ok(reader)
     }
 
-    writer.write_all(bytes)?;
-    drop(writer);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (reader, mut writer) = std::io::pipe()?;
 
-    Ok(reader.into())
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsFd as _;
+
+            let len = i32::try_from(bytes.len())
+                .map_err(|_err| error::Error::from(error::ErrorKind::TooMuchData))?;
+            nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(len))?;
+        }
+
+        writer.write_all(bytes)?;
+        drop(writer);
+
+        Ok(reader.into())
+    }
 }
