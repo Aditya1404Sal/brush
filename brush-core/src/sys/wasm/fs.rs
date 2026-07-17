@@ -12,7 +12,12 @@ impl crate::sys::fs::PathExt for std::path::Path {
     }
 
     fn executable(&self) -> bool {
-        true
+        // wasip2 has no `access(X_OK)`; returning `true` unconditionally made PATH searches
+        // (`type <cmd>`, `find_executables_in_path`) report a phantom hit for every candidate,
+        // so an unknown command resolved to `/usr/local/bin/<name>` instead of "not found".
+        // A real existence check is the honest wasip2 behavior (`test -e` works on the agent),
+        // excluding directories so a PATH dir is never mistaken for the executable itself.
+        self.exists() && !self.is_dir()
     }
 
     fn exists_and_is_block_device(&self) -> bool {
