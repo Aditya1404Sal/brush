@@ -1338,24 +1338,67 @@ const fn is_quoting_char(c: char) -> bool {
     matches!(c, '\\' | '\'' | '\"')
 }
 
-/// Return a string with all the quoting removed.
+/// Return a string with all the quoting removed, honoring POSIX quote semantics:
+/// inside single quotes every character (including backslash) is literal; inside
+/// double quotes backslash escapes only `$`, `` ` ``, `"`, `\`, and newline (line
+/// continuation) and is otherwise retained; outside quotes backslash escapes the
+/// next character.
 ///
 /// # Arguments
 ///
 /// * `s` - The string to unquote.
 pub fn unquote_str(s: &str) -> String {
-    let mut result = String::new();
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
 
+    let mut result = String::new();
+    let mut quote = Quote::None;
     let mut in_escape = false;
+
     for c in s.chars() {
-        match c {
-            c if in_escape => {
-                result.push(c);
-                in_escape = false;
+        match quote {
+            Quote::None => {
+                if in_escape {
+                    result.push(c);
+                    in_escape = false;
+                } else {
+                    match c {
+                        '\\' => in_escape = true,
+                        '\'' => quote = Quote::Single,
+                        '"' => quote = Quote::Double,
+                        c => result.push(c),
+                    }
+                }
             }
-            '\\' => in_escape = true,
-            c if is_quoting_char(c) => (),
-            c => result.push(c),
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                } else {
+                    result.push(c);
+                }
+            }
+            Quote::Double => {
+                if in_escape {
+                    in_escape = false;
+                    match c {
+                        '$' | '`' | '"' | '\\' => result.push(c),
+                        '\n' => (),
+                        c => {
+                            result.push('\\');
+                            result.push(c);
+                        }
+                    }
+                } else {
+                    match c {
+                        '\\' => in_escape = true,
+                        '"' => quote = Quote::None,
+                        c => result.push(c),
+                    }
+                }
+            }
         }
     }
 
@@ -1757,6 +1800,14 @@ HERE2
         assert_eq!(unquote_str(r#""hello""#), "hello");
         assert_eq!(unquote_str(r"'hello'"), "hello");
         assert_eq!(unquote_str(r#""hel\"lo""#), r#"hel"lo"#);
-        assert_eq!(unquote_str(r"'hel\'lo'"), r"hel'lo");
+        // Single quotes are fully literal (POSIX): backslash is an ordinary character.
+        assert_eq!(unquote_str(r"'\n'"), r"\n");
+        assert_eq!(unquote_str(r"'hel\lo'"), r"hel\lo");
+        // Double quotes: backslash escapes only $ ` " \ and newline; otherwise retained.
+        assert_eq!(unquote_str(r#""a\nb""#), r"a\nb");
+        assert_eq!(unquote_str(r#""a\\b""#), r"a\b");
+        assert_eq!(unquote_str(r#""a\$b""#), "a$b");
+        // Outside quotes, backslash escapes the next character.
+        assert_eq!(unquote_str(r"hel\'lo"), "hel'lo");
     }
 }
