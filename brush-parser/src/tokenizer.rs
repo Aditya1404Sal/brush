@@ -1338,8 +1338,9 @@ const fn is_quoting_char(c: char) -> bool {
     matches!(c, '\\' | '\'' | '\"')
 }
 
-/// Return a string with all the quoting removed, honoring POSIX quote semantics:
-/// inside single quotes every character (including backslash) is literal; inside
+/// Return a string with all the quoting removed, honoring POSIX quote semantics.
+///
+/// Inside single quotes every character (including backslash) is literal; inside
 /// double quotes backslash escapes only `$`, `` ` ``, `"`, `\`, and newline (line
 /// continuation) and is otherwise retained; outside quotes backslash escapes the
 /// next character.
