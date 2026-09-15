@@ -726,7 +726,14 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
 
-    match (builtin.execute_func)(context, args).await {
+    let result = (builtin.execute_func)(context, args).await;
+
+    // On wasm32, pipeline stages share one thread; give a stage waiting on this one's output — or
+    // watching a pipe this builtin just found broken — its turn.
+    #[cfg(target_arch = "wasm32")]
+    openfiles::yield_to_pipe_peers().await;
+
+    match result {
         Ok(result) => Ok(result),
         Err(e) => {
             // Broken pipe errors should silently return the appropriate exit code
@@ -812,17 +819,19 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
 
     // On wasm32 (wasip2): `std::io::pipe()` is unsupported and the single-threaded runtime has no
-    // blocking pool for the concurrent spawn-then-read below. Reuse the in-memory pipe and run the
-    // substitution *inline to completion* first — dropping its params drops the pipe writer, so
-    // the buffered output can then be drained with a clean EOF. Mirrors the inline-sequential
-    // pipeline design in `execute_via_builtin_in_owned_shell`/`spawn_pipeline_processes`.
+    // blocking pool for the concurrent spawn-then-read below. Use the in-memory pipe and run the
+    // substitution to completion first — bash collects all of a substitution's output before
+    // expanding it anyway — so dropping its params drops the pipe writer. A background job started
+    // inside the substitution can still hold a writer; like bash, wait for it to close.
     #[cfg(target_arch = "wasm32")]
     {
-        let (mut reader, writer) = openfiles::open_mem_pipe();
+        let (mut reader, writer, _watch) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
         let cmd_result = run_substitution_command(subshell, params, s).await?;
         shell.set_last_exit_status(cmd_result.exit_code.into());
+
+        openfiles::wait_for_input(&reader, openfiles::InputReadiness::default()).await;
 
         let mut output_str = String::new();
         std::io::Read::read_to_string(&mut reader, &mut output_str)?;

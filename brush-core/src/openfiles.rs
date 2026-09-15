@@ -27,6 +27,12 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
     /// is not supported or if it fails.
     #[cfg(unix)]
     fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error>;
+
+    /// Returns the stream as [`std::any::Any`], letting the shell recognize stream types it
+    /// provides itself. Custom streams can keep the default, which returns `None`.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// Represents a file open in a shell context.
@@ -302,56 +308,269 @@ impl std::io::Write for OpenFile {
     }
 }
 
-/// An in-memory, single-thread pipe used to connect pipeline stages on `wasm32` targets, where
-/// `std::io::pipe()` is unsupported ("operation not supported on this platform") and there is no
-/// blocking thread pool to run stages concurrently.
+/// What a builtin needs to find in its input before it starts reading, when that input is an
+/// in-memory pipe fed by another pipeline stage. See [`wait_for_input`].
 ///
-/// On `wasm32` each non-last pipeline stage runs to completion *inline* and in order (see
-/// `spawn_pipeline_processes`), so the upstream stage always finishes — and drops its writer — before
-/// the downstream stage reads. That means the reader never has to block on not-yet-produced data:
-/// it either finds bytes buffered or observes end-of-stream (all writers dropped). The buffer is
-/// unbounded because there is no concurrent consumer to back-pressure against; it holds one stage's
-/// full output until the next stage drains it. This is correct for any finite pipeline.
+/// With neither `delimiter` nor `min_bytes` set, the input is ready only at end-of-stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputReadiness {
+    /// Ready once this byte is buffered.
+    pub delimiter: Option<u8>,
+    /// When set, a `delimiter` preceded by an odd number of backslashes is escaped and does not
+    /// count.
+    pub backslash_escapes: bool,
+    /// Ready once at least this many bytes are buffered.
+    pub min_bytes: Option<usize>,
+}
+
+/// Waits until `file` holds enough input for a synchronous read to proceed without blocking.
+///
+/// Pipeline stages on `wasm32` share one thread and connect through in-memory pipes, and a
+/// builtin's synchronous read cannot wait for another stage to produce. A builtin that reads its
+/// input calls this first: it returns once `readiness` is satisfied or every writer has closed,
+/// letting the producing stage run in the meantime. Returns immediately for every other kind of
+/// file, and on every other target.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(
+        clippy::unused_async,
+        reason = "only in-memory pipes, which exist on wasm32, need to wait"
+    )
+)]
+pub async fn wait_for_input(file: &OpenFile, readiness: InputReadiness) {
+    #[cfg(target_arch = "wasm32")]
+    if let OpenFile::Stream(stream) = file {
+        if let Some(reader) = stream
+            .as_any()
+            .and_then(|any| any.downcast_ref::<mem_pipe::MemPipeReader>())
+        {
+            reader.wait_ready(readiness).await;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (file, readiness);
+}
+
+/// An in-memory pipe used to connect pipeline stages on `wasm32` targets, where
+/// `std::io::pipe()` is unsupported ("operation not supported on this platform") and there is
+/// only one thread.
+///
+/// Pipeline stages run as tasks on that one thread and hand control to each other cooperatively,
+/// so neither end of the pipe may block:
+///
+/// - A write never waits. It fails with `BrokenPipe` once every reader is gone (the stage is then
+///   ended, as `SIGPIPE` would end it) or once the buffer would exceed its capacity.
+/// - A read never waits either. A reader that must not see a premature end-of-stream first awaits
+///   [`MemPipeReader::wait_ready`]; a read that still finds the buffer empty while a writer
+///   remains fails with `WouldBlock` rather than silently reporting end-of-stream.
+/// - Stages yield after each builtin (see [`yield_to_pipe_peers`]) once more than 64 KiB is
+///   buffered — the point at which a producer would block on a full OS pipe, and what lets the
+///   next stage start at all when the producer never finishes — and while any reader is parked
+///   waiting for a line or a byte count, so the producer and that reader interleave.
 ///
 /// The adapter is pure in-memory logic (no wasm-specific APIs), so it also compiles under `cfg(test)`
 /// to be unit-tested natively; only its *use* in the pipeline wiring is `wasm32`-only.
 #[cfg(any(target_arch = "wasm32", test))]
 mod mem_pipe {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    /// The shared state behind a memory pipe: the byte buffer plus a count of live writer handles.
-    /// End-of-stream is "buffer drained and no writers remain", so the count — not the `Arc`
-    /// strong count (the reader keeps the `Arc` alive) — is what signals EOF.
+    use tokio::sync::Notify;
+
+    /// The default buffer capacity. A producer that outruns a reader waiting for end-of-stream
+    /// stops here instead of growing memory without bound.
+    pub(crate) const DEFAULT_CAPACITY: usize = 64 * 1024 * 1024;
+
+    /// Once more than this many bytes are buffered across pipes, stages yield after each builtin.
+    /// It matches a Linux pipe's default buffer, where a producer would block and the consumer
+    /// would get scheduled.
+    pub(crate) const SOFT_LIMIT: usize = 64 * 1024;
+
+    thread_local! {
+        /// Readers currently parked waiting for a line or a byte count. While non-zero, stages
+        /// yield after each builtin so the waiting reader gets a turn.
+        static STREAMING_WAITERS: Cell<usize> = const { Cell::new(0) };
+
+        /// Set when a write found no reader, so the writing stage yields once and its watcher can
+        /// end it.
+        static BROKEN_WRITE: Cell<bool> = const { Cell::new(false) };
+
+        /// Bytes written into pipes on this thread and not yet read or discarded.
+        static BUFFERED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Returns whether more than [`SOFT_LIMIT`] bytes are buffered across pipes.
+    pub(crate) fn over_soft_limit() -> bool {
+        BUFFERED.get() > SOFT_LIMIT
+    }
+
+    /// Adjusts the buffered-byte count; tolerates thread-local teardown, since pipes can be dropped
+    /// while the thread exits.
+    fn account(add: usize, remove: usize) {
+        let _ = BUFFERED.try_with(|b| b.set(b.get().saturating_add(add).saturating_sub(remove)));
+    }
+
+    /// The buffer and the handle counts behind one pipe. End-of-stream is "buffer drained and no
+    /// writers remain", so the explicit counts — not the `Arc` strong count, which every handle and
+    /// watch contributes to — are what signal EOF and a broken pipe.
     struct Inner {
         buf: VecDeque<u8>,
         writers: usize,
+        readers: usize,
+        capacity: usize,
+        broken: bool,
+        overflowed: bool,
+    }
+
+    impl Drop for Inner {
+        // Bytes nobody read are discarded with the pipe.
+        fn drop(&mut self) {
+            account(0, self.buf.len());
+        }
+    }
+
+    struct Shared {
+        inner: Mutex<Inner>,
+        /// Notified on every state change a waiter could care about: bytes written, the last writer
+        /// closed, the pipe broken.
+        changed: Notify,
     }
 
     /// Locks the shared state, recovering from a poisoned mutex: the state is a byte buffer and a
-    /// counter, always left consistent between statements, so a panic elsewhere while holding
-    /// the lock cannot have left it half-updated.
-    fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
-        inner
+    /// few counters, always left consistent between statements, so a panic elsewhere while
+    /// holding the lock cannot have left it half-updated.
+    fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Inner> {
+        shared
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The write half. Cloning bumps the live-writer count; dropping decrements it, and reaching
     /// zero is the EOF signal to the reader.
-    pub(super) struct MemPipeWriter(Arc<Mutex<Inner>>);
+    pub(crate) struct MemPipeWriter(Arc<Shared>);
 
     /// The read half. Drains the shared buffer; reports EOF once the buffer is empty and every
     /// writer handle has been dropped.
-    pub(super) struct MemPipeReader(Arc<Mutex<Inner>>);
+    pub(crate) struct MemPipeReader(Arc<Shared>);
 
-    /// Creates a connected (reader, writer) pair sharing one in-memory buffer.
-    pub(super) fn pipe() -> (MemPipeReader, MemPipeWriter) {
-        let inner = Arc::new(Mutex::new(Inner {
-            buf: VecDeque::new(),
-            writers: 1,
-        }));
-        (MemPipeReader(Arc::clone(&inner)), MemPipeWriter(inner))
+    /// Observes a pipe without holding either end, so it never keeps the pipe open.
+    pub(crate) struct MemPipeWatch(Arc<Shared>);
+
+    /// Creates a connected (reader, writer) pair sharing one in-memory buffer, plus a watch on it.
+    pub(crate) fn pipe(capacity: usize) -> (MemPipeReader, MemPipeWriter, MemPipeWatch) {
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                buf: VecDeque::new(),
+                writers: 1,
+                readers: 1,
+                capacity,
+                broken: false,
+                overflowed: false,
+            }),
+            changed: Notify::new(),
+        });
+        (
+            MemPipeReader(Arc::clone(&shared)),
+            MemPipeWriter(Arc::clone(&shared)),
+            MemPipeWatch(shared),
+        )
+    }
+
+    /// Yields to other tasks when more than [`SOFT_LIMIT`] bytes are buffered, when a stage is
+    /// parked waiting for a line or a byte count, or when this task just wrote to a pipe nobody
+    /// reads. Called after every builtin.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn yield_to_pipe_peers() {
+        let broken_write = BROKEN_WRITE.replace(false);
+        if broken_write || STREAMING_WAITERS.get() > 0 || over_soft_limit() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Counts a parked streaming reader for as long as it is alive.
+    struct StreamingWaiter;
+
+    impl StreamingWaiter {
+        fn new() -> Self {
+            STREAMING_WAITERS.set(STREAMING_WAITERS.get() + 1);
+            Self
+        }
+    }
+
+    impl Drop for StreamingWaiter {
+        fn drop(&mut self) {
+            let _ = STREAMING_WAITERS.try_with(|w| w.set(w.get().saturating_sub(1)));
+        }
+    }
+
+    /// Returns whether `buf` contains `delimiter` not escaped by a preceding odd run of
+    /// backslashes (when `backslash_escapes` is set).
+    fn contains_delimiter(buf: &VecDeque<u8>, delimiter: u8, backslash_escapes: bool) -> bool {
+        let mut backslashes = 0usize;
+        for &byte in buf {
+            if byte == delimiter && !(backslash_escapes && backslashes % 2 == 1) {
+                return true;
+            }
+            if backslash_escapes && byte == b'\\' {
+                backslashes += 1;
+            } else {
+                backslashes = 0;
+            }
+        }
+        false
+    }
+
+    fn is_ready(inner: &Inner, readiness: super::InputReadiness) -> bool {
+        inner.writers == 0
+            || readiness.min_bytes.is_some_and(|n| inner.buf.len() >= n)
+            || readiness
+                .delimiter
+                .is_some_and(|d| contains_delimiter(&inner.buf, d, readiness.backslash_escapes))
+    }
+
+    impl MemPipeReader {
+        /// Waits until `readiness` is satisfied or every writer has closed.
+        pub(crate) async fn wait_ready(&self, readiness: super::InputReadiness) {
+            let streaming = readiness.delimiter.is_some() || readiness.min_bytes.is_some();
+            loop {
+                let notified = self.0.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                if is_ready(&lock(&self.0), readiness) {
+                    return;
+                }
+
+                // Only a reader that can start before end-of-stream asks producers to yield; a reader
+                // waiting for end-of-stream is best served by letting the producer run on.
+                let _waiter = streaming.then(StreamingWaiter::new);
+                notified.await;
+            }
+        }
+    }
+
+    impl MemPipeWatch {
+        /// Resolves once a write has found no reader, or has exceeded the capacity.
+        pub(crate) async fn wait_broken(&self) {
+            loop {
+                let notified = self.0.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                if lock(&self.0).broken {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        /// Returns whether the pipe broke because a write exceeded its capacity.
+        pub(crate) fn overflowed(&self) -> bool {
+            lock(&self.0).overflowed
+        }
     }
 
     impl Clone for MemPipeWriter {
@@ -363,13 +582,41 @@ mod mem_pipe {
 
     impl Drop for MemPipeWriter {
         fn drop(&mut self) {
-            lock(&self.0).writers -= 1;
+            let mut inner = lock(&self.0);
+            inner.writers -= 1;
+            let closed = inner.writers == 0;
+            drop(inner);
+            if closed {
+                self.0.changed.notify_waiters();
+            }
         }
     }
 
     impl std::io::Write for MemPipeWriter {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            lock(&self.0).buf.extend(data.iter().copied());
+            let mut inner = lock(&self.0);
+            if inner.readers == 0 {
+                inner.broken = true;
+                drop(inner);
+                BROKEN_WRITE.set(true);
+                self.0.changed.notify_waiters();
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            if inner.buf.len().saturating_add(data.len()) > inner.capacity {
+                inner.broken = true;
+                inner.overflowed = true;
+                drop(inner);
+                BROKEN_WRITE.set(true);
+                self.0.changed.notify_waiters();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "in-memory pipe buffer limit exceeded",
+                ));
+            }
+            inner.buf.extend(data.iter().copied());
+            drop(inner);
+            account(data.len(), 0);
+            self.0.changed.notify_waiters();
             Ok(data.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -405,7 +652,14 @@ mod mem_pipe {
 
     impl Clone for MemPipeReader {
         fn clone(&self) -> Self {
+            lock(&self.0).readers += 1;
             Self(Arc::clone(&self.0))
+        }
+    }
+
+    impl Drop for MemPipeReader {
+        fn drop(&mut self) {
+            lock(&self.0).readers -= 1;
         }
     }
 
@@ -413,16 +667,23 @@ mod mem_pipe {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let mut inner = lock(&self.0);
             if inner.buf.is_empty() {
-                // Empty: EOF if no writer remains. If writers still exist the upstream stage has
-                // not run yet — which cannot happen on the inline path — so return EOF rather than
-                // spin-block, which would wedge the single-threaded reactor.
-                return Ok(0);
+                if inner.writers == 0 {
+                    return Ok(0);
+                }
+                // A writer remains, so this is not end-of-stream. Blocking would stall the only
+                // thread, and reporting EOF would silently truncate the input.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "in-memory pipe has no data yet; the reading builtin must first await \
+                     `openfiles::wait_for_input`",
+                ));
             }
             let n = std::cmp::min(buf.len(), inner.buf.len());
             for (slot, byte) in buf.iter_mut().zip(inner.buf.drain(..n)) {
                 *slot = byte;
             }
             drop(inner);
+            account(0, n);
             Ok(n)
         }
     }
@@ -454,17 +715,25 @@ mod mem_pipe {
         fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, super::error::Error> {
             Err(super::error::ErrorKind::CannotConvertToNativeFd.into())
         }
+
+        fn as_any(&self) -> Option<&dyn std::any::Any> {
+            Some(self)
+        }
     }
 }
 
-/// Creates an in-memory pipe as a connected `(reader, writer)` pair of [`OpenFile`]s, for use on
-/// `wasm32` where `std::io::pipe()` is unsupported. See [`mem_pipe`].
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn open_mem_pipe() -> (OpenFile, OpenFile) {
-    let (reader, writer) = mem_pipe::pipe();
+pub(crate) use mem_pipe::{MemPipeWatch, yield_to_pipe_peers};
+
+/// Creates an in-memory pipe as a connected `(reader, writer)` pair of [`OpenFile`]s plus a watch
+/// on it, for use on `wasm32` where `std::io::pipe()` is unsupported. See [`mem_pipe`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn open_mem_pipe() -> (OpenFile, OpenFile, MemPipeWatch) {
+    let (reader, writer, watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
     (
         OpenFile::Stream(Box::new(reader)),
         OpenFile::Stream(Box::new(writer)),
+        watch,
     )
 }
 
@@ -632,45 +901,45 @@ where
 
 #[cfg(test)]
 mod mem_pipe_tests {
-    use super::mem_pipe;
+    use super::{InputReadiness, mem_pipe};
+    use futures::FutureExt as _;
     use std::io::{Read, Write};
 
-    /// Bytes written before EOF are read back in order; EOF is reported only once the writer drops.
+    const LINE: InputReadiness = InputReadiness {
+        delimiter: Some(b'\n'),
+        backslash_escapes: false,
+        min_bytes: None,
+    };
+
+    /// Bytes written are read back in order. With the writer still open, an empty read is an
+    /// error, not end-of-stream; once the writer drops it is a clean EOF.
     #[test]
     fn round_trips_bytes_then_reports_eof_on_writer_drop() {
-        let (mut reader, mut writer) = mem_pipe::pipe();
+        let (mut reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
 
         writer.write_all(b"hello ").unwrap();
         writer.write_all(b"world").unwrap();
 
-        // Data is readable while the writer is still open.
-        let mut got = Vec::new();
-        let mut chunk = [0u8; 4];
-        loop {
-            let n = reader.read(&mut chunk).unwrap();
-            if n == 0 {
-                break; // buffer drained; writer still open -> EOF-so-far, but nothing more yet
-            }
-            got.extend_from_slice(&chunk[..n]);
-        }
+        let mut got = [0u8; 11];
+        reader.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello world");
 
-        // After the writer drops, a further read still reports clean EOF (0), not an error.
+        let mut chunk = [0u8; 4];
+        let err = reader.read(&mut chunk).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
         drop(writer);
         assert_eq!(reader.read(&mut chunk).unwrap(), 0);
     }
 
-    /// This is the pipeline shape: the upstream stage's writer is fully written and dropped before
-    /// the downstream stage reads. The reader must see all bytes and a single clean EOF.
+    /// A stage that finishes before the next one reads: the reader sees every byte, then EOF.
     #[test]
-    fn inline_sequential_stage_handoff() {
-        let (mut reader, mut writer) = mem_pipe::pipe();
+    fn completed_stage_handoff() {
+        let (mut reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
 
-        // Stage 1 runs to completion and drops its writer (as `cmd_params` is dropped per-stage).
         writer.write_all(b"line1\nline2\nline3\n").unwrap();
         drop(writer);
 
-        // Stage 2 then drains everything and observes EOF.
         let mut out = String::new();
         reader.read_to_string(&mut out).unwrap();
         assert_eq!(out, "line1\nline2\nline3\n");
@@ -681,20 +950,140 @@ mod mem_pipe_tests {
     #[test]
     fn eof_waits_for_all_writer_clones_to_drop() {
         use super::Stream as _;
-        let (mut reader, writer) = mem_pipe::pipe();
+        let (mut reader, writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
         let mut writer2 = writer.clone_box();
 
         writer2.write_all(b"x").unwrap();
-        drop(writer); // one writer gone, one remains
+        drop(writer);
 
         let mut buf = [0u8; 8];
-        // The single buffered byte is readable...
         assert_eq!(reader.read(&mut buf).unwrap(), 1);
         assert_eq!(&buf[..1], b"x");
-        // ...but with a writer still alive, an empty read reports 0 (no more data *yet*).
-        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        assert_eq!(
+            reader.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
 
-        drop(writer2); // last writer gone -> genuine EOF, still 0
+        drop(writer2);
         assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    /// Writing after every reader is gone fails like `EPIPE` and trips the watch.
+    #[test]
+    fn write_without_readers_breaks_the_pipe() {
+        use super::Stream as _;
+        let (reader, mut writer, watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+        let reader2 = reader.clone_box();
+
+        drop(reader);
+        writer.write_all(b"still read").unwrap();
+        assert!(watch.wait_broken().now_or_never().is_none());
+
+        drop(reader2);
+        let err = writer.write_all(b"nobody").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(watch.wait_broken().now_or_never().is_some());
+        assert!(!watch.overflowed());
+    }
+
+    /// A write that would exceed the capacity fails, and the watch reports why.
+    #[test]
+    fn write_beyond_capacity_breaks_the_pipe() {
+        let (_reader, mut writer, watch) = mem_pipe::pipe(8);
+
+        writer.write_all(b"12345678").unwrap();
+        let err = writer.write_all(b"9").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(watch.wait_broken().now_or_never().is_some());
+        assert!(watch.overflowed());
+    }
+
+    /// A line reader becomes ready at the delimiter, a byte-count reader at the count, and every
+    /// reader at end-of-stream.
+    #[test]
+    fn readiness_by_delimiter_count_and_eof() {
+        let (reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+
+        writer.write_all(b"abc").unwrap();
+        assert!(reader.wait_ready(LINE).now_or_never().is_none());
+        assert!(
+            reader
+                .wait_ready(InputReadiness::default())
+                .now_or_never()
+                .is_none()
+        );
+        let three = InputReadiness {
+            min_bytes: Some(3),
+            ..InputReadiness::default()
+        };
+        assert!(reader.wait_ready(three).now_or_never().is_some());
+
+        writer.write_all(b"\n").unwrap();
+        assert!(reader.wait_ready(LINE).now_or_never().is_some());
+
+        drop(writer);
+        assert!(
+            reader
+                .wait_ready(InputReadiness::default())
+                .now_or_never()
+                .is_some()
+        );
+    }
+
+    /// With backslash escapes on, an escaped delimiter does not end the line; an escaped backslash
+    /// before the delimiter does not escape it.
+    #[test]
+    fn escaped_delimiter_is_not_ready() {
+        let escaped = InputReadiness {
+            backslash_escapes: true,
+            ..LINE
+        };
+
+        let (reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+        writer.write_all(b"a\\\n").unwrap();
+        assert!(reader.wait_ready(escaped).now_or_never().is_none());
+        assert!(reader.wait_ready(LINE).now_or_never().is_some());
+
+        let (reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+        writer.write_all(b"a\\\\\n").unwrap();
+        assert!(reader.wait_ready(escaped).now_or_never().is_some());
+    }
+
+    /// Buffered bytes count toward the soft limit until they are read or the pipe is dropped.
+    #[test]
+    fn buffered_bytes_track_the_soft_limit() {
+        let (mut reader, mut writer, watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+        assert!(!mem_pipe::over_soft_limit());
+
+        writer
+            .write_all(&vec![b'y'; mem_pipe::SOFT_LIMIT + 1])
+            .unwrap();
+        assert!(mem_pipe::over_soft_limit());
+
+        let mut chunk = [0u8; 2];
+        reader.read_exact(&mut chunk).unwrap();
+        assert!(!mem_pipe::over_soft_limit());
+
+        writer.write_all(&[b'y'; 8]).unwrap();
+        assert!(mem_pipe::over_soft_limit());
+        drop((reader, writer, watch));
+        assert!(!mem_pipe::over_soft_limit());
+    }
+
+    /// A parked line reader stays parked until the delimiter arrives, and is woken by the write.
+    #[test]
+    fn parked_reader_wakes_on_write() {
+        let (reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        let mut wait = Box::pin(reader.wait_ready(LINE));
+        assert!(wait.poll_unpin(&mut cx).is_pending());
+
+        writer.write_all(b"partial").unwrap();
+        assert!(wait.poll_unpin(&mut cx).is_pending());
+
+        writer.write_all(b"\n").unwrap();
+        assert!(wait.poll_unpin(&mut cx).is_ready());
     }
 }
