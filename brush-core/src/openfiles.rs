@@ -314,8 +314,10 @@ impl std::io::Write for OpenFile {
 /// With neither `delimiter` nor `min_bytes` set, the input is ready only at end-of-stream.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputReadiness {
-    /// Ready once this byte is buffered.
+    /// Ready once this byte is buffered (see `min_delimiters`).
     pub delimiter: Option<u8>,
+    /// How many `delimiter`s must be buffered; 0 counts as 1.
+    pub min_delimiters: usize,
     /// When set, a `delimiter` preceded by an odd number of backslashes is escaped and does not
     /// count.
     pub backslash_escapes: bool,
@@ -506,13 +508,23 @@ mod mem_pipe {
         }
     }
 
-    /// Returns whether `buf` contains `delimiter` not escaped by a preceding odd run of
-    /// backslashes (when `backslash_escapes` is set).
-    fn contains_delimiter(buf: &VecDeque<u8>, delimiter: u8, backslash_escapes: bool) -> bool {
+    /// Returns whether `buf` contains at least `needed` (minimum 1) `delimiter`s not escaped by a
+    /// preceding odd run of backslashes (when `backslash_escapes` is set).
+    fn contains_delimiters(
+        buf: &VecDeque<u8>,
+        delimiter: u8,
+        needed: usize,
+        backslash_escapes: bool,
+    ) -> bool {
+        let needed = needed.max(1);
+        let mut found = 0usize;
         let mut backslashes = 0usize;
         for &byte in buf {
             if byte == delimiter && !(backslash_escapes && backslashes % 2 == 1) {
-                return true;
+                found += 1;
+                if found >= needed {
+                    return true;
+                }
             }
             if backslash_escapes && byte == b'\\' {
                 backslashes += 1;
@@ -526,9 +538,14 @@ mod mem_pipe {
     fn is_ready(inner: &Inner, readiness: super::InputReadiness) -> bool {
         inner.writers == 0
             || readiness.min_bytes.is_some_and(|n| inner.buf.len() >= n)
-            || readiness
-                .delimiter
-                .is_some_and(|d| contains_delimiter(&inner.buf, d, readiness.backslash_escapes))
+            || readiness.delimiter.is_some_and(|d| {
+                contains_delimiters(
+                    &inner.buf,
+                    d,
+                    readiness.min_delimiters,
+                    readiness.backslash_escapes,
+                )
+            })
     }
 
     impl MemPipeReader {
@@ -907,6 +924,7 @@ mod mem_pipe_tests {
 
     const LINE: InputReadiness = InputReadiness {
         delimiter: Some(b'\n'),
+        min_delimiters: 0,
         backslash_escapes: false,
         min_bytes: None,
     };
@@ -1047,6 +1065,23 @@ mod mem_pipe_tests {
         let (reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
         writer.write_all(b"a\\\\\n").unwrap();
         assert!(reader.wait_ready(escaped).now_or_never().is_some());
+    }
+
+    /// A reader that needs several lines is ready only once that many delimiters are buffered.
+    #[test]
+    fn readiness_waits_for_several_delimiters() {
+        let three_lines = InputReadiness {
+            min_delimiters: 3,
+            ..LINE
+        };
+        let (reader, mut writer, _watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
+
+        writer.write_all(b"1\n2\n").unwrap();
+        assert!(reader.wait_ready(LINE).now_or_never().is_some());
+        assert!(reader.wait_ready(three_lines).now_or_never().is_none());
+
+        writer.write_all(b"3\n").unwrap();
+        assert!(reader.wait_ready(three_lines).now_or_never().is_some());
     }
 
     /// Buffered bytes count toward the soft limit until they are read or the pipe is dropped.
