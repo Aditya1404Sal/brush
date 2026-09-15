@@ -82,6 +82,14 @@ impl builtins::Command for MapFileCommand {
             .try_fd(self.fd)
             .ok_or_else(|| ErrorKind::BadFileDescriptor(self.fd))?;
 
+        // When the input is a pipe fed by another pipeline stage on the same thread (wasm32), let
+        // that stage finish first: mapfile reads to end-of-stream.
+        brush_core::openfiles::wait_for_input(
+            &input_file,
+            brush_core::openfiles::InputReadiness::default(),
+        )
+        .await;
+
         // Read!
         let results = self.read_entries(input_file)?;
 

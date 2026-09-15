@@ -115,6 +115,13 @@ impl builtins::Command for ReadCommand {
         // Convert timeout to Duration.
         let timeout = self.timeout_in_seconds.map(Duration::from_secs_f64);
 
+        // When the input is a pipe fed by another pipeline stage on the same thread (wasm32), let
+        // that stage run until this read has what it needs: a whole line, the requested count, or
+        // end-of-stream.
+        if timeout.is_none() {
+            brush_core::openfiles::wait_for_input(&input_stream, self.input_readiness()).await;
+        }
+
         // Perform the read operation (potentially with timeout).
         let read_result = self.read_line(input_stream, context.stderr(), timeout)?;
 
@@ -595,6 +602,37 @@ impl ReadCommand {
         };
 
         read_line_with_reader(&mut reader, &config)
+    }
+
+    /// Describes how much input this read needs buffered before it can run without stalling:
+    /// the delimiter (unless `-N`), and for `-n`/`-N` enough bytes for the requested characters
+    /// at four bytes each. A non-ASCII delimiter falls back to waiting for end-of-stream.
+    fn input_readiness(&self) -> brush_core::openfiles::InputReadiness {
+        let delimiter = if self.return_after_n_chars_no_delimiter.is_some() {
+            None
+        } else if let Some(delimiter_str) = &self.delimiter {
+            if delimiter_str.is_empty() {
+                Some(0)
+            } else {
+                delimiter_str
+                    .chars()
+                    .next()
+                    .and_then(|c| u8::try_from(c).ok())
+                    .filter(u8::is_ascii)
+            }
+        } else {
+            Some(b'\n')
+        };
+
+        let char_limit = self
+            .return_after_n_chars_no_delimiter
+            .or(self.return_after_n_chars);
+
+        brush_core::openfiles::InputReadiness {
+            delimiter,
+            backslash_escapes: !self.raw_mode,
+            min_bytes: char_limit.map(|n| n.saturating_mul(4)),
+        }
     }
 
     fn setup_terminal_settings(

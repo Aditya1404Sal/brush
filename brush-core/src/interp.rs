@@ -383,11 +383,13 @@ impl Execute for ast::Pipeline {
 
         // Spawn all the processes required for the pipeline, connecting outputs/inputs with pipes
         // as needed.
-        let spawn_results = spawn_pipeline_processes(self, shell, &params).await?;
+        // `spawned` stays alive until this function returns: on wasm32 it owns the stage tasks, and
+        // dropping it aborts any still running.
+        let spawned = spawn_pipeline_processes(self, shell, &params).await?;
 
         // Wait for the processes. This also has a side effect of updating pipeline status.
         let mut result =
-            wait_for_pipeline_processes_and_update_status(self, spawn_results, shell, &params)
+            wait_for_pipeline_processes_and_update_status(self, spawned.results, shell, &params)
                 .await?;
 
         // Invert the exit code if requested.
@@ -447,12 +449,22 @@ async fn spawn_pipeline_processes(
     pipeline: &ast::Pipeline,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
-) -> Result<VecDeque<ExecutionSpawnResult>, error::Error> {
+) -> Result<SpawnedPipeline, error::Error> {
     let pipeline_len = pipeline.seq.len();
     let mut pipe_readers = vec![];
     let mut pipe_writers = vec![];
     let mut spawn_results = VecDeque::new();
     let mut process_group_id: Option<i32> = None;
+
+    // On wasm32, one watch per pipe, kept in step with `pipe_writers`: the stage writing into a
+    // pipe is ended if it writes after every reader is gone.
+    #[cfg(target_arch = "wasm32")]
+    let mut pipe_watches = vec![];
+
+    // On wasm32, the stage tasks spawned so far. Held here from the first spawn, so an early return
+    // below aborts them rather than leaving them running.
+    #[cfg(target_arch = "wasm32")]
+    let mut stage_tasks = StageTasks::default();
 
     // Create pipes to use between commands, but only bother doing so if there's more than one
     // command.
@@ -461,11 +473,15 @@ async fn spawn_pipeline_processes(
         pipe_writers.reserve_exact(pipeline_len - 1);
 
         for _ in 0..(pipeline_len - 1) {
-            // On wasm32 there are no OS pipes (`std::io::pipe()` errors) and no thread pool to run
-            // stages concurrently, so use an in-memory pipe and run stages inline in order (see
-            // `openfiles::open_mem_pipe` and `execute_via_builtin_in_owned_shell`).
+            // On wasm32 there are no OS pipes (`std::io::pipe()` errors) and one thread, so stages
+            // connect through in-memory pipes and run as cooperating tasks (see
+            // `openfiles::open_mem_pipe` and `spawn_pipeline_stage`).
             #[cfg(target_arch = "wasm32")]
-            let (reader, writer) = openfiles::open_mem_pipe();
+            let (reader, writer) = {
+                let (reader, writer, watch) = openfiles::open_mem_pipe();
+                pipe_watches.push(watch);
+                (reader, writer)
+            };
             #[cfg(not(target_arch = "wasm32"))]
             let (reader, writer) = {
                 let (r, w) = std::io::pipe()?;
@@ -504,6 +520,20 @@ async fn spawn_pipeline_processes(
             cmd_params.open_files.set_fd(OpenFiles::STDOUT_FD, writer);
         }
 
+        // On wasm32, every stage that does not run in the current shell becomes its own task, so
+        // stages interleave instead of each running to completion before the next starts.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let output_watch = pipe_watches.pop();
+            if !run_in_current_shell {
+                let join_handle =
+                    spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params, output_watch);
+                stage_tasks.0.push(join_handle.abort_handle());
+                spawn_results.push_back(ExecutionSpawnResult::StartedTask(join_handle));
+                continue;
+            }
+        }
+
         let pipeline_context = if !run_in_current_shell {
             // Make sure that all commands in the pipeline are in the same process group.
             if current_pipeline_index > 0 {
@@ -538,7 +568,93 @@ async fn spawn_pipeline_processes(
         spawn_results.push_back(spawn_result);
     }
 
-    Ok(spawn_results)
+    Ok(SpawnedPipeline {
+        results: spawn_results,
+        #[cfg(target_arch = "wasm32")]
+        _stage_tasks: stage_tasks,
+    })
+}
+
+/// The spawned stages of a pipeline, in pipeline order.
+struct SpawnedPipeline {
+    results: VecDeque<ExecutionSpawnResult>,
+    /// On `wasm32`, the stages running as tasks; held only so that dropping it aborts them. See
+    /// [`StageTasks`].
+    #[cfg(target_arch = "wasm32")]
+    _stage_tasks: StageTasks,
+}
+
+/// Aborts a pipeline's stage tasks that are still running when the pipeline itself is dropped.
+///
+/// A pipeline future can be dropped before its stages finish: the stage containing it is ended with
+/// 141, the background job running it is aborted, or a later stage fails to start. Tokio does not
+/// cancel a task when its `JoinHandle` is dropped, so without this its stages would keep running —
+/// consuming the thread and holding pipe writers open, so a reader waiting for end-of-stream would
+/// never see it. Aborting a task that has already finished does nothing.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct StageTasks(Vec<tokio::task::AbortHandle>);
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for StageTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Runs one pipeline stage as its own task on `wasm32`, in a copy of the shell (as a subshell).
+///
+/// Stages share one thread and hand control to each other at the yield points in the in-memory
+/// pipes. If this stage writes into a pipe after every reader is gone — the downstream stage has
+/// finished — the stage is ended with exit status 141, as `SIGPIPE` would end it.
+#[cfg(target_arch = "wasm32")]
+fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
+    mut shell: Shell<SE>,
+    command: ast::Command,
+    params: ExecutionParameters,
+    output_watch: Option<openfiles::MemPipeWatch>,
+) -> tokio::task::JoinHandle<Result<ExecutionResult, error::Error>> {
+    let stderr = params.try_fd(&shell, OpenFiles::STDERR_FD);
+
+    tokio::spawn(async move {
+        let run = async {
+            let context = PipelineExecutionContext {
+                shell: commands::ShellForCommand::ParentShell(&mut shell),
+                process_group_id: None,
+            };
+            match command
+                .execute_in_pipeline(context, params)
+                .await?
+                .wait()
+                .await?
+            {
+                ExecutionWaitResult::Completed(result) => Ok(result),
+                ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+            }
+        };
+
+        let Some(watch) = output_watch else {
+            return run.await;
+        };
+
+        tokio::select! {
+            biased;
+            () = watch.wait_broken() => {
+                if watch.overflowed() {
+                    if let Some(mut stderr) = stderr {
+                        let _ = writeln!(
+                            stderr,
+                            "brush: pipeline stage stopped: in-memory pipe buffer limit exceeded"
+                        );
+                    }
+                }
+                Ok(ExecutionResult::new(141))
+            }
+            result = run => result,
+        }
+    })
 }
 
 async fn wait_for_pipeline_processes_and_update_status(
@@ -2013,7 +2129,7 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
     // pipeline site (`openfiles::open_mem_pipe`) and command substitution.
     #[cfg(target_arch = "wasm32")]
     {
-        let (reader, mut writer) = openfiles::open_mem_pipe();
+        let (reader, mut writer, _watch) = openfiles::open_mem_pipe();
         writer.write_all(bytes)?;
         drop(writer);
         Ok(reader)
