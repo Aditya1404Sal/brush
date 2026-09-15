@@ -630,6 +630,7 @@ impl ReadCommand {
 
         brush_core::openfiles::InputReadiness {
             delimiter,
+            min_delimiters: 1,
             backslash_escapes: !self.raw_mode,
             min_bytes: char_limit.map(|n| n.saturating_mul(4)),
         }

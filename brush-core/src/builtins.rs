@@ -385,6 +385,23 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
     }
 }
 
+/// Returns a built-in command registration for a `SimpleCommand` that reads its standard input to
+/// end-of-stream.
+///
+/// A `SimpleCommand` executes synchronously, so it cannot wait for another pipeline stage to
+/// finish producing its input. This registration waits for that before executing the command (see
+/// [`crate::openfiles::wait_for_input`]). Where pipes are OS pipes, it behaves exactly like
+/// [`simple_builtin`].
+pub fn simple_builtin_reading_stdin<
+    B: SimpleCommand + Send + Sync,
+    SE: extensions::ShellExtensions,
+>() -> Registration<SE> {
+    Registration {
+        execute_func: exec_simple_builtin_reading_stdin::<B, SE>,
+        ..simple_builtin::<B, SE>()
+    }
+}
+
 /// Returns a built-in command registration, given an implementation of the
 /// `Command` trait.
 pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> Registration<SE> {
@@ -460,6 +477,22 @@ async fn exec_simple_builtin_impl<
     });
 
     T::execute(context, plain_args)
+}
+
+fn exec_simple_builtin_reading_stdin<
+    T: SimpleCommand + Send + Sync,
+    SE: extensions::ShellExtensions,
+>(
+    context: commands::ExecutionContext<'_, SE>,
+    args: Vec<CommandArg>,
+) -> BoxFuture<'_, Result<results::ExecutionResult, error::Error>> {
+    Box::pin(async move {
+        if let Some(stdin) = context.try_fd(crate::openfiles::OpenFiles::STDIN_FD) {
+            crate::openfiles::wait_for_input(&stdin, crate::openfiles::InputReadiness::default())
+                .await;
+        }
+        exec_simple_builtin_impl::<T, SE>(context, args).await
+    })
 }
 
 fn exec_builtin<T: Command + Send + Sync, SE: extensions::ShellExtensions>(
