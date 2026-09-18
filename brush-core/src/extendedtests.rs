@@ -11,7 +11,8 @@ use crate::{
     variables::{self, ArrayLiteral},
 };
 
-#[async_recursion::async_recursion]
+#[cfg_attr(target_arch = "wasm32", async_recursion::async_recursion(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_recursion::async_recursion)]
 pub(crate) async fn eval_extended_test_expr(
     expr: &ast::ExtendedTestExpr,
     shell: &mut Shell<impl extensions::ShellExtensions>,

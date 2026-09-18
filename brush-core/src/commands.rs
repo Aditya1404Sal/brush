@@ -44,17 +44,17 @@ pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellEx
 
 impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
     /// Returns the standard input file; usable with `write!` et al.
-    pub fn stdin(&self) -> impl std::io::Read + 'static {
+    pub fn stdin(&self) -> openfiles::OpenFile {
         self.params.stdin(self.shell)
     }
 
     /// Returns the standard output file; usable with `write!` et al.
-    pub fn stdout(&self) -> impl std::io::Write + 'static {
+    pub fn stdout(&self) -> openfiles::OpenFile {
         self.params.stdout(self.shell)
     }
 
     /// Returns the standard error file; usable with `write!` et al.
-    pub fn stderr(&self) -> impl std::io::Write + 'static {
+    pub fn stderr(&self) -> openfiles::OpenFile {
         self.params.stderr(self.shell)
     }
 
@@ -459,10 +459,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 
     /// Runs an owned-shell builtin stage. Natively this offloads to a blocking task and returns a
     /// `StartedTask` so pipeline stages run concurrently on real threads. On `wasm32` there is no
-    /// thread pool and a builtin's synchronous I/O cannot yield the single-threaded reactor, so the
-    /// stage is run to completion *inline* (in pipeline order) and returned as `Completed`; the
-    /// upstream stage thus finishes and drops its in-memory pipe writer before the downstream stage
-    /// reads, giving the reader a clean end-of-stream (see `openfiles::open_mem_pipe`).
+    /// thread pool. The pipeline owns local stage tasks; each task awaits its builtin and
+    /// cooperative I/O directly, returning `Completed` to that stage's execution wrapper.
     #[cfg(not(target_arch = "wasm32"))]
     fn execute_via_builtin_in_owned_shell(
         mut shell: Shell<SE>,
@@ -725,13 +723,15 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
 ) -> Result<ExecutionResult, error::Error> {
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
+    #[cfg(target_arch = "wasm32")]
+    let services = context.shell.execution_services();
 
     let result = (builtin.execute_func)(context, args).await;
 
     // On wasm32, pipeline stages share one thread; give a stage waiting on this one's output — or
     // watching a pipe this builtin just found broken — its turn.
     #[cfg(target_arch = "wasm32")]
-    openfiles::yield_to_pipe_peers().await;
+    (services.yield_now)().await;
 
     match result {
         Ok(result) => Ok(result),
@@ -819,22 +819,21 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
 
     // On wasm32 (wasip2): `std::io::pipe()` is unsupported and the single-threaded runtime has no
-    // blocking pool for the concurrent spawn-then-read below. Use the in-memory pipe and run the
-    // substitution to completion first — bash collects all of a substitution's output before
-    // expanding it anyway — so dropping its params drops the pipe writer. A background job started
-    // inside the substitution can still hold a writer; like bash, wait for it to close.
+    // blocking pool for the concurrent spawn-then-read below. Poll the producer and bounded-pipe
+    // drain together, so substitutions larger than capacity do not fill an undrained pipe.
+    // Expansion still receives the captured output only after the producer completes.
     #[cfg(target_arch = "wasm32")]
     {
         let (mut reader, writer, _watch) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
-        let cmd_result = run_substitution_command(subshell, params, s).await?;
-        shell.set_last_exit_status(cmd_result.exit_code.into());
-
-        openfiles::wait_for_input(&reader, openfiles::InputReadiness::default()).await;
-
         let mut output_str = String::new();
-        std::io::Read::read_to_string(&mut reader, &mut output_str)?;
+        let (cmd_result, output_result) = futures::join!(
+            run_substitution_command(subshell, params, s),
+            futures::io::AsyncReadExt::read_to_string(reader.async_io(), &mut output_str)
+        );
+        output_result?;
+        shell.set_last_exit_status(cmd_result?.exit_code.into());
         Ok(output_str)
     }
 
@@ -878,6 +877,9 @@ async fn run_substitution_command(
     if let Ok(program) = &parse_result {
         if let Some(redir) = try_unwrap_bare_input_redir_program(program) {
             interp::setup_redirect(&mut shell, &mut params, redir).await?;
+            #[cfg(target_arch = "wasm32")]
+            futures::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell)).await?;
+            #[cfg(not(target_arch = "wasm32"))]
             std::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell))?;
             return Ok(ExecutionResult::new(0));
         }

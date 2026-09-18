@@ -46,10 +46,7 @@ impl ExecutionParameters {
     /// # Arguments
     ///
     /// * `shell` - The shell context.
-    pub fn stdin(
-        &self,
-        shell: &Shell<impl extensions::ShellExtensions>,
-    ) -> impl std::io::Read + 'static {
+    pub fn stdin(&self, shell: &Shell<impl extensions::ShellExtensions>) -> OpenFile {
         self.try_stdin(shell).unwrap_or_else(|| {
             ioutils::FailingReaderWriter::new("standard input not available").into()
         })
@@ -72,10 +69,7 @@ impl ExecutionParameters {
     /// # Arguments
     ///
     /// * `shell` - The shell context.
-    pub fn stdout(
-        &self,
-        shell: &Shell<impl extensions::ShellExtensions>,
-    ) -> impl std::io::Write + 'static {
+    pub fn stdout(&self, shell: &Shell<impl extensions::ShellExtensions>) -> OpenFile {
         self.try_stdout(shell).unwrap_or_else(|| {
             ioutils::FailingReaderWriter::new("standard output not available").into()
         })
@@ -97,10 +91,7 @@ impl ExecutionParameters {
     /// # Arguments
     ///
     /// * `shell` - The shell context.
-    pub fn stderr(
-        &self,
-        shell: &Shell<impl extensions::ShellExtensions>,
-    ) -> impl std::io::Write + 'static {
+    pub fn stderr(&self, shell: &Shell<impl extensions::ShellExtensions>) -> OpenFile {
         self.try_stderr(shell).unwrap_or_else(|| {
             ioutils::FailingReaderWriter::new("standard error not available").into()
         })
@@ -183,7 +174,8 @@ pub enum ProcessGroupPolicy {
     SameProcessGroup,
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait Execute {
     async fn execute(
         &self,
@@ -192,7 +184,8 @@ pub trait Execute {
     ) -> Result<ExecutionResult, error::Error>;
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 trait ExecuteInPipeline<SE: extensions::ShellExtensions> {
     async fn execute_in_pipeline(
         &self,
@@ -201,7 +194,8 @@ trait ExecuteInPipeline<SE: extensions::ShellExtensions> {
     ) -> Result<ExecutionSpawnResult, error::Error>;
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::Program {
     async fn execute(
         &self,
@@ -236,7 +230,8 @@ impl Execute for ast::Program {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::CompoundList {
     async fn execute(
         &self,
@@ -291,7 +286,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
     }
 
-    let join_handle = tokio::spawn(async move {
+    let join_handle = spawn_command_task(shell.execution_services(), async move {
         cloned_ao_list
             .execute(&mut cloned_shell, &cloned_params)
             .await
@@ -304,7 +299,8 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     ))
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::AndOrList {
     async fn execute(
         &self,
@@ -360,7 +356,8 @@ impl Execute for ast::AndOrList {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::Pipeline {
     async fn execute(
         &self,
@@ -388,9 +385,12 @@ impl Execute for ast::Pipeline {
         let spawned = spawn_pipeline_processes(self, shell, &params).await?;
 
         // Wait for the processes. This also has a side effect of updating pipeline status.
-        let mut result =
+        let wait_result =
             wait_for_pipeline_processes_and_update_status(self, spawned.results, shell, &params)
-                .await?;
+                .await;
+        #[cfg(target_arch = "wasm32")]
+        spawned._stage_tasks.cancel_and_join().await;
+        let mut result = wait_result?;
 
         // Invert the exit code if requested.
         if self.bang {
@@ -556,7 +556,12 @@ async fn spawn_pipeline_processes(
 
         let spawn_result = command
             .execute_in_pipeline(pipeline_context, cmd_params)
-            .await?;
+            .await;
+        #[cfg(target_arch = "wasm32")]
+        if spawn_result.is_err() {
+            stage_tasks.cancel_and_join().await;
+        }
+        let spawn_result = spawn_result?;
 
         // Update the process group ID if something was spawned.
         if let ExecutionSpawnResult::StartedProcess(child) = &spawn_result {
@@ -593,7 +598,19 @@ struct SpawnedPipeline {
 /// never see it. Aborting a task that has already finished does nothing.
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]
-struct StageTasks(Vec<tokio::task::AbortHandle>);
+struct StageTasks(Vec<crate::execution::TaskControl>);
+
+#[cfg(target_arch = "wasm32")]
+impl StageTasks {
+    async fn cancel_and_join(&self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in &self.0 {
+            task.clone().join().await;
+        }
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 impl Drop for StageTasks {
@@ -615,10 +632,9 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     command: ast::Command,
     params: ExecutionParameters,
     output_watch: Option<openfiles::MemPipeWatch>,
-) -> tokio::task::JoinHandle<Result<ExecutionResult, error::Error>> {
-    let stderr = params.try_fd(&shell, OpenFiles::STDERR_FD);
-
-    tokio::spawn(async move {
+) -> crate::execution::CommandTask {
+    let services = shell.execution_services();
+    services.spawn(async move {
         let run = async {
             let context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut shell),
@@ -642,14 +658,6 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
         tokio::select! {
             biased;
             () = watch.wait_broken() => {
-                if watch.overflowed() {
-                    if let Some(mut stderr) = stderr {
-                        let _ = writeln!(
-                            stderr,
-                            "brush: pipeline stage stopped: in-memory pipe buffer limit exceeded"
-                        );
-                    }
-                }
                 Ok(ExecutionResult::new(141))
             }
             result = run => result,
@@ -731,7 +739,8 @@ async fn wait_for_pipeline_processes_and_update_status(
     Ok(result)
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
     async fn execute_in_pipeline(
         &self,
@@ -773,7 +782,8 @@ enum WhileOrUntil {
     Until,
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::CompoundCommand {
     async fn execute(
         &self,
@@ -828,7 +838,8 @@ impl Execute for ast::CompoundCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::CoprocessCommand {
     async fn execute(
         &self,
@@ -876,7 +887,7 @@ impl Execute for ast::CoprocessCommand {
             .set_fd(OpenFiles::STDOUT_FD, stdout_writer.into());
 
         let body = self.body.clone();
-        let join_handle = tokio::spawn(async move {
+        let join_handle = spawn_command_task(shell.execution_services(), async move {
             let pipeline_context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut child_shell),
                 process_group_id: None,
@@ -913,7 +924,8 @@ impl Execute for ast::CoprocessCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::ForClauseCommand {
     async fn execute(
         &self,
@@ -979,7 +991,8 @@ impl Execute for ast::ForClauseCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::CaseClauseCommand {
     async fn execute(
         &self,
@@ -1046,7 +1059,8 @@ impl Execute for ast::CaseClauseCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::IfClauseCommand {
     async fn execute(
         &self,
@@ -1099,7 +1113,8 @@ impl Execute for ast::IfClauseCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
     async fn execute(
         &self,
@@ -1157,7 +1172,8 @@ impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::ArithmeticCommand {
     async fn execute(
         &self,
@@ -1177,7 +1193,8 @@ impl Execute for ast::ArithmeticCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::ArithmeticForClauseCommand {
     async fn execute(
         &self,
@@ -1220,7 +1237,8 @@ impl Execute for ast::ArithmeticForClauseCommand {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::FunctionDefinition {
     async fn execute(
         &self,
@@ -1261,7 +1279,8 @@ impl Execute for ast::FunctionDefinition {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[allow(clippy::too_many_lines)]
 impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleCommand {
     async fn execute_in_pipeline(
@@ -2065,6 +2084,7 @@ const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> She
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn setup_process_substitution(
     shell: &Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
@@ -2118,21 +2138,50 @@ fn setup_process_substitution(
     Ok((candidate_fd_num, target_file))
 }
 
+#[cfg(target_arch = "wasm32")]
+fn setup_process_substitution(
+    _shell: &Shell<impl extensions::ShellExtensions>,
+    _params: &ExecutionParameters,
+    _kind: &ast::ProcessSubstitutionKind,
+    _subshell_cmd: &ast::SubshellCommand,
+) -> Result<(ShellFd, OpenFile), error::Error> {
+    error::unimp("process substitution on WASM")
+}
+
+fn spawn_command_task(
+    services: crate::execution::ExecutionServices,
+    future: impl std::future::Future<Output = Result<ExecutionResult, error::Error>>
+    + crate::execution::MaybeSend
+    + 'static,
+) -> crate::execution::CommandTask {
+    #[cfg(target_arch = "wasm32")]
+    {
+        services.spawn(future)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = services;
+        tokio::spawn(future)
+    }
+}
+
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "the native implementation performs fallible file I/O"
+    )
+)]
 fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
     let bytes = contents.as_bytes();
 
     // wasm32-wasip2 has no OS pipes (`std::io::pipe()` errors "operation not supported on this
     // platform"). A here-document / here-string body is fully known up front, so stage it through the
-    // same in-memory `OpenFile::Stream` the pipeline and `$(...)` paths use: write the bytes, drop
-    // the writer (writers -> 0 => clean EOF for the reader), and hand back the reader. This is the
-    // simplest instance of that pattern (no inline sequencing needed). Mirrors the cfg-split at the
-    // pipeline site (`openfiles::open_mem_pipe`) and command substitution.
+    // a shared read-only byte stream. It is staged invocation input, not a pipe waiting for a
+    // consumer, so here-documents larger than the pipe capacity cannot deadlock initialization.
     #[cfg(target_arch = "wasm32")]
     {
-        let (reader, mut writer, _watch) = openfiles::open_mem_pipe();
-        writer.write_all(bytes)?;
-        drop(writer);
-        Ok(reader)
+        Ok(openfiles::from_bytes(bytes.to_vec()))
     }
 
     #[cfg(not(target_arch = "wasm32"))]

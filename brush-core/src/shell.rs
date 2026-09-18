@@ -57,6 +57,9 @@ pub use state::ShellState;
 ///   `DefaultShellExtensions`, which provide standard behavior.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExtensions> {
+    /// Executor callbacks are runtime resources and are supplied anew on restoration.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    execution_services: crate::execution::ExecutionServices,
     /// Injected error behavior.
     #[cfg_attr(feature = "serde", serde(skip, default = "default_error_formatter"))]
     error_formatter: SE::ErrorFormatter,
@@ -150,6 +153,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
         Self {
+            execution_services: self.execution_services,
             error_formatter: self.error_formatter.clone(),
             traps: self.traps.clone(),
             open_files: self.open_files.clone(),
@@ -201,6 +205,16 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// Returns this shell's execution services, inherited by cloned subshells.
+    pub const fn execution_services(&self) -> crate::execution::ExecutionServices {
+        self.execution_services
+    }
+
+    /// Reinstalls runtime callbacks after deserializing shell state.
+    pub const fn set_execution_services(&mut self, services: crate::execution::ExecutionServices) {
+        self.execution_services = services;
+    }
+
     /// Returns a new shell instance created with the given options.
     /// Does *not* load any configuration files (e.g., bashrc).
     ///
@@ -213,6 +227,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
         // Instantiate the shell with some defaults.
         let mut shell = Self {
+            execution_services: options.execution_services,
             error_formatter: options.error_formatter,
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
