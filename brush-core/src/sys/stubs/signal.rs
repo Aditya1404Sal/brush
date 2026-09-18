@@ -19,6 +19,10 @@ impl Signal {
     }
 
     /// Creates a `Signal` from a string representation.
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "matches the target-specific Signal API"
+    )]
     pub fn from_str(s: &str) -> Result<Self, error::Error> {
         Err(error::ErrorKind::InvalidSignal(s.into()).into())
     }

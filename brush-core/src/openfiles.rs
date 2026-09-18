@@ -9,12 +9,35 @@ use crate::ShellFd;
 use crate::error;
 use crate::sys;
 
+/// A borrowed asynchronous stream view with no synchronous read/write methods.
+pub trait AsyncStream: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin + Send {}
+impl<T: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
+
 /// A trait representing a stream that can be read from and written to.
 /// This is used for custom stream implementations in `OpenFile`.
 ///
 /// Types that implement this trait are expected to be cloneable via the
 /// `clone_box` function.
 pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
+    /// Polls a read. Ready streams may use the synchronous default; cooperative streams
+    /// register the supplied waker when no bytes are available yet.
+    fn poll_read(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(self.read(buf))
+    }
+
+    /// Polls a write, suspending when a cooperative stream has no capacity.
+    fn poll_write(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(self.write(buf))
+    }
+
     /// Clones the stream into a boxed trait object.
     fn clone_box(&self) -> Box<dyn Stream>;
 
@@ -108,6 +131,44 @@ pub fn null() -> Result<OpenFile, error::Error> {
     Ok(file.into())
 }
 
+/// Creates a read-only shared byte stream, suitable for fully staged here-documents.
+/// This storage is invocation input, rather than an undrained bounded pipe.
+pub fn from_bytes(bytes: Vec<u8>) -> OpenFile {
+    struct Bytes(Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>);
+    impl std::io::Read for Bytes {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read(buf)
+        }
+    }
+    impl std::io::Write for Bytes {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Stream for Bytes {
+        fn clone_box(&self) -> Box<dyn Stream> {
+            Box::new(Self(self.0.clone()))
+        }
+        #[cfg(unix)]
+        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+            Err(error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+        #[cfg(unix)]
+        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+            Err(error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+    }
+    OpenFile::Stream(Box::new(Bytes(Arc::new(std::sync::Mutex::new(
+        std::io::Cursor::new(bytes),
+    )))))
+}
+
 impl Clone for OpenFile {
     fn clone(&self) -> Self {
         match self {
@@ -139,6 +200,12 @@ impl std::fmt::Display for OpenFile {
 }
 
 impl OpenFile {
+    /// Borrows an async view. Memory pipes suspend without blocking the executor;
+    /// regular files and custom ready streams retain their existing synchronous I/O.
+    pub fn async_io(&mut self) -> &mut dyn AsyncStream {
+        self
+    }
+
     /// Converts the open file into an `OwnedFd`. For shared file/pipe handles this materializes
     /// a real duplicate via `dup(2)` so the caller receives an independently owned descriptor.
     #[cfg(unix)]
@@ -308,6 +375,47 @@ impl std::io::Write for OpenFile {
     }
 }
 
+impl futures::io::AsyncRead for OpenFile {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Stream(stream) => stream.poll_read(cx, buf),
+            file => std::task::Poll::Ready(std::io::Read::read(file, buf)),
+        }
+    }
+}
+
+impl futures::io::AsyncWrite for OpenFile {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Stream(stream) => stream.poll_write(cx, buf),
+            file => std::task::Poll::Ready(std::io::Write::write(file, buf)),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(std::io::Write::flush(&mut *self))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Closing this borrowed view flushes; dropping the owned OpenFile closes its handle.
+        self.poll_flush(cx)
+    }
+}
+
 /// What a builtin needs to find in its input before it starts reading, when that input is an
 /// in-memory pipe fed by another pipeline stage. See [`wait_for_input`].
 ///
@@ -354,65 +462,20 @@ pub async fn wait_for_input(file: &OpenFile, readiness: InputReadiness) {
     let _ = (file, readiness);
 }
 
-/// An in-memory pipe used to connect pipeline stages on `wasm32` targets, where
-/// `std::io::pipe()` is unsupported ("operation not supported on this platform") and there is
-/// only one thread.
-///
-/// Pipeline stages run as tasks on that one thread and hand control to each other cooperatively,
-/// so neither end of the pipe may block:
-///
-/// - A write never waits. It fails with `BrokenPipe` once every reader is gone (the stage is then
-///   ended, as `SIGPIPE` would end it) or once the buffer would exceed its capacity.
-/// - A read never waits either. A reader that must not see a premature end-of-stream first awaits
-///   [`MemPipeReader::wait_ready`]; a read that still finds the buffer empty while a writer
-///   remains fails with `WouldBlock` rather than silently reporting end-of-stream.
-/// - Stages yield after each builtin (see [`yield_to_pipe_peers`]) once more than 64 KiB is
-///   buffered — the point at which a producer would block on a full OS pipe, and what lets the
-///   next stage start at all when the producer never finishes — and while any reader is parked
-///   waiting for a line or a byte count, so the producer and that reader interleave.
-///
-/// The adapter is pure in-memory logic (no wasm-specific APIs), so it also compiles under `cfg(test)`
-/// to be unit-tested natively; only its *use* in the pipeline wiring is `wasm32`-only.
+/// A bounded in-memory pipe for single-threaded WASM execution.
+/// Async views park on empty/full buffers and register wakeups under the state lock.
+/// Synchronous compatibility reports `WouldBlock`, never a premature EOF or capacity failure.
+/// Last-writer closure delivers EOF after draining; last-reader closure wakes writers with
+/// `BrokenPipe`. The state machine is platform independent and tested on the host.
 #[cfg(any(target_arch = "wasm32", test))]
 mod mem_pipe {
-    use std::cell::Cell;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::Notify;
 
-    /// The default buffer capacity. A producer that outruns a reader waiting for end-of-stream
-    /// stops here instead of growing memory without bound.
-    pub(crate) const DEFAULT_CAPACITY: usize = 64 * 1024 * 1024;
-
-    /// Once more than this many bytes are buffered across pipes, stages yield after each builtin.
-    /// It matches a Linux pipe's default buffer, where a producer would block and the consumer
-    /// would get scheduled.
-    pub(crate) const SOFT_LIMIT: usize = 64 * 1024;
-
-    thread_local! {
-        /// Readers currently parked waiting for a line or a byte count. While non-zero, stages
-        /// yield after each builtin so the waiting reader gets a turn.
-        static STREAMING_WAITERS: Cell<usize> = const { Cell::new(0) };
-
-        /// Set when a write found no reader, so the writing stage yields once and its watcher can
-        /// end it.
-        static BROKEN_WRITE: Cell<bool> = const { Cell::new(false) };
-
-        /// Bytes written into pipes on this thread and not yet read or discarded.
-        static BUFFERED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Returns whether more than [`SOFT_LIMIT`] bytes are buffered across pipes.
-    pub(crate) fn over_soft_limit() -> bool {
-        BUFFERED.get() > SOFT_LIMIT
-    }
-
-    /// Adjusts the buffered-byte count; tolerates thread-local teardown, since pipes can be dropped
-    /// while the thread exits.
-    fn account(add: usize, remove: usize) {
-        let _ = BUFFERED.try_with(|b| b.set(b.get().saturating_add(add).saturating_sub(remove)));
-    }
+    /// Maximum buffered bytes. Capacity exhaustion parks asynchronous writers.
+    pub(crate) const DEFAULT_CAPACITY: usize = 64 * 1024;
 
     /// The buffer and the handle counts behind one pipe. End-of-stream is "buffer drained and no
     /// writers remain", so the explicit counts — not the `Arc` strong count, which every handle and
@@ -422,15 +485,10 @@ mod mem_pipe {
         writers: usize,
         readers: usize,
         capacity: usize,
+        next_id: usize,
         broken: bool,
-        overflowed: bool,
-    }
-
-    impl Drop for Inner {
-        // Bytes nobody read are discarded with the pipe.
-        fn drop(&mut self) {
-            account(0, self.buf.len());
-        }
+        read_wakers: HashMap<usize, std::task::Waker>,
+        write_wakers: HashMap<usize, std::task::Waker>,
     }
 
     struct Shared {
@@ -452,60 +510,36 @@ mod mem_pipe {
 
     /// The write half. Cloning bumps the live-writer count; dropping decrements it, and reaching
     /// zero is the EOF signal to the reader.
-    pub(crate) struct MemPipeWriter(Arc<Shared>);
+    pub(crate) struct MemPipeWriter(Arc<Shared>, usize);
 
     /// The read half. Drains the shared buffer; reports EOF once the buffer is empty and every
     /// writer handle has been dropped.
-    pub(crate) struct MemPipeReader(Arc<Shared>);
+    pub(crate) struct MemPipeReader(Arc<Shared>, usize);
 
     /// Observes a pipe without holding either end, so it never keeps the pipe open.
     pub(crate) struct MemPipeWatch(Arc<Shared>);
 
     /// Creates a connected (reader, writer) pair sharing one in-memory buffer, plus a watch on it.
     pub(crate) fn pipe(capacity: usize) -> (MemPipeReader, MemPipeWriter, MemPipeWatch) {
+        assert!(capacity > 0, "pipe capacity must be positive");
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 buf: VecDeque::new(),
                 writers: 1,
                 readers: 1,
                 capacity,
+                next_id: 2,
                 broken: false,
-                overflowed: false,
+                read_wakers: HashMap::new(),
+                write_wakers: HashMap::new(),
             }),
             changed: Notify::new(),
         });
         (
-            MemPipeReader(Arc::clone(&shared)),
-            MemPipeWriter(Arc::clone(&shared)),
+            MemPipeReader(Arc::clone(&shared), 0),
+            MemPipeWriter(Arc::clone(&shared), 1),
             MemPipeWatch(shared),
         )
-    }
-
-    /// Yields to other tasks when more than [`SOFT_LIMIT`] bytes are buffered, when a stage is
-    /// parked waiting for a line or a byte count, or when this task just wrote to a pipe nobody
-    /// reads. Called after every builtin.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn yield_to_pipe_peers() {
-        let broken_write = BROKEN_WRITE.replace(false);
-        if broken_write || STREAMING_WAITERS.get() > 0 || over_soft_limit() {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// Counts a parked streaming reader for as long as it is alive.
-    struct StreamingWaiter;
-
-    impl StreamingWaiter {
-        fn new() -> Self {
-            STREAMING_WAITERS.set(STREAMING_WAITERS.get() + 1);
-            Self
-        }
-    }
-
-    impl Drop for StreamingWaiter {
-        fn drop(&mut self) {
-            let _ = STREAMING_WAITERS.try_with(|w| w.set(w.get().saturating_sub(1)));
-        }
     }
 
     /// Returns whether `buf` contains at least `needed` (minimum 1) `delimiter`s not escaped by a
@@ -551,7 +585,6 @@ mod mem_pipe {
     impl MemPipeReader {
         /// Waits until `readiness` is satisfied or every writer has closed.
         pub(crate) async fn wait_ready(&self, readiness: super::InputReadiness) {
-            let streaming = readiness.delimiter.is_some() || readiness.min_bytes.is_some();
             loop {
                 let notified = self.0.changed.notified();
                 tokio::pin!(notified);
@@ -561,16 +594,13 @@ mod mem_pipe {
                     return;
                 }
 
-                // Only a reader that can start before end-of-stream asks producers to yield; a reader
-                // waiting for end-of-stream is best served by letting the producer run on.
-                let _waiter = streaming.then(StreamingWaiter::new);
                 notified.await;
             }
         }
     }
 
     impl MemPipeWatch {
-        /// Resolves once a write has found no reader, or has exceeded the capacity.
+        /// Resolves once the last reader closes.
         pub(crate) async fn wait_broken(&self) {
             loop {
                 let notified = self.0.changed.notified();
@@ -583,17 +613,16 @@ mod mem_pipe {
                 notified.await;
             }
         }
-
-        /// Returns whether the pipe broke because a write exceeded its capacity.
-        pub(crate) fn overflowed(&self) -> bool {
-            lock(&self.0).overflowed
-        }
     }
 
     impl Clone for MemPipeWriter {
         fn clone(&self) -> Self {
-            lock(&self.0).writers += 1;
-            Self(Arc::clone(&self.0))
+            let mut inner = lock(&self.0);
+            inner.writers += 1;
+            let id = inner.next_id;
+            inner.next_id += 1;
+            drop(inner);
+            Self(Arc::clone(&self.0), id)
         }
     }
 
@@ -601,40 +630,64 @@ mod mem_pipe {
         fn drop(&mut self) {
             let mut inner = lock(&self.0);
             inner.writers -= 1;
+            inner.write_wakers.remove(&self.1);
             let closed = inner.writers == 0;
+            let wake = if closed {
+                std::mem::take(&mut inner.read_wakers)
+            } else {
+                HashMap::new()
+            };
             drop(inner);
+            for waker in wake.into_values() {
+                waker.wake();
+            }
             if closed {
                 self.0.changed.notify_waiters();
             }
         }
     }
 
-    impl std::io::Write for MemPipeWriter {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+    impl MemPipeWriter {
+        fn write_with_waker(
+            &self,
+            data: &[u8],
+            waker: Option<&std::task::Waker>,
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::task::Poll;
+            if data.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
             let mut inner = lock(&self.0);
             if inner.readers == 0 {
-                inner.broken = true;
-                drop(inner);
-                BROKEN_WRITE.set(true);
-                self.0.changed.notify_waiters();
-                return Err(std::io::ErrorKind::BrokenPipe.into());
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
-            if inner.buf.len().saturating_add(data.len()) > inner.capacity {
-                inner.broken = true;
-                inner.overflowed = true;
-                drop(inner);
-                BROKEN_WRITE.set(true);
-                self.0.changed.notify_waiters();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "in-memory pipe buffer limit exceeded",
-                ));
+            let n = data.len().min(inner.capacity - inner.buf.len());
+            if n == 0 {
+                if let Some(waker) = waker {
+                    inner.write_wakers.insert(self.1, waker.clone());
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Err(std::io::ErrorKind::WouldBlock.into()));
             }
-            inner.buf.extend(data.iter().copied());
+            inner.buf.extend(data[..n].iter().copied());
+            let wake = std::mem::take(&mut inner.read_wakers);
             drop(inner);
-            account(data.len(), 0);
+            for waker in wake.into_values() {
+                waker.wake();
+            }
             self.0.changed.notify_waiters();
-            Ok(data.len())
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl std::io::Write for MemPipeWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            match self.write_with_waker(data, None) {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => {
+                    unreachable!("synchronous writes do not register wakeups")
+                }
+            }
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
@@ -649,6 +702,18 @@ mod mem_pipe {
     }
 
     impl super::Stream for MemPipeWriter {
+        fn poll_write(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.write_with_waker(data, Some(cx.waker()))
+        }
+
+        fn as_any(&self) -> Option<&dyn std::any::Any> {
+            Some(self)
+        }
+
         fn clone_box(&self) -> Box<dyn super::Stream> {
             Box::new(self.clone())
         }
@@ -669,39 +734,80 @@ mod mem_pipe {
 
     impl Clone for MemPipeReader {
         fn clone(&self) -> Self {
-            lock(&self.0).readers += 1;
-            Self(Arc::clone(&self.0))
+            let mut inner = lock(&self.0);
+            inner.readers += 1;
+            let id = inner.next_id;
+            inner.next_id += 1;
+            drop(inner);
+            Self(Arc::clone(&self.0), id)
         }
     }
 
     impl Drop for MemPipeReader {
         fn drop(&mut self) {
-            lock(&self.0).readers -= 1;
+            let mut inner = lock(&self.0);
+            inner.readers -= 1;
+            inner.read_wakers.remove(&self.1);
+            let closed = inner.readers == 0;
+            let wake = if closed {
+                inner.broken = true;
+                std::mem::take(&mut inner.write_wakers)
+            } else {
+                HashMap::new()
+            };
+            drop(inner);
+            for waker in wake.into_values() {
+                waker.wake();
+            }
+            if closed {
+                self.0.changed.notify_waiters();
+            }
+        }
+    }
+
+    impl MemPipeReader {
+        fn read_with_waker(
+            &self,
+            buf: &mut [u8],
+            waker: Option<&std::task::Waker>,
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::task::Poll;
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            let mut inner = lock(&self.0);
+            if inner.buf.is_empty() {
+                if inner.writers == 0 {
+                    return Poll::Ready(Ok(0));
+                }
+                if let Some(waker) = waker {
+                    inner.read_wakers.insert(self.1, waker.clone());
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Err(std::io::ErrorKind::WouldBlock.into()));
+            }
+            let n = buf.len().min(inner.buf.len());
+            for (slot, byte) in buf.iter_mut().zip(inner.buf.drain(..n)) {
+                *slot = byte;
+            }
+            let wake = std::mem::take(&mut inner.write_wakers);
+            drop(inner);
+            for waker in wake.into_values() {
+                waker.wake();
+            }
+            self.0.changed.notify_waiters();
+            Poll::Ready(Ok(n))
         }
     }
 
     impl std::io::Read for MemPipeReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let mut inner = lock(&self.0);
-            if inner.buf.is_empty() {
-                if inner.writers == 0 {
-                    return Ok(0);
+            match self.read_with_waker(buf, None) {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => {
+                    unreachable!("synchronous reads do not register wakeups")
                 }
-                // A writer remains, so this is not end-of-stream. Blocking would stall the only
-                // thread, and reporting EOF would silently truncate the input.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "in-memory pipe has no data yet; the reading builtin must first await \
-                     `openfiles::wait_for_input`",
-                ));
             }
-            let n = std::cmp::min(buf.len(), inner.buf.len());
-            for (slot, byte) in buf.iter_mut().zip(inner.buf.drain(..n)) {
-                *slot = byte;
-            }
-            drop(inner);
-            account(0, n);
-            Ok(n)
         }
     }
 
@@ -719,6 +825,14 @@ mod mem_pipe {
     }
 
     impl super::Stream for MemPipeReader {
+        fn poll_read(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.read_with_waker(buf, Some(cx.waker()))
+        }
+
         fn clone_box(&self) -> Box<dyn super::Stream> {
             Box::new(self.clone())
         }
@@ -740,7 +854,7 @@ mod mem_pipe {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use mem_pipe::{MemPipeWatch, yield_to_pipe_peers};
+pub(crate) use mem_pipe::MemPipeWatch;
 
 /// Creates an in-memory pipe as a connected `(reader, writer)` pair of [`OpenFile`]s plus a watch
 /// on it, for use on `wasm32` where `std::io::pipe()` is unsupported. See [`mem_pipe`].
@@ -751,6 +865,15 @@ pub(crate) fn open_mem_pipe() -> (OpenFile, OpenFile, MemPipeWatch) {
         OpenFile::Stream(Box::new(reader)),
         OpenFile::Stream(Box::new(writer)),
         watch,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_pipe(capacity: usize) -> (OpenFile, OpenFile) {
+    let (reader, writer, _) = mem_pipe::pipe(capacity);
+    (
+        OpenFile::Stream(Box::new(reader)),
+        OpenFile::Stream(Box::new(writer)),
     )
 }
 
@@ -1001,19 +1124,17 @@ mod mem_pipe_tests {
         let err = writer.write_all(b"nobody").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(watch.wait_broken().now_or_never().is_some());
-        assert!(!watch.overflowed());
     }
 
-    /// A write that would exceed the capacity fails, and the watch reports why.
+    /// Capacity exhaustion is recoverable backpressure, not a broken pipe.
     #[test]
-    fn write_beyond_capacity_breaks_the_pipe() {
+    fn write_beyond_capacity_would_block() {
         let (_reader, mut writer, watch) = mem_pipe::pipe(8);
 
         writer.write_all(b"12345678").unwrap();
         let err = writer.write_all(b"9").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
-        assert!(watch.wait_broken().now_or_never().is_some());
-        assert!(watch.overflowed());
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(watch.wait_broken().now_or_never().is_none());
     }
 
     /// A line reader becomes ready at the delimiter, a byte-count reader at the count, and every
@@ -1084,27 +1205,6 @@ mod mem_pipe_tests {
         assert!(reader.wait_ready(three_lines).now_or_never().is_some());
     }
 
-    /// Buffered bytes count toward the soft limit until they are read or the pipe is dropped.
-    #[test]
-    fn buffered_bytes_track_the_soft_limit() {
-        let (mut reader, mut writer, watch) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
-        assert!(!mem_pipe::over_soft_limit());
-
-        writer
-            .write_all(&vec![b'y'; mem_pipe::SOFT_LIMIT + 1])
-            .unwrap();
-        assert!(mem_pipe::over_soft_limit());
-
-        let mut chunk = [0u8; 2];
-        reader.read_exact(&mut chunk).unwrap();
-        assert!(!mem_pipe::over_soft_limit());
-
-        writer.write_all(&[b'y'; 8]).unwrap();
-        assert!(mem_pipe::over_soft_limit());
-        drop((reader, writer, watch));
-        assert!(!mem_pipe::over_soft_limit());
-    }
-
     /// A parked line reader stays parked until the delimiter arrives, and is woken by the write.
     #[test]
     fn parked_reader_wakes_on_write() {
@@ -1120,5 +1220,100 @@ mod mem_pipe_tests {
 
         writer.write_all(b"\n").unwrap();
         assert!(wait.poll_unpin(&mut cx).is_ready());
+    }
+
+    fn open_pipe(capacity: usize) -> (super::OpenFile, super::OpenFile) {
+        let (reader, writer, _) = mem_pipe::pipe(capacity);
+        (
+            super::OpenFile::Stream(Box::new(reader)),
+            super::OpenFile::Stream(Box::new(writer)),
+        )
+    }
+
+    #[test]
+    fn oversized_async_writes_backpressure_and_drain_before_eof() {
+        use futures::io::{AsyncReadExt, AsyncWriteExt};
+        for capacity in [1, 8, 64 * 1024] {
+            let (mut reader, mut writer) = open_pipe(capacity);
+            let payload: Vec<u8> = (0..(capacity * 3 + 19))
+                .map(|n| u8::try_from(n % 251).unwrap())
+                .collect();
+            let mut output = Vec::new();
+            let (write, read) = futures::executor::block_on(async {
+                futures::join!(
+                    async {
+                        writer.async_io().write_all(&payload).await?;
+                        drop(writer);
+                        Ok::<_, std::io::Error>(())
+                    },
+                    reader.async_io().read_to_end(&mut output)
+                )
+            });
+            write.unwrap();
+            read.unwrap();
+            assert_eq!(output, payload);
+        }
+    }
+
+    #[test]
+    fn full_writer_wakes_when_last_reader_closes() {
+        use futures::io::AsyncWriteExt;
+        let (reader, mut writer) = open_pipe(1);
+        std::io::Write::write_all(&mut writer, b"a").unwrap();
+        let mut write = Box::pin(writer.async_io().write_all(b"b"));
+        let wake = std::sync::Arc::new(CountWake::default());
+        let waker = futures::task::waker(wake.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(write.poll_unpin(&mut cx).is_pending());
+        drop(reader);
+        assert!(wake.0.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            matches!(write.poll_unpin(&mut cx), std::task::Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[test]
+    fn empty_reader_wakes_when_last_writer_closes() {
+        use futures::io::AsyncReadExt;
+        let (mut reader, writer) = open_pipe(1);
+        let writer2 = writer.clone();
+        let mut buf = [0; 1];
+        let mut read = Box::pin(reader.async_io().read(&mut buf));
+        let wake = std::sync::Arc::new(CountWake::default());
+        let waker = futures::task::waker(wake.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(read.poll_unpin(&mut cx).is_pending());
+        drop(writer);
+        assert!(read.poll_unpin(&mut cx).is_pending());
+        drop(writer2);
+        assert!(wake.0.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(matches!(
+            read.poll_unpin(&mut cx),
+            std::task::Poll::Ready(Ok(0))
+        ));
+    }
+
+    #[test]
+    fn synchronous_oversized_write_reports_partial_progress() {
+        let (mut reader, mut writer, _) = mem_pipe::pipe(1);
+        assert_eq!(writer.write(b"abc").unwrap(), 1);
+        assert_eq!(
+            writer.write(b"bc").unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut buf = [0; 4];
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'a');
+        assert_eq!(writer.write(b"bc").unwrap(), 1);
+    }
+
+    #[derive(Default)]
+    struct CountWake(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for CountWake {
+        fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+            arc_self
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }

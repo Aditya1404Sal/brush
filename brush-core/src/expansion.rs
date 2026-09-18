@@ -1017,7 +1017,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
     }
 
-    #[async_recursion::async_recursion]
+    #[cfg_attr(target_arch = "wasm32", async_recursion::async_recursion(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_recursion::async_recursion)]
     async fn expand_word_piece(
         &mut self,
         word_piece: brush_parser::word::WordPiece,

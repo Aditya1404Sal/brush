@@ -13,7 +13,7 @@ use crate::sys;
 use crate::trace_categories;
 use crate::traps;
 
-pub(crate) type JobJoinHandle = tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>;
+pub(crate) type JobJoinHandle = crate::execution::CommandTask;
 pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
 
 /// Manages the jobs that are currently managed by the shell.

@@ -253,7 +253,7 @@ pub enum ExecutionSpawnResult {
     /// Indicates that a process was started and had not yet completed.
     StartedProcess(processes::ChildProcess),
     /// Indicates that a task was started to handle the execution asynchronously.
-    StartedTask(tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>),
+    StartedTask(crate::execution::CommandTask),
 }
 
 impl From<ExecutionResult> for ExecutionSpawnResult {

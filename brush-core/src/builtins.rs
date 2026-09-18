@@ -1,7 +1,10 @@
 //! Facilities for implementing and managing builtins
 
 use clap::builder::styling;
+#[cfg(not(target_arch = "wasm32"))]
 pub use futures::future::BoxFuture;
+#[cfg(target_arch = "wasm32")]
+pub use futures::future::LocalBoxFuture as BoxFuture;
 use std::io::Write;
 
 use crate::{BuiltinError, CommandArg, commands, error, extensions, results};
@@ -80,7 +83,7 @@ pub trait Command: clap::Parser {
         &self,
         context: commands::ExecutionContext<'_, SE>,
     ) -> impl std::future::Future<Output = Result<results::ExecutionResult, Self::Error>>
-    + std::marker::Send;
+    + crate::execution::MaybeSend;
 
     /// Returns the textual help content associated with the command.
     ///
