@@ -38,9 +38,22 @@ pub struct ExecutionParameters {
     /// Whether `errexit` (exit on error) behavior should be
     /// suppressed in this execution context. Defaults to `false`.
     pub suppress_errexit: bool,
+    /// Embedder context, cloned into stages and substitutions rather than installed globally.
+    context: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl ExecutionParameters {
+    /// Attaches invocation-owned embedder context inherited by cloned execution parameters.
+    /// The context is not shell state and is never serialized into a shell snapshot.
+    pub fn set_context<T: std::any::Any + Send + Sync>(&mut self, context: std::sync::Arc<T>) {
+        self.context = Some(context);
+    }
+
+    /// Retrieves this invocation's context when its type matches, without retaining a borrow.
+    pub fn context<T: std::any::Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
+        self.context.clone()?.downcast().ok()
+    }
+
     /// Returns the standard input file; usable with `write!` et al.
     ///
     /// # Arguments
@@ -2201,5 +2214,26 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
         drop(writer);
 
         Ok(reader.into())
+    }
+}
+
+#[cfg(test)]
+mod execution_context_tests {
+    use super::ExecutionParameters;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cloned_parameters_retain_context_without_cross_invocation_leakage() {
+        let mut first = ExecutionParameters::default();
+        let mut second = ExecutionParameters::default();
+        first.set_context(Arc::new(String::from("first")));
+        second.set_context(Arc::new(String::from("second")));
+        let child = first.clone();
+        first.set_context(Arc::new(String::from("replacement")));
+        tokio::task::yield_now().await;
+        assert_eq!(&*child.context::<String>().unwrap(), "first");
+        assert_eq!(&*second.context::<String>().unwrap(), "second");
+        assert!(child.context::<usize>().is_none());
+        assert!(ExecutionParameters::default().context::<String>().is_none());
     }
 }

@@ -793,7 +793,10 @@ mod mem_pipe {
             let closed = inner.readers == 0;
             // Only cancel an active pipe writer. A stage that redirects its output elsewhere
             // must run even if its unused pipeline reader exits before its first poll.
-            if closed && inner.wrote && inner.cancel_on_broken {
+            // Closing after EOF cannot break an already-closed writer. Its producer
+            // may still be completing task bookkeeping; cancelling now would replace
+            // the command's real exit status with a spurious 141.
+            if closed && inner.writers > 0 && inner.wrote && inner.cancel_on_broken {
                 inner.broken = true;
             }
 
@@ -1327,6 +1330,20 @@ mod mem_pipe_tests {
         writer.write_all(b"x").unwrap();
         drop(reader);
         assert!(watch.wait_broken().now_or_never().is_some());
+    }
+
+    #[test]
+    fn closing_reader_after_eof_does_not_cancel_completed_writer() {
+        for capacity in [1, 8, mem_pipe::DEFAULT_CAPACITY] {
+            let (mut reader, mut writer, watch) = mem_pipe::pipe(capacity);
+            writer.write_all(b"x").unwrap();
+            drop(writer);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"x");
+            drop(reader);
+            assert!(watch.wait_broken().now_or_never().is_none());
+        }
     }
 
     #[test]
