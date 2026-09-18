@@ -38,6 +38,16 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
         std::task::Poll::Ready(self.write(buf))
     }
 
+    /// Reports immediately readable input without consuming it, for `read -t 0`.
+    /// Custom streams may return `None` when they do not support this query.
+    fn input_ready(&self) -> Option<bool> {
+        None
+    }
+
+    /// Selects whether a broken write should cancel its owning pipeline stage.
+    /// A command such as `tee -p` handles `BrokenPipe` itself. Other streams ignore this.
+    fn set_broken_pipe_cancellation(&mut self, _enabled: bool) {}
+
     /// Clones the stream into a boxed trait object.
     fn clone_box(&self) -> Box<dyn Stream>;
 
@@ -152,6 +162,9 @@ pub fn from_bytes(bytes: Vec<u8>) -> OpenFile {
         }
     }
     impl Stream for Bytes {
+        fn input_ready(&self) -> Option<bool> {
+            Some(true)
+        }
         fn clone_box(&self) -> Box<dyn Stream> {
             Box::new(Self(self.0.clone()))
         }
@@ -204,6 +217,22 @@ impl OpenFile {
     /// regular files and custom ready streams retain their existing synchronous I/O.
     pub fn async_io(&mut self) -> &mut dyn AsyncStream {
         self
+    }
+
+    /// Queries readiness without consuming bytes. Cooperative streams can answer immediately.
+    pub fn input_ready(&self) -> Option<bool> {
+        match self {
+            Self::Stream(stream) => stream.input_ready(),
+            Self::File(_) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Let a command explicitly handle pipe write errors instead of SIGPIPE-style stage cancellation.
+    pub fn set_broken_pipe_cancellation(&mut self, enabled: bool) {
+        if let Self::Stream(stream) = self {
+            stream.set_broken_pipe_cancellation(enabled);
+        }
     }
 
     /// Converts the open file into an `OwnedFd`. For shared file/pipe handles this materializes
@@ -469,7 +498,7 @@ pub async fn wait_for_input(file: &OpenFile, readiness: InputReadiness) {
 /// `BrokenPipe`. The state machine is platform independent and tested on the host.
 #[cfg(any(target_arch = "wasm32", test))]
 mod mem_pipe {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::Notify;
@@ -487,8 +516,10 @@ mod mem_pipe {
         capacity: usize,
         next_id: usize,
         broken: bool,
-        read_wakers: HashMap<usize, std::task::Waker>,
-        write_wakers: HashMap<usize, std::task::Waker>,
+        cancel_on_broken: bool,
+        wrote: bool,
+        read_wakers: BTreeMap<usize, std::task::Waker>,
+        write_wakers: BTreeMap<usize, std::task::Waker>,
     }
 
     struct Shared {
@@ -530,8 +561,10 @@ mod mem_pipe {
                 capacity,
                 next_id: 2,
                 broken: false,
-                read_wakers: HashMap::new(),
-                write_wakers: HashMap::new(),
+                cancel_on_broken: true,
+                wrote: false,
+                read_wakers: BTreeMap::new(),
+                write_wakers: BTreeMap::new(),
             }),
             changed: Notify::new(),
         });
@@ -600,7 +633,8 @@ mod mem_pipe {
     }
 
     impl MemPipeWatch {
-        /// Resolves once the last reader closes.
+        /// Resolves when an active pipe loses its last reader or a write observes closure.
+        /// Closing an unused pipe alone must not cancel commands redirected elsewhere.
         pub(crate) async fn wait_broken(&self) {
             loop {
                 let notified = self.0.changed.notified();
@@ -635,7 +669,7 @@ mod mem_pipe {
             let wake = if closed {
                 std::mem::take(&mut inner.read_wakers)
             } else {
-                HashMap::new()
+                BTreeMap::new()
             };
             drop(inner);
             for waker in wake.into_values() {
@@ -659,6 +693,9 @@ mod mem_pipe {
             }
             let mut inner = lock(&self.0);
             if inner.readers == 0 {
+                inner.broken = inner.cancel_on_broken;
+                drop(inner);
+                self.0.changed.notify_waiters();
                 return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
             let n = data.len().min(inner.capacity - inner.buf.len());
@@ -669,6 +706,7 @@ mod mem_pipe {
                 }
                 return Poll::Ready(Err(std::io::ErrorKind::WouldBlock.into()));
             }
+            inner.wrote = true;
             inner.buf.extend(data[..n].iter().copied());
             let wake = std::mem::take(&mut inner.read_wakers);
             drop(inner);
@@ -710,6 +748,10 @@ mod mem_pipe {
             self.write_with_waker(data, Some(cx.waker()))
         }
 
+        fn set_broken_pipe_cancellation(&mut self, enabled: bool) {
+            lock(&self.0).cancel_on_broken = enabled;
+        }
+
         fn as_any(&self) -> Option<&dyn std::any::Any> {
             Some(self)
         }
@@ -749,11 +791,16 @@ mod mem_pipe {
             inner.readers -= 1;
             inner.read_wakers.remove(&self.1);
             let closed = inner.readers == 0;
-            let wake = if closed {
+            // Only cancel an active pipe writer. A stage that redirects its output elsewhere
+            // must run even if its unused pipeline reader exits before its first poll.
+            if closed && inner.wrote && inner.cancel_on_broken {
                 inner.broken = true;
+            }
+
+            let wake = if closed {
                 std::mem::take(&mut inner.write_wakers)
             } else {
-                HashMap::new()
+                BTreeMap::new()
             };
             drop(inner);
             for waker in wake.into_values() {
@@ -833,6 +880,10 @@ mod mem_pipe {
             self.read_with_waker(buf, Some(cx.waker()))
         }
 
+        fn input_ready(&self) -> Option<bool> {
+            let inner = lock(&self.0);
+            Some(!inner.buf.is_empty() || inner.writers == 0)
+        }
         fn clone_box(&self) -> Box<dyn super::Stream> {
             Box::new(self.clone())
         }
@@ -1121,6 +1172,7 @@ mod mem_pipe_tests {
         assert!(watch.wait_broken().now_or_never().is_none());
 
         drop(reader2);
+        assert!(watch.wait_broken().now_or_never().is_some());
         let err = writer.write_all(b"nobody").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(watch.wait_broken().now_or_never().is_some());
@@ -1253,6 +1305,28 @@ mod mem_pipe_tests {
             read.unwrap();
             assert_eq!(output, payload);
         }
+    }
+
+    #[test]
+    fn tee_can_handle_broken_pipe_without_stage_cancellation() {
+        let (reader, writer, watch) = mem_pipe::pipe(1);
+        let mut writer = super::OpenFile::Stream(Box::new(writer));
+        writer.set_broken_pipe_cancellation(false);
+        writer.write_all(b"x").unwrap();
+        drop(reader);
+        assert_eq!(
+            writer.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(watch.wait_broken().now_or_never().is_none());
+    }
+
+    #[test]
+    fn closing_reader_cancels_a_writer_that_already_produced() {
+        let (reader, mut writer, watch) = mem_pipe::pipe(1);
+        writer.write_all(b"x").unwrap();
+        drop(reader);
+        assert!(watch.wait_broken().now_or_never().is_some());
     }
 
     #[test]
