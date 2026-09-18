@@ -394,6 +394,7 @@ dependencies = [
  "chrono",
  "clap",
  "fancy-regex",
+ "futures",
  "itertools 0.14.0",
  "nix 0.31.3",
  "pretty_assertions",

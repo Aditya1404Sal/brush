@@ -1,4 +1,6 @@
-use std::io::{Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
+use std::io::Write;
 
 use clap::Parser;
 
@@ -82,16 +84,8 @@ impl builtins::Command for MapFileCommand {
             .try_fd(self.fd)
             .ok_or_else(|| ErrorKind::BadFileDescriptor(self.fd))?;
 
-        // When the input is a pipe fed by another pipeline stage on the same thread (wasm32), let
-        // that stage finish first: mapfile reads to end-of-stream.
-        brush_core::openfiles::wait_for_input(
-            &input_file,
-            brush_core::openfiles::InputReadiness::default(),
-        )
-        .await;
-
         // Read!
-        let results = self.read_entries(input_file)?;
+        let results = self.read_entries(input_file).await?;
 
         if let Some(origin) = self.origin {
             // -O: preserve existing array, assign at offset.
@@ -124,7 +118,11 @@ impl builtins::Command for MapFileCommand {
 }
 
 impl MapFileCommand {
-    fn read_entries(
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(clippy::unused_async, reason = "WASM pipe input is awaited")
+    )]
+    async fn read_entries(
         &self,
         mut input_file: brush_core::openfiles::OpenFile,
     ) -> Result<variables::ArrayLiteral, brush_core::Error> {
@@ -146,7 +144,11 @@ impl MapFileCommand {
             let mut saw_delimiter = false;
 
             loop {
-                match input_file.read(&mut buf) {
+                #[cfg(target_arch = "wasm32")]
+                let read = futures::io::AsyncReadExt::read(input_file.async_io(), &mut buf).await;
+                #[cfg(not(target_arch = "wasm32"))]
+                let read = input_file.read(&mut buf);
+                match read {
                     Ok(0) => break,                                         // End of input
                     Ok(1) if buf[0] == b'\x03' => break,                    // Ctrl+C
                     Ok(1) if buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D

@@ -1,11 +1,22 @@
 use clap::Parser;
 use itertools::Itertools;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use brush_core::{ErrorKind, builtins, env, error, variables};
 
-use std::io::{Read, Write};
+#[cfg(target_arch = "wasm32")]
+use futures::{
+    FutureExt,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use utf8_chars::BufReadCharsExt;
 
 /// Exit code returned when `read` times out.
@@ -92,7 +103,7 @@ impl builtins::Command for ReadCommand {
         }
 
         // Validate timeout value if provided.
-        if let Some(result) = self.validate_timeout(&context)? {
+        if let Some(result) = self.validate_timeout(&context).await? {
             return Ok(result);
         }
 
@@ -115,15 +126,15 @@ impl builtins::Command for ReadCommand {
         // Convert timeout to Duration.
         let timeout = self.timeout_in_seconds.map(Duration::from_secs_f64);
 
-        // When the input is a pipe fed by another pipeline stage on the same thread (wasm32), let
-        // that stage run until this read has what it needs: a whole line, the requested count, or
-        // end-of-stream.
-        if timeout.is_none() {
-            brush_core::openfiles::wait_for_input(&input_stream, self.input_readiness()).await;
-        }
-
-        // Perform the read operation (potentially with timeout).
-        let read_result = self.read_line(input_stream, context.stderr(), timeout)?;
+        let read_result = self
+            .read_line(
+                input_stream,
+                context.stderr(),
+                timeout,
+                #[cfg(target_arch = "wasm32")]
+                context.shell.execution_services(),
+            )
+            .await?;
 
         // Determine whether to skip IFS splitting (for -N option).
         let skip_ifs_splitting = self.return_after_n_chars_no_delimiter.is_some();
@@ -297,6 +308,7 @@ enum ReadResult {
 ///
 /// This separates the concerns of character-level I/O with timeout handling from the
 /// higher-level logic of line building and escape processing.
+#[cfg(not(target_arch = "wasm32"))]
 struct InputReader {
     /// The input source.
     input: std::io::BufReader<PolledInput>,
@@ -325,6 +337,7 @@ enum InputEvent {
     CtrlD,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl InputReader {
     /// Creates a new input reader with optional timeout.
     fn new(
@@ -353,7 +366,11 @@ impl InputReader {
     }
 
     /// Reads the next input event, handling timeout and control characters.
-    fn read_event(&mut self) -> Result<InputEvent, brush_core::Error> {
+    #[allow(
+        clippy::unused_async,
+        reason = "WASM awaits incremental input through the same interface"
+    )]
+    async fn read_event(&mut self) -> Result<InputEvent, brush_core::Error> {
         let ch = loop {
             if let Some(ch) = self.pending.pop_front() {
                 break ch;
@@ -395,6 +412,7 @@ impl InputReader {
 /// out not to belong to the current UTF-8 sequence needs, and the guarantee that `read`
 /// never consumes more of the descriptor than it asked for -- whatever runs next may
 /// want the rest.
+#[cfg(not(target_arch = "wasm32"))]
 struct PolledInput {
     /// The input source.
     input: brush_core::openfiles::OpenFile,
@@ -402,6 +420,7 @@ struct PolledInput {
     deadline: Option<Instant>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Read for PolledInput {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if let Some(deadline) = self.deadline {
@@ -413,6 +432,104 @@ impl Read for PolledInput {
             }
         }
         self.input.read(buf)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct InputReader {
+    input: brush_core::openfiles::OpenFile,
+    timer: Option<futures::future::LocalBoxFuture<'static, ()>>,
+    pending: VecDeque<char>,
+    bytes: VecDeque<u8>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl InputReader {
+    fn new(
+        input: brush_core::openfiles::OpenFile,
+        timeout: Option<Duration>,
+        _term_mode: Option<brush_core::terminal::AutoModeGuard>,
+        services: brush_core::execution::ExecutionServices,
+    ) -> Self {
+        Self {
+            input,
+            timer: timeout
+                .filter(|time| !time.is_zero())
+                .map(|time| (services.sleep)(time)),
+            pending: VecDeque::new(),
+            bytes: VecDeque::new(),
+        }
+    }
+    fn check_input_available(&self) -> bool {
+        self.input.input_ready().unwrap_or(false)
+    }
+
+    async fn byte(&mut self) -> Result<Option<u8>, std::io::Error> {
+        if let Some(byte) = self.bytes.pop_front() {
+            return Ok(Some(byte));
+        }
+        let mut byte = [0];
+        let read = self.input.async_io().read(&mut byte);
+        let count = if let Some(timer) = &mut self.timer {
+            match futures::future::select(read.boxed_local(), timer.as_mut()).await {
+                futures::future::Either::Left((result, _)) => result?,
+                futures::future::Either::Right(_) => {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+            }
+        } else {
+            read.await?
+        };
+        Ok((count != 0).then_some(byte[0]))
+    }
+
+    async fn read_event(&mut self) -> Result<InputEvent, brush_core::Error> {
+        let ch = if let Some(ch) = self.pending.pop_front() {
+            ch
+        } else {
+            let first = match self.byte().await {
+                Ok(Some(byte)) => byte,
+                Ok(None) => return Ok(InputEvent::Eof),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return Ok(InputEvent::Timeout);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let width = match first {
+                0..=127 => 1,
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => 1,
+            };
+            let mut encoded = vec![first];
+            while encoded.len() < width {
+                match self.byte().await {
+                    Ok(Some(byte)) if byte & 0xc0 == 0x80 => encoded.push(byte),
+                    Ok(Some(byte)) => {
+                        self.bytes.push_front(byte);
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if let Ok(text) = std::str::from_utf8(&encoded) {
+                text.chars().next().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "empty UTF-8 sequence")
+                })?
+            } else {
+                self.pending
+                    .extend(encoded.into_iter().skip(1).map(char::from));
+                char::from(first)
+            }
+        };
+        Ok(match ch {
+            CTRL_C => InputEvent::CtrlC,
+            CTRL_D => InputEvent::CtrlD,
+            _ => InputEvent::Char(ch),
+        })
     }
 }
 
@@ -435,7 +552,7 @@ struct LineReaderConfig {
 /// For example, with `-n 3` and input `a\bc` (4 bytes):
 /// - Bash processes: 'a' (output 1), '\b' → 'b' (output 2), 'c' (output 3) → "abc"
 /// - The backslash is consumed but doesn't count toward the limit
-fn read_line_with_reader(
+async fn read_line_with_reader(
     reader: &mut InputReader,
     config: &LineReaderConfig,
 ) -> Result<ReadResult, brush_core::Error> {
@@ -446,7 +563,7 @@ fn read_line_with_reader(
     let mut pending_backslash = false;
 
     loop {
-        let event = reader.read_event()?;
+        let event = reader.read_event().await?;
 
         match event {
             InputEvent::Eof => {
@@ -549,19 +666,28 @@ impl ReadCommand {
     /// - Without `-r`: backslash-newline is line continuation, other backslashes escape the next
     ///   char
     /// - With `-r`: backslash is treated as a literal character
-    fn read_line(
+    async fn read_line(
         &self,
         input_file: brush_core::openfiles::OpenFile,
-        mut stderr_file: impl std::io::Write,
+        mut stderr_file: brush_core::openfiles::OpenFile,
         timeout: Option<Duration>,
+        #[cfg(target_arch = "wasm32")] services: brush_core::execution::ExecutionServices,
     ) -> Result<ReadResult, brush_core::Error> {
         let term_mode = self.setup_terminal_settings(&input_file)?;
 
         // Display prompt on stderr, but only if input is from a terminal (per bash behavior).
         if let Some(prompt) = &self.prompt {
             if input_file.is_terminal() {
-                write!(stderr_file, "{prompt}")?;
-                stderr_file.flush()?;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    write!(stderr_file, "{prompt}")?;
+                    stderr_file.flush()?;
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    stderr_file.async_io().write_all(prompt.as_bytes()).await?;
+                    stderr_file.async_io().flush().await?;
+                }
             }
         }
 
@@ -583,7 +709,13 @@ impl ReadCommand {
             .or(self.return_after_n_chars);
 
         // Create the input reader.
-        let mut reader = InputReader::new(input_file, timeout, term_mode);
+        let mut reader = InputReader::new(
+            input_file,
+            timeout,
+            term_mode,
+            #[cfg(target_arch = "wasm32")]
+            services,
+        );
 
         // Handle -t 0 special case: just check if input is available without reading.
         if timeout == Some(Duration::ZERO) {
@@ -601,39 +733,7 @@ impl ReadCommand {
             process_escapes: !self.raw_mode,
         };
 
-        read_line_with_reader(&mut reader, &config)
-    }
-
-    /// Describes how much input this read needs buffered before it can run without stalling:
-    /// the delimiter (unless `-N`), and for `-n`/`-N` enough bytes for the requested characters
-    /// at four bytes each. A non-ASCII delimiter falls back to waiting for end-of-stream.
-    fn input_readiness(&self) -> brush_core::openfiles::InputReadiness {
-        let delimiter = if self.return_after_n_chars_no_delimiter.is_some() {
-            None
-        } else if let Some(delimiter_str) = &self.delimiter {
-            if delimiter_str.is_empty() {
-                Some(0)
-            } else {
-                delimiter_str
-                    .chars()
-                    .next()
-                    .and_then(|c| u8::try_from(c).ok())
-                    .filter(u8::is_ascii)
-            }
-        } else {
-            Some(b'\n')
-        };
-
-        let char_limit = self
-            .return_after_n_chars_no_delimiter
-            .or(self.return_after_n_chars);
-
-        brush_core::openfiles::InputReadiness {
-            delimiter,
-            min_delimiters: 1,
-            backslash_escapes: !self.raw_mode,
-            min_bytes: char_limit.map(|n| n.saturating_mul(4)),
-        }
+        read_line_with_reader(&mut reader, &config).await
     }
 
     fn setup_terminal_settings(
@@ -660,17 +760,28 @@ impl ReadCommand {
     /// `Ok(None)` if the timeout is valid or not specified.
     ///
     /// TODO(read): Bash uses $TMOUT as a default timeout for `read` when -t is not specified.
-    fn validate_timeout(
+    #[cfg_attr(not(target_arch = "wasm32"), allow(clippy::unused_async))]
+    async fn validate_timeout(
         &self,
         context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
     ) -> Result<Option<brush_core::ExecutionResult>, brush_core::Error> {
         if let Some(timeout) = self.timeout_in_seconds {
-            if timeout < 0.0 {
-                writeln!(
-                    context.stderr(),
-                    "{}: -t: invalid timeout specification",
+            if Duration::try_from_secs_f64(timeout).is_err() {
+                let message = format!(
+                    "{}: -t: invalid timeout specification\n",
                     context.command_name
-                )?;
+                );
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use futures::io::AsyncWriteExt;
+                    context
+                        .stderr()
+                        .async_io()
+                        .write_all(message.as_bytes())
+                        .await?;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                context.stderr().write_all(message.as_bytes())?;
                 return Ok(Some(brush_core::ExecutionResult::general_error()));
             }
         }
@@ -788,7 +899,11 @@ mod tests {
 
         // Holding `tx` means the continuation byte never arrives, so the deadline has to
         // be enforced on it and not just on the byte that started the sequence.
-        let result = read_line_with_reader(&mut reader, &config).unwrap();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_line_with_reader(&mut reader, &config))
+            .unwrap();
         drop(tx);
 
         assert!(matches!(result, ReadResult::TimedOut(Some(line)) if line == "\u{c3}"));
