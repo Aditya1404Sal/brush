@@ -23,6 +23,10 @@ use std::{
     time::Duration,
 };
 
+/// Logical process boundaries and synthetic pipe signals for cooperative WASM execution.
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod process;
+
 /// Futures dispatched by native shells must be `Send`.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MaybeSend: Send {}
@@ -63,33 +67,71 @@ thread_local! {
 }
 
 #[derive(Default)]
-struct TaskScope {
+pub(super) struct TaskScope {
     children: RefCell<Vec<TaskControl>>,
+    scopes: RefCell<Vec<Rc<Self>>>,
+    done: Cell<bool>,
 }
 
 impl Drop for TaskScope {
     fn drop(&mut self) {
-        for child in self.children.get_mut() {
-            child.abort();
-        }
+        self.abort();
     }
 }
 
 impl TaskScope {
-    async fn cancel_and_join(&self) {
-        let children = std::mem::take(&mut *self.children.borrow_mut());
-        for child in &children {
+    fn abort(&self) {
+        for child in self.children.borrow().iter() {
             child.abort();
         }
-        for child in children {
-            child.join().await;
+        for scope in self.scopes.borrow().iter() {
+            scope.abort();
         }
+    }
+
+    fn cancel_and_join(&self) -> LocalBoxFuture<'_, ()> {
+        Box::pin(async {
+            loop {
+                self.abort();
+                // Keep observers registered while awaiting: this cleanup future can itself
+                // be cancelled, and its ancestor must still be able to join descendants.
+                let children = self.children.borrow().clone();
+                let scopes = self.scopes.borrow().clone();
+                for child in children {
+                    child.join().await;
+                }
+                for scope in scopes {
+                    scope.cancel_and_join().await;
+                }
+                self.children.borrow_mut().retain(|child| !child.done.get());
+                self.scopes.borrow_mut().retain(|scope| !scope.done.get());
+                if self.children.borrow().is_empty() && self.scopes.borrow().is_empty() {
+                    self.done.set(true);
+                    break;
+                }
+            }
+        })
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn nested() -> Rc<Self> {
+        let scope = Rc::new(Self::default());
+        CURRENT_SCOPE.with_borrow(|parent| {
+            if let Some(parent) = parent {
+                let mut scopes = parent.scopes.borrow_mut();
+                scopes.retain(|scope| !scope.done.get());
+                scopes.push(scope.clone());
+            }
+        });
+        scope
     }
 }
 
 struct ScopedFuture<F> {
     future: Pin<Box<F>>,
     scope: Rc<TaskScope>,
+    #[cfg(any(target_arch = "wasm32", test))]
+    process: Option<Rc<process::ProcessState>>,
 }
 
 struct RestoreScope(Option<Rc<TaskScope>>);
@@ -105,6 +147,8 @@ impl<F: Future> Future for ScopedFuture<F> {
         let prior = CURRENT_SCOPE.replace(Some(self.scope.clone()));
         // Restore even if a command panics. No scope is installed across a suspended poll.
         let _restore = RestoreScope(prior);
+        #[cfg(any(target_arch = "wasm32", test))]
+        let _process = process::install(self.process.clone());
         self.future.as_mut().poll(cx)
     }
 }
@@ -211,10 +255,14 @@ impl ExecutionServices {
         });
         let scope = Rc::new(TaskScope::default());
         let done = control.done.clone();
+        #[cfg(any(target_arch = "wasm32", test))]
+        let process = process::current();
         (self.spawn_local)(Box::pin(async move {
             let output = std::panic::AssertUnwindSafe(ScopedFuture {
                 future: Box::pin(Abortable::new(future, registration)),
                 scope: scope.clone(),
+                #[cfg(any(target_arch = "wasm32", test))]
+                process,
             })
             .catch_unwind()
             .await;
@@ -299,6 +347,62 @@ mod tests {
             });
             assert_eq!(parent.await.unwrap(), 42);
             assert!(released.get());
+        });
+    }
+
+    #[test]
+    fn cancelling_borrowed_process_during_cleanup_retains_join_observers() {
+        run(async {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    let _ = self.0.take().unwrap().send(());
+                }
+            }
+
+            let services = ExecutionServices::default();
+            let (cleanup_started_send, cleanup_started) = oneshot::channel();
+            let (finish_send, finish) = oneshot::channel();
+            let (body_dropped_send, body_dropped) = oneshot::channel();
+            let done = Rc::new(Cell::new(false));
+            let observed = done.clone();
+            let (abort, _registration) = AbortHandle::new_pair();
+            // A held completion observer lets cancellation interrupt the precise await
+            // inside nested cleanup without relying on executor timing or a sleep.
+            let descendant = TaskControl {
+                abort,
+                done: done.clone(),
+                finished: async move {
+                    let _ = cleanup_started_send.send(());
+                    finish.await.unwrap();
+                    done.set(true);
+                }
+                .boxed_local()
+                .shared(),
+            };
+            let mut parent = services.spawn(async move {
+                let _body = NotifyDrop(Some(body_dropped_send));
+                process::run_process(crate::traps::PipeDisposition::Default, async move {
+                    CURRENT_SCOPE.with_borrow(|scope| {
+                        scope
+                            .as_ref()
+                            .unwrap()
+                            .children
+                            .borrow_mut()
+                            .push(descendant);
+                    });
+                    Ok(crate::ExecutionResult::success())
+                })
+                .await
+            });
+            cleanup_started.await.unwrap();
+            parent.abort();
+            body_dropped.await.unwrap();
+            assert!((&mut parent).now_or_never().is_none());
+            assert!(!observed.get());
+            finish_send.send(()).unwrap();
+            assert!(matches!(parent.await, Err(TaskError::Cancelled)));
+            assert!(observed.get());
         });
     }
 

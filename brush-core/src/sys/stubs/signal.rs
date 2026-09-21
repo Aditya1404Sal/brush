@@ -5,16 +5,28 @@ use crate::{error, sys, traps};
 /// A stub enum representing system signals on unsupported platforms.
 #[allow(unnameable_types)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Signal {}
+pub enum Signal {
+    /// Synthetic pipe-write signal on WASM; no host signal API is implied.
+    #[cfg(target_arch = "wasm32")]
+    SIGPIPE = 13,
+}
 
 impl Signal {
     /// Returns an iterator over all possible signals.
     pub fn iterator() -> impl Iterator<Item = Self> {
+        #[cfg(target_arch = "wasm32")]
+        return [Self::SIGPIPE].into_iter();
+        #[cfg(not(target_arch = "wasm32"))]
         std::iter::empty()
     }
 
     /// Converts the signal into its corresponding name as a `&'static str`.
     pub const fn as_str(self) -> &'static str {
+        #[cfg(target_arch = "wasm32")]
+        return match self {
+            Self::SIGPIPE => "SIGPIPE",
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         ""
     }
 
@@ -24,6 +36,10 @@ impl Signal {
         reason = "matches the target-specific Signal API"
     )]
     pub fn from_str(s: &str) -> Result<Self, error::Error> {
+        #[cfg(target_arch = "wasm32")]
+        if s == "SIGPIPE" {
+            return Ok(Self::SIGPIPE);
+        }
         Err(error::ErrorKind::InvalidSignal(s.into()).into())
     }
 }
@@ -32,6 +48,10 @@ impl TryFrom<i32> for Signal {
     type Error = error::Error;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
+        #[cfg(target_arch = "wasm32")]
+        if value == 13 {
+            return Ok(Self::SIGPIPE);
+        }
         Err(error::ErrorKind::InvalidSignal(std::format!("{value}")).into())
     }
 }

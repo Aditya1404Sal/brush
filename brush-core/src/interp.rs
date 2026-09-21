@@ -408,6 +408,7 @@ impl Execute for ast::Pipeline {
         // Invert the exit code if requested.
         if self.bang {
             result.exit_code = ExecutionExitCode::from(if result.is_success() { 1 } else { 0 });
+            result.terminating_signal = None;
         }
 
         // Update exit status.
@@ -469,11 +470,6 @@ async fn spawn_pipeline_processes(
     let mut spawn_results = VecDeque::new();
     let mut process_group_id: Option<i32> = None;
 
-    // On wasm32, one watch per pipe, kept in step with `pipe_writers`: the stage writing into a
-    // pipe is ended if it writes after every reader is gone.
-    #[cfg(target_arch = "wasm32")]
-    let mut pipe_watches = vec![];
-
     // On wasm32, the stage tasks spawned so far. Held here from the first spawn, so an early return
     // below aborts them rather than leaving them running.
     #[cfg(target_arch = "wasm32")]
@@ -491,8 +487,7 @@ async fn spawn_pipeline_processes(
             // `openfiles::open_mem_pipe` and `spawn_pipeline_stage`).
             #[cfg(target_arch = "wasm32")]
             let (reader, writer) = {
-                let (reader, writer, watch) = openfiles::open_mem_pipe();
-                pipe_watches.push(watch);
+                let (reader, writer) = openfiles::open_mem_pipe();
                 (reader, writer)
             };
             #[cfg(not(target_arch = "wasm32"))]
@@ -537,10 +532,8 @@ async fn spawn_pipeline_processes(
         // stages interleave instead of each running to completion before the next starts.
         #[cfg(target_arch = "wasm32")]
         {
-            let output_watch = pipe_watches.pop();
             if !run_in_current_shell {
-                let join_handle =
-                    spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params, output_watch);
+                let join_handle = spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params);
                 stage_tasks.0.push(join_handle.abort_handle());
                 spawn_results.push_back(ExecutionSpawnResult::StartedTask(join_handle));
                 continue;
@@ -604,11 +597,9 @@ struct SpawnedPipeline {
 
 /// Aborts a pipeline's stage tasks that are still running when the pipeline itself is dropped.
 ///
-/// A pipeline future can be dropped before its stages finish: the stage containing it is ended with
-/// 141, the background job running it is aborted, or a later stage fails to start. Tokio does not
-/// cancel a task when its `JoinHandle` is dropped, so without this its stages would keep running —
-/// consuming the thread and holding pipe writers open, so a reader waiting for end-of-stream would
-/// never see it. Aborting a task that has already finished does nothing.
+/// A pipeline future can be dropped when its containing process terminates or a stage fails to
+/// start. These controls signal cancellation immediately; the owning execution scope retains
+/// completion observers and joins cleanup before returning. Finished tasks are unaffected.
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]
 struct StageTasks(Vec<crate::execution::TaskControl>);
@@ -638,17 +629,19 @@ impl Drop for StageTasks {
 ///
 /// Stages share one thread and hand control to each other at the yield points in the in-memory
 /// pipes. If this stage writes into a pipe after every reader is gone — the downstream stage has
-/// finished — the stage is ended with exit status 141, as `SIGPIPE` would end it.
+/// finished — default SIGPIPE ends the writing logical process with status 141. An ignored or
+/// caught SIGPIPE instead leaves error handling to the command and its shell trap safe point.
 #[cfg(target_arch = "wasm32")]
 fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     mut shell: Shell<SE>,
     command: ast::Command,
     params: ExecutionParameters,
-    output_watch: Option<openfiles::MemPipeWatch>,
 ) -> crate::execution::CommandTask {
     let services = shell.execution_services();
+    shell.traps_mut().reset_pipe_for_subshell();
+    let disposition = shell.traps().pipe_disposition();
     services.spawn(async move {
-        let run = async {
+        crate::execution::process::run_process(disposition, async move {
             let context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut shell),
                 process_group_id: None,
@@ -662,19 +655,8 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
                 ExecutionWaitResult::Completed(result) => Ok(result),
                 ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
             }
-        };
-
-        let Some(watch) = output_watch else {
-            return run.await;
-        };
-
-        tokio::select! {
-            biased;
-            () = watch.wait_broken() => {
-                Ok(ExecutionResult::new(141))
-            }
-            result = run => result,
-        }
+        })
+        .await
     })
 }
 
@@ -686,7 +668,7 @@ async fn wait_for_pipeline_processes_and_update_status(
 ) -> Result<ExecutionResult, error::Error> {
     let mut result = ExecutionResult::success();
     let mut stopped_children = vec![];
-    let mut last_failure_exit_code: Option<ExecutionExitCode> = None;
+    let mut last_failure_exit_code: Option<(ExecutionExitCode, Option<u8>)> = None;
 
     // Clear our the pipeline status so we can start filling it out.
     shell.last_pipeline_statuses_mut().clear();
@@ -708,7 +690,7 @@ async fn wait_for_pipeline_processes_and_update_status(
 
                 // Track the last failure for pipefail option
                 if !result.is_success() {
-                    last_failure_exit_code = Some(result.exit_code);
+                    last_failure_exit_code = Some((result.exit_code, result.terminating_signal));
                 }
             }
             ExecutionWaitResult::Stopped(child) => {
@@ -725,8 +707,9 @@ async fn wait_for_pipeline_processes_and_update_status(
 
     // Apply pipefail semantics if enabled
     if shell.options().return_last_failure_from_pipeline {
-        if let Some(failure_exit_code) = last_failure_exit_code {
+        if let Some((failure_exit_code, terminating_signal)) = last_failure_exit_code {
             result.exit_code = failure_exit_code;
+            result.terminating_signal = terminating_signal;
         }
     }
 
@@ -811,10 +794,20 @@ impl Execute for ast::CompoundCommand {
                 // Clone off a new subshell, and run the body of the subshell there.
                 // TODO(source-info): Do we need to reset the line number?
                 let mut subshell = shell.clone();
+                #[cfg(target_arch = "wasm32")]
+                subshell.traps_mut().reset_pipe_for_subshell();
 
                 // Handle errors within the subshell context to prevent fatal errors
                 // from propagating to the parent shell.
-                let subshell_result = match list.execute(&mut subshell, params).await {
+                #[cfg(target_arch = "wasm32")]
+                let execution = crate::execution::process::run_process(
+                    subshell.traps().pipe_disposition(),
+                    list.execute(&mut subshell, params),
+                )
+                .await;
+                #[cfg(not(target_arch = "wasm32"))]
+                let execution = list.execute(&mut subshell, params).await;
+                let subshell_result = match execution {
                     Ok(result) => result,
                     Err(error) => {
                         // Display the error to stderr, but prevent fatal error propagation

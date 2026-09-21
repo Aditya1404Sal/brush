@@ -45,6 +45,8 @@ mod state;
 mod traps;
 
 pub use builder::{CreateOptions, ShellBuilder, ShellBuilderState};
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) use callstack::FrameGuard;
 pub use initscripts::{ProfileLoadBehavior, RcLoadBehavior};
 pub use state::ShellState;
 
