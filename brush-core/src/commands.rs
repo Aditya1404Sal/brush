@@ -12,9 +12,12 @@ use brush_parser::ast;
 use itertools::Itertools;
 use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::ExecutionExitCode;
+
 use crate::{
-    ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult,
-    Shell, ShellFd, builtins, commands, env, error, escape,
+    ErrorKind, ExecutionControlFlow, ExecutionParameters, ExecutionResult, Shell, ShellFd,
+    builtins, commands, env, error, escape,
     extensions::{self, ShellExtensions},
     functions,
     interp::{self, Execute, ProcessGroupPolicy},
@@ -521,9 +524,19 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
         let last_arg = Self::take_last_arg(&self.args);
+        #[cfg(any(target_arch = "wasm32", test))]
+        let mut cleanup = crate::shell::FrameGuard::new(
+            &mut shell,
+            self.post_execute.unwrap_or(|_| Ok(())),
+            None,
+        );
+        #[cfg(any(target_arch = "wasm32", test))]
+        let shell = cleanup.shell();
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        let shell = &mut *shell;
 
         let cmd_context = ExecutionContext {
-            shell: &mut shell,
+            shell: &mut *shell,
             command_name: self.command_name,
             params: self.params,
         };
@@ -533,8 +546,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // Update $_ after command execution.
         shell.update_last_arg_variable(last_arg);
 
+        #[cfg(not(any(target_arch = "wasm32", test)))]
         if let Some(post_execute) = self.post_execute {
-            let _ = post_execute(&mut shell);
+            let _ = post_execute(shell);
         }
 
         let result = result?;
@@ -548,9 +562,19 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
         let last_arg = Self::take_last_arg(&self.args);
+        #[cfg(any(target_arch = "wasm32", test))]
+        let mut cleanup = crate::shell::FrameGuard::new(
+            &mut shell,
+            self.post_execute.unwrap_or(|_| Ok(())),
+            None,
+        );
+        #[cfg(any(target_arch = "wasm32", test))]
+        let shell = cleanup.shell();
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        let shell = &mut *shell;
 
         let cmd_context = ExecutionContext {
-            shell: &mut shell,
+            shell: &mut *shell,
             command_name: self.command_name,
             params: self.params,
         };
@@ -564,8 +588,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // where the caller observes only the invocation's last argument.
         shell.update_last_arg_variable(last_arg);
 
+        #[cfg(not(any(target_arch = "wasm32", test)))]
         if let Some(post_execute) = self.post_execute {
-            let _ = post_execute(&mut shell);
+            let _ = post_execute(shell);
         }
 
         result
@@ -716,6 +741,7 @@ pub(crate) fn execute_external_command(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     builtin: &builtins::Registration<SE>,
     context: ExecutionContext<'_, SE>,
@@ -748,6 +774,118 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn execute_builtin_command<SE: extensions::ShellExtensions>(
+    builtin: &builtins::Registration<SE>,
+    context: ExecutionContext<'_, SE>,
+    args: Vec<CommandArg>,
+) -> Result<ExecutionResult, error::Error> {
+    use crate::execution::process;
+    if builtin.execution_boundary == builtins::ExecutionBoundary::Command {
+        let disposition = process::pipe_disposition().for_exec();
+        let mut command_shell = context.shell.clone();
+        command_shell.traps_mut().reset_pipe_for_subshell();
+        let command_context = ExecutionContext {
+            shell: &mut command_shell,
+            command_name: context.command_name,
+            params: context.params,
+        };
+        process::run_process(
+            disposition,
+            execute_wasm_builtin(builtin, command_context, args, false),
+        )
+        .await
+    } else {
+        process::set_pipe_disposition(context.shell.traps().pipe_disposition());
+        execute_wasm_builtin(builtin, context, args, true).await
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
+    builtin: &builtins::Registration<SE>,
+    context: ExecutionContext<'_, SE>,
+    args: Vec<CommandArg>,
+    deliver_traps: bool,
+) -> Result<ExecutionResult, error::Error> {
+    use crate::{execution::process, traps::PipeDisposition};
+    use futures::io::AsyncWriteExt;
+    let ExecutionContext {
+        shell,
+        command_name,
+        params,
+    } = context;
+    let services = shell.execution_services();
+    let mark_errors_fatal = builtin.special_builtin && shell.options().posix_mode;
+    let mut result = (builtin.execute_func)(
+        ExecutionContext {
+            shell: &mut *shell,
+            command_name: command_name.clone(),
+            params: params.clone(),
+        },
+        args,
+    )
+    .await;
+
+    // Default SIGPIPE is observed by the enclosing process before anything else executes.
+    (services.yield_now)().await;
+    if let Err(error) = &result {
+        if error
+            .as_io_error()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+        {
+            if process::pipe_disposition() != PipeDisposition::Default {
+                let mut stderr = params.stderr(shell);
+                let diagnostic = stderr
+                    .async_io()
+                    .write_all(format!("{command_name}: write error: Broken pipe\n").as_bytes())
+                    .await;
+                if let Err(error) = diagnostic {
+                    if error.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(error.into());
+                    }
+                }
+                result = Ok(ExecutionResult::new(1));
+            } else {
+                result = Ok(ExecutionResult::terminated_by_signal(13));
+            }
+        } else if error.as_io_error().is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::Unsupported
+                && error.to_string() == crate::openfiles::SYNCHRONOUS_PIPE_INPUT_MESSAGE
+        }) {
+            params
+                .stderr(shell)
+                .async_io()
+                .write_all(
+                    format!("{}\n", crate::openfiles::SYNCHRONOUS_PIPE_INPUT_MESSAGE).as_bytes(),
+                )
+                .await?;
+            result = Ok(ExecutionResult::new(1));
+        }
+    }
+
+    if deliver_traps && process::take_pending_pipe_trap() {
+        let triggering_status = result
+            .as_ref()
+            .map_or(1, |result| u8::from(result.exit_code));
+        shell.set_last_exit_status(triggering_status);
+        let _handling = process::handling_pipe();
+        let signal = "PIPE".parse()?;
+        let handler_result = shell.invoke_trap_handler(signal, &params).await?;
+        process::set_pipe_disposition(shell.traps().pipe_disposition());
+        if !handler_result.is_normal_flow() {
+            return Ok(handler_result);
+        }
+    }
+    result.map_err(|error| {
+        if mark_errors_fatal {
+            error.into_fatal()
+        } else {
+            error
+        }
+    })
+}
+
 pub(crate) async fn invoke_shell_function(
     function: functions::Registration,
     mut context: ExecutionContext<'_, impl extensions::ShellExtensions>,
@@ -777,10 +915,19 @@ pub(crate) async fn invoke_shell_function(
     // so the parameters are passed through by shared reference rather than cloned. This prevents
     // direct mutation of the caller's `ExecutionParameters` open-file table, though the function
     // may still change the shell's persistent open files via builtins (e.g. `exec`).
-    let result = body.execute(context.shell, &context.params).await;
-
-    // We've come back out, reflect it.
-    context.shell.leave_function()?;
+    #[cfg(any(target_arch = "wasm32", test))]
+    let result = {
+        let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
+        let result = body.execute(frame.shell(), &context.params).await;
+        frame.finish()?;
+        result
+    };
+    #[cfg(not(any(target_arch = "wasm32", test)))]
+    let result = {
+        let result = body.execute(context.shell, &context.params).await;
+        context.shell.leave_function()?;
+        result
+    };
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;
@@ -807,6 +954,8 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 ) -> Result<String, error::Error> {
     // Instantiate a subshell to run the command in.
     let mut subshell = shell.clone();
+    #[cfg(target_arch = "wasm32")]
+    subshell.traps_mut().reset_pipe_for_subshell();
 
     // Command substitutions don't inherit errexit by default. Only inherit it when
     // command_subst_inherits_errexit is enabled, otherwise disable errexit in the subshell.
@@ -824,12 +973,15 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     // Expansion still receives the captured output only after the producer completes.
     #[cfg(target_arch = "wasm32")]
     {
-        let (mut reader, writer, _watch) = openfiles::open_mem_pipe();
+        let (mut reader, writer) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
         let mut output_str = String::new();
         let (cmd_result, output_result) = futures::join!(
-            run_substitution_command(subshell, params, s),
+            crate::execution::process::run_process(
+                subshell.traps().pipe_disposition(),
+                run_substitution_command(subshell, params, s)
+            ),
             futures::io::AsyncReadExt::read_to_string(reader.async_io(), &mut output_str)
         );
         output_result?;

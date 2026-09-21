@@ -150,6 +150,16 @@ pub struct ContentOptions {
     pub colorized: bool,
 }
 
+/// WASM failure boundary for an embedded command.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecutionBoundary {
+    /// Execute as a shell builtin in the caller's logical process.
+    #[default]
+    Caller,
+    /// Execute as an external-like utility with its own logical process.
+    Command,
+}
+
 /// Encapsulates a registration for a built-in command.
 #[derive(Clone)]
 pub struct Registration<SE: extensions::ShellExtensions> {
@@ -167,6 +177,9 @@ pub struct Registration<SE: extensions::ShellExtensions> {
 
     /// Is this builtin one that takes specially handled declarations?
     pub declaration_builtin: bool,
+
+    /// Logical process behavior on WASM. Native execution is unchanged.
+    pub execution_boundary: ExecutionBoundary,
 }
 
 impl<SE: extensions::ShellExtensions> Registration<SE> {
@@ -385,16 +398,19 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
         disabled: false,
         special_builtin: false,
         declaration_builtin: false,
+        execution_boundary: ExecutionBoundary::Caller,
     }
 }
 
 /// Returns a built-in command registration for a `SimpleCommand` that reads its standard input to
 /// end-of-stream.
 ///
-/// A `SimpleCommand` executes synchronously, so it cannot wait for another pipeline stage to
-/// finish producing its input. This registration waits for that before executing the command (see
-/// [`crate::openfiles::wait_for_input`]). Where pipes are OS pipes, it behaves exactly like
-/// [`simple_builtin`].
+/// Cooperative WASM pipes are rejected before executing the command: waiting for EOF without
+/// consuming a bounded pipe can deadlock its producer. Files and native streams retain the
+/// behavior of [`simple_builtin`]. Use an async command for incremental pipe input.
+#[deprecated(
+    note = "synchronous stdin commands cannot consume cooperative pipes; use OpenFile::async_io()"
+)]
 pub fn simple_builtin_reading_stdin<
     B: SimpleCommand + Send + Sync,
     SE: extensions::ShellExtensions,
@@ -414,6 +430,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
         disabled: false,
         special_builtin: false,
         declaration_builtin: false,
+        execution_boundary: ExecutionBoundary::Caller,
     }
 }
 
@@ -428,6 +445,7 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
         disabled: false,
         special_builtin: false,
         declaration_builtin: true,
+        execution_boundary: ExecutionBoundary::Caller,
     }
 }
 
@@ -448,6 +466,7 @@ pub fn raw_arg_builtin<
         disabled: false,
         special_builtin: false,
         declaration_builtin: true,
+        execution_boundary: ExecutionBoundary::Caller,
     }
 }
 
@@ -491,8 +510,9 @@ fn exec_simple_builtin_reading_stdin<
 ) -> BoxFuture<'_, Result<results::ExecutionResult, error::Error>> {
     Box::pin(async move {
         if let Some(stdin) = context.try_fd(crate::openfiles::OpenFiles::STDIN_FD) {
+            #[allow(deprecated)]
             crate::openfiles::wait_for_input(&stdin, crate::openfiles::InputReadiness::default())
-                .await;
+                .await?;
         }
         exec_simple_builtin_impl::<T, SE>(context, args).await
     })

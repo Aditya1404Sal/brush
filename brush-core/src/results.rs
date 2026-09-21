@@ -12,6 +12,9 @@ pub struct ExecutionResult {
     pub next_control_flow: ExecutionControlFlow,
     /// The exit code resulting from execution.
     pub exit_code: ExecutionExitCode,
+    /// Signal that terminated a cooperative logical process, distinct from an explicit
+    /// exit with the same numeric status. Native process status handling is unchanged.
+    pub terminating_signal: Option<u8>,
 }
 
 impl ExecutionResult {
@@ -24,6 +27,14 @@ impl ExecutionResult {
         Self {
             exit_code: exit_code.into(),
             ..Self::default()
+        }
+    }
+
+    /// Returns a cooperative process termination, retaining its signal provenance.
+    pub fn terminated_by_signal(signal: u8) -> Self {
+        Self {
+            terminating_signal: Some(signal),
+            ..Self::new(128_u8.saturating_add(signal))
         }
     }
 
@@ -41,6 +52,7 @@ impl ExecutionResult {
         Self {
             next_control_flow: ExecutionControlFlow::Normal,
             exit_code: ExecutionExitCode::Success,
+            terminating_signal: None,
         }
     }
 
@@ -49,6 +61,7 @@ impl ExecutionResult {
         Self {
             next_control_flow: ExecutionControlFlow::Normal,
             exit_code: ExecutionExitCode::GeneralError,
+            terminating_signal: None,
         }
     }
 
@@ -100,6 +113,7 @@ impl From<ExecutionExitCode> for ExecutionResult {
         Self {
             next_control_flow: ExecutionControlFlow::Normal,
             exit_code,
+            terminating_signal: None,
         }
     }
 }
