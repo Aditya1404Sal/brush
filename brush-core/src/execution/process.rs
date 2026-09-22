@@ -113,6 +113,10 @@ pub(super) struct ProcessState {
 
 impl ProcessState {
     fn new(dispositions: Dispositions) -> Rc<Self> {
+        Self::with_parent(dispositions, current().as_ref())
+    }
+
+    fn with_parent(dispositions: Dispositions, parent: Option<&Rc<Self>>) -> Rc<Self> {
         let state = Rc::new(Self {
             dispositions: Cell::new(dispositions),
             terminated: Cell::new(None),
@@ -121,7 +125,7 @@ impl ProcessState {
             waker: RefCell::new(None),
             children: RefCell::new(Vec::new()),
         });
-        if let Some(parent) = current() {
+        if let Some(parent) = parent {
             let mut children = parent.children.borrow_mut();
             children.retain(|child| child.strong_count() > 0);
             children.push(Rc::downgrade(&state));
@@ -350,6 +354,80 @@ pub async fn run_process(
     run_state(ProcessState::new(inherited_dispositions(disposition)), body).await
 }
 
+/// A numbered process registered before it first runs, so it can be signalled at once (for
+/// example `sleep 5 & kill $!`). Dropping it unrun records it as killed.
+pub struct NumberedProcess {
+    table: ProcessTable,
+    pid: Pid,
+    state: Rc<ProcessState>,
+    _registration: Registration,
+    finished: bool,
+}
+
+impl NumberedProcess {
+    /// Registers `pid` as a child of the running process.
+    #[must_use]
+    pub fn register(table: &ProcessTable, pid: Pid, dispositions: Dispositions) -> Self {
+        Self::register_under(table, pid, dispositions, current().as_ref())
+    }
+
+    /// Registers `pid` as a child of this process, so group signals reach it before it runs.
+    #[must_use]
+    pub fn register_child(&self, pid: Pid, dispositions: Dispositions) -> Self {
+        Self::register_under(&self.table, pid, dispositions, Some(&self.state))
+    }
+
+    fn register_under(
+        table: &ProcessTable,
+        pid: Pid,
+        dispositions: Dispositions,
+        parent: Option<&Rc<ProcessState>>,
+    ) -> Self {
+        let state = ProcessState::with_parent(dispositions, parent);
+        let key = (table.id(), pid);
+        REGISTRY.with_borrow_mut(|registry| registry.insert(key, Rc::downgrade(&state)));
+        Self {
+            table: table.clone(),
+            pid,
+            state,
+            _registration: Registration(Some(key)),
+            finished: false,
+        }
+    }
+
+    /// This process's number.
+    pub const fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Runs `body` as this process and records its final status in the table.
+    pub async fn run(
+        mut self,
+        body: impl Future<Output = Result<ExecutionResult, Error>>,
+    ) -> Result<ExecutionResult, Error> {
+        let result = run_state(self.state.clone(), body).await;
+        // Only this process's own termination is a signal death; a normal exit that merely
+        // returns a killed child's status (143) is an ordinary exit, as for a bash subshell.
+        let status = match (self.state.terminated.get(), &result) {
+            (Some(signal), _) => ProcessStatus::Signaled(signal),
+            (None, Ok(result)) => ProcessStatus::Exited(u8::from(result.exit_code)),
+            (None, Err(_)) => ProcessStatus::Exited(1),
+        };
+        self.table.set_status(self.pid, status);
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for NumberedProcess {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.table
+                .set_status(self.pid, ProcessStatus::Signaled(signals::KILL));
+        }
+    }
+}
+
 /// Runs `body` as numbered process `pid` of `table`, reachable by [`signal_process`], and
 /// records its final status in the table.
 pub async fn run_numbered_process(
@@ -358,21 +436,9 @@ pub async fn run_numbered_process(
     dispositions: Dispositions,
     body: impl Future<Output = Result<ExecutionResult, Error>>,
 ) -> Result<ExecutionResult, Error> {
-    let state = ProcessState::new(dispositions);
-    let key = (table.id(), pid);
-    REGISTRY.with_borrow_mut(|registry| registry.insert(key, Rc::downgrade(&state)));
-    let _registration = Registration(Some(key));
-    let observed = state.clone();
-    let result = run_state(state, body).await;
-    // Only this process's own termination is a signal death; a normal exit that merely returns
-    // a killed child's status (143) is an ordinary exit, as for a bash subshell.
-    let status = match (observed.terminated.get(), &result) {
-        (Some(signal), _) => ProcessStatus::Signaled(signal),
-        (None, Ok(result)) => ProcessStatus::Exited(u8::from(result.exit_code)),
-        (None, Err(_)) => ProcessStatus::Exited(1),
-    };
-    table.set_status(pid, status);
-    result
+    NumberedProcess::register(table, pid, dispositions)
+        .run(body)
+        .await
 }
 
 fn lookup(table: &ProcessTable, pid: Pid) -> Option<Rc<ProcessState>> {

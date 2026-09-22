@@ -159,10 +159,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     own_pid: Option<crate::process_table::Pid>,
 
-    /// Numbers reserved for the stages of this background job's pipeline, in stage order.
+    /// Registered processes for the stages of this background job's pipeline, in stage order.
     #[cfg(target_arch = "wasm32")]
     #[cfg_attr(feature = "serde", serde(skip))]
-    pending_stage_pids: std::collections::VecDeque<crate::process_table::Pid>,
+    pending_stage_processes: std::collections::VecDeque<crate::execution::process::NumberedProcess>,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -206,7 +206,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             #[cfg(target_arch = "wasm32")]
-            pending_stage_pids: std::collections::VecDeque::new(),
+            pending_stage_processes: std::collections::VecDeque::new(),
         }
     }
 }
@@ -234,19 +234,21 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         self.own_pid = Some(pid);
     }
 
-    /// Reserves numbers for the stages of this background job's pipeline.
+    /// Hands this background job the registered processes of its pipeline's stages.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn set_stage_pids(
+    pub(crate) fn set_stage_processes(
         &mut self,
-        pids: std::collections::VecDeque<crate::process_table::Pid>,
+        processes: std::collections::VecDeque<crate::execution::process::NumberedProcess>,
     ) {
-        self.pending_stage_pids = pids;
+        self.pending_stage_processes = processes;
     }
 
-    /// Takes the next reserved stage number, if this is a numbered background pipeline.
+    /// Takes the next stage's registered process, if this is a numbered background pipeline.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn take_stage_pid(&mut self) -> Option<crate::process_table::Pid> {
-        self.pending_stage_pids.pop_front()
+    pub(crate) fn take_stage_process(
+        &mut self,
+    ) -> Option<crate::execution::process::NumberedProcess> {
+        self.pending_stage_processes.pop_front()
     }
 
     /// Returns this shell's execution services, inherited by cloned subshells.
