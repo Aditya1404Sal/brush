@@ -783,20 +783,33 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     use crate::execution::process;
     if builtin.execution_boundary == builtins::ExecutionBoundary::Command {
         let disposition = process::pipe_disposition().for_exec();
-        let mut command_shell = context.shell.clone();
+        let ExecutionContext {
+            shell,
+            command_name,
+            params,
+        } = context;
+        let mut command_shell = shell.clone();
         command_shell.traps_mut().reset_pipe_for_subshell();
         let command_context = ExecutionContext {
             shell: &mut command_shell,
-            command_name: context.command_name,
-            params: context.params,
+            command_name,
+            params: params.clone(),
         };
-        process::run_process(
+        let result = process::run_process(
             disposition,
             execute_wasm_builtin(builtin, command_context, args, false),
         )
-        .await
+        .await;
+        // Signals that reached this (calling) process while the command ran.
+        let triggering_status = result
+            .as_ref()
+            .map_or(1, |result| u8::from(result.exit_code));
+        if let Some(outcome) = deliver_pending_traps(shell, &params, triggering_status).await? {
+            return Ok(outcome);
+        }
+        result
     } else {
-        process::set_pipe_disposition(context.shell.traps().pipe_disposition());
+        process::apply_trap_dispositions(context.shell.traps());
         execute_wasm_builtin(builtin, context, args, true).await
     }
 }
@@ -864,17 +877,12 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
         }
     }
 
-    if deliver_traps && process::take_pending_pipe_trap() {
+    if deliver_traps {
         let triggering_status = result
             .as_ref()
             .map_or(1, |result| u8::from(result.exit_code));
-        shell.set_last_exit_status(triggering_status);
-        let _handling = process::handling_pipe();
-        let signal = "PIPE".parse()?;
-        let handler_result = shell.invoke_trap_handler(signal, &params).await?;
-        process::set_pipe_disposition(shell.traps().pipe_disposition());
-        if !handler_result.is_normal_flow() {
-            return Ok(handler_result);
+        if let Some(outcome) = deliver_pending_traps(shell, &params, triggering_status).await? {
+            return Ok(outcome);
         }
     }
     result.map_err(|error| {
@@ -884,6 +892,28 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
             error
         }
     })
+}
+
+/// Runs handlers for caught signals that arrived while the current command ran. Returns the
+/// handler's result when it changes control flow (for example `exit`).
+#[cfg(target_arch = "wasm32")]
+async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
+    shell: &mut Shell<SE>,
+    params: &ExecutionParameters,
+    triggering_status: u8,
+) -> Result<Option<ExecutionResult>, error::Error> {
+    use crate::execution::process::{self, signals};
+    while let Some(signal_number) = process::take_pending_trap() {
+        shell.set_last_exit_status(triggering_status);
+        let _handling = (signal_number == signals::PIPE).then(process::handling_pipe);
+        let signal: crate::traps::TrapSignal = i32::from(signal_number).try_into()?;
+        let handler_result = shell.invoke_trap_handler(signal, params).await?;
+        process::apply_trap_dispositions(shell.traps());
+        if !handler_result.is_normal_flow() {
+            return Ok(Some(handler_result));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) async fn invoke_shell_function(

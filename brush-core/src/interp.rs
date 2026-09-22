@@ -257,6 +257,16 @@ impl Execute for ast::CompoundList {
             let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
             if run_async {
+                #[cfg(target_arch = "wasm32")]
+                if shell.jobs().running_count(shell.processes()) >= jobs::MAX_RUNNING_JOBS {
+                    writeln!(
+                        params.stderr(shell),
+                        "bash: fork: retry: Resource temporarily unavailable"
+                    )?;
+                    result = ExecutionResult::new(1);
+                    shell.set_last_exit_status(1);
+                    continue;
+                }
                 let job = spawn_async_ao_list_in_task(ao_list, shell, params);
                 let job_formatted = job.to_pid_style_string();
 
@@ -281,6 +291,73 @@ impl Execute for ast::CompoundList {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
+    ao_list: &ast::AndOrList,
+    shell: &'a mut Shell<SE>,
+    params: &ExecutionParameters,
+) -> &'a jobs::Job {
+    use crate::execution::process;
+    let table = shell.processes().clone();
+    let command_line = ao_list.to_string();
+    let leader = table.allocate(shell.own_pid(), command_line.clone());
+
+    let mut cloned_shell = shell.clone();
+    let mut cloned_params = params.clone();
+    let cloned_ao_list = ao_list.clone();
+    cloned_shell.options_mut().interactive = false;
+    cloned_shell.set_own_pid(leader);
+    // Bash resets caught handlers in asynchronous subshells; ignored signals stay ignored.
+    cloned_shell.traps_mut().reset_caught_for_subshell();
+    if let Ok(null) = openfiles::null() {
+        cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
+    }
+
+    // A single background pipeline reports one number per stage; `$!` is the last stage.
+    let stage_pids: VecDeque<_> = if ao_list.additional.is_empty()
+        && ao_list.first.seq.len() > 1
+        && !cloned_shell
+            .options()
+            .run_last_pipeline_cmd_in_current_shell
+    {
+        ao_list
+            .first
+            .seq
+            .iter()
+            .map(|command| table.allocate(leader, command.to_string()))
+            .collect()
+    } else {
+        VecDeque::new()
+    };
+    cloned_shell.set_stage_pids(stage_pids.clone());
+
+    let mut dispositions = process::Dispositions::from_traps(cloned_shell.traps());
+    // Without job control, asynchronous commands ignore SIGINT.
+    dispositions.int = crate::traps::PipeDisposition::Ignored;
+    let job_table = table;
+    let join_handle = spawn_command_task(shell.execution_services(), async move {
+        process::run_numbered_process(&job_table, leader, dispositions, async move {
+            cloned_ao_list
+                .execute(&mut cloned_shell, &cloned_params)
+                .await
+        })
+        .await
+    });
+
+    let pids = if stage_pids.is_empty() {
+        vec![leader]
+    } else {
+        stage_pids.into()
+    };
+    shell.jobs_mut().add_as_current(jobs::Job::new_numbered(
+        [jobs::JobTask::Internal(join_handle)],
+        command_line,
+        leader,
+        pids,
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     ao_list: &ast::AndOrList,
     shell: &'a mut Shell<SE>,
@@ -533,7 +610,13 @@ async fn spawn_pipeline_processes(
         #[cfg(target_arch = "wasm32")]
         {
             if !run_in_current_shell {
-                let join_handle = spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params);
+                let stage_pid = shell.take_stage_pid();
+                let mut stage_shell = shell.clone();
+                if let Some(pid) = stage_pid {
+                    stage_shell.set_own_pid(pid);
+                }
+                let join_handle =
+                    spawn_pipeline_stage(stage_shell, command.clone(), cmd_params, stage_pid);
                 stage_tasks.0.push(join_handle.abort_handle());
                 spawn_results.push_back(ExecutionSpawnResult::StartedTask(join_handle));
                 continue;
@@ -636,12 +719,18 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     mut shell: Shell<SE>,
     command: ast::Command,
     params: ExecutionParameters,
+    pid: Option<crate::process_table::Pid>,
 ) -> crate::execution::CommandTask {
+    use crate::execution::process;
     let services = shell.execution_services();
     shell.traps_mut().reset_pipe_for_subshell();
     let disposition = shell.traps().pipe_disposition();
+    let table = shell.processes().clone();
+    // Evaluated now, while the spawning process is being polled, so stages inherit its
+    // dispositions (for example a background job's ignored INT).
+    let dispositions = process::inherited_dispositions(disposition);
     services.spawn(async move {
-        crate::execution::process::run_process(disposition, async move {
+        let body = async move {
             let context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut shell),
                 process_group_id: None,
@@ -655,8 +744,11 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
                 ExecutionWaitResult::Completed(result) => Ok(result),
                 ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
             }
-        })
-        .await
+        };
+        match pid {
+            Some(pid) => process::run_numbered_process(&table, pid, dispositions, body).await,
+            None => process::run_process(disposition, body).await,
+        }
     })
 }
 

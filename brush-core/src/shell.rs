@@ -158,6 +158,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// The numbered logical process this shell clone runs as; `None` is the main shell.
     #[cfg_attr(feature = "serde", serde(skip))]
     own_pid: Option<crate::process_table::Pid>,
+
+    /// Numbers reserved for the stages of this background job's pipeline, in stage order.
+    #[cfg(target_arch = "wasm32")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pending_stage_pids: std::collections::VecDeque<crate::process_table::Pid>,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -200,6 +205,8 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             depth: self.depth + 1,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
+            #[cfg(target_arch = "wasm32")]
+            pending_stage_pids: std::collections::VecDeque::new(),
         }
     }
 }
@@ -225,6 +232,21 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Marks this shell clone as running as numbered process `pid`.
     pub const fn set_own_pid(&mut self, pid: crate::process_table::Pid) {
         self.own_pid = Some(pid);
+    }
+
+    /// Reserves numbers for the stages of this background job's pipeline.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn set_stage_pids(
+        &mut self,
+        pids: std::collections::VecDeque<crate::process_table::Pid>,
+    ) {
+        self.pending_stage_pids = pids;
+    }
+
+    /// Takes the next reserved stage number, if this is a numbered background pipeline.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_stage_pid(&mut self) -> Option<crate::process_table::Pid> {
+        self.pending_stage_pids.pop_front()
     }
 
     /// Returns this shell's execution services, inherited by cloned subshells.

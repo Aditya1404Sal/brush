@@ -87,6 +87,16 @@ pub(crate) fn init_well_known_vars(
         bashpid_var.treat_as_integer();
         shell.env_mut().set_global("BASHPID", bashpid_var)?;
     }
+    #[cfg(target_family = "wasm")]
+    {
+        // The synthetic number of the logical process reading it: a job's own number, else `$$`.
+        let mut bashpid_var = ShellVariable::new(ShellValue::Dynamic {
+            getter: |shell| shell.own_pid().to_string().into(),
+            setter: |_| (),
+        });
+        bashpid_var.treat_as_integer();
+        shell.env_mut().set_global("BASHPID", bashpid_var)?;
+    }
 
     // BASH_ALIASES
     shell.env_mut().set_global(

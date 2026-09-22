@@ -257,24 +257,10 @@ pub(crate) fn record_broken_pipe() {
 }
 
 /// Takes the oldest caught signal waiting for a trap safe point.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into trap safe points by the next change")
-)]
 pub(crate) fn take_pending_trap() -> Option<u8> {
     current().and_then(|state| {
         let mut pending = state.pending.borrow_mut();
         (!pending.is_empty()).then(|| pending.remove(0))
-    })
-}
-
-/// Takes a pending PIPE trap only.
-pub(crate) fn take_pending_pipe_trap() -> bool {
-    current().is_some_and(|state| {
-        let mut pending = state.pending.borrow_mut();
-        let before = pending.len();
-        pending.retain(|signal| *signal != signals::PIPE);
-        pending.len() != before
     })
 }
 
@@ -521,13 +507,13 @@ mod tests {
                     let _ = writer.write(b"x");
                     let _ = writer.write(b"x");
                     assert_eq!(
-                        take_pending_pipe_trap(),
+                        take_pending_trap() == Some(signals::PIPE),
                         disposition == PipeDisposition::Caught
                     );
-                    assert!(!take_pending_pipe_trap());
+                    assert_eq!(take_pending_trap(), None);
                     let _handling = handling_pipe();
                     let _ = writer.write(b"x");
-                    assert!(!take_pending_pipe_trap());
+                    assert_eq!(take_pending_trap(), None);
                     Ok(ExecutionResult::new(1))
                 })
                 .await

@@ -91,7 +91,18 @@ impl JobTask {
     }
 }
 
+/// Most background jobs one shell keeps running at once.
+pub const MAX_RUNNING_JOBS: usize = 256;
+
 impl JobManager {
+    /// Jobs whose numbered process is still running.
+    pub fn running_count(&self, table: &crate::process_table::ProcessTable) -> usize {
+        self.jobs
+            .iter()
+            .filter(|job| job.leader.is_some_and(|pid| table.is_running(pid)))
+            .count()
+    }
+
     /// Returns a new job manager.
     pub fn new() -> Self {
         Self::default()
@@ -286,6 +297,12 @@ pub struct Job {
 
     /// The current operational state of the job.
     pub state: JobState,
+
+    /// The numbered logical process that runs this job.
+    leader: Option<crate::process_table::Pid>,
+
+    /// Numbers reported for this job; the last is `$!`.
+    pids: Vec<crate::process_table::Pid>,
 }
 
 impl Display for Job {
@@ -317,7 +334,39 @@ impl Job {
             annotation: JobAnnotation::None,
             command_line,
             state,
+            leader: None,
+            pids: Vec::new(),
         }
+    }
+
+    /// Returns a running job whose work runs as numbered process `leader`.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(dead_code, reason = "only WASM numbers background jobs")
+    )]
+    pub(crate) fn new_numbered<I>(
+        tasks: I,
+        command_line: String,
+        leader: crate::process_table::Pid,
+        pids: Vec<crate::process_table::Pid>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = JobTask>,
+    {
+        let mut job = Self::new(tasks, command_line, JobState::Running);
+        job.leader = Some(leader);
+        job.pids = pids;
+        job
+    }
+
+    /// The numbered process running this job, if it has one.
+    pub const fn leader(&self) -> Option<crate::process_table::Pid> {
+        self.leader
+    }
+
+    /// Numbers reported for this job, in pipeline order.
+    pub fn pids(&self) -> &[crate::process_table::Pid] {
+        &self.pids
     }
 
     /// Returns a pid-style string for the job.
@@ -474,6 +523,9 @@ impl Job {
 
     /// Tries to retrieve a "representative" pid for the job.
     pub fn representative_pid(&self) -> Option<sys::process::ProcessId> {
+        if let Some(pid) = self.pids.last() {
+            return Some(*pid);
+        }
         for task in &self.tasks {
             match task {
                 JobTask::External(p) => {
