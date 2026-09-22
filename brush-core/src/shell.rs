@@ -150,6 +150,14 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
     /// History of commands executed in the shell.
     history: Option<crate::history::History>,
+
+    /// Synthetic process numbers shared with every clone of this shell.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    processes: crate::process_table::ProcessTable,
+
+    /// The numbered logical process this shell clone runs as; `None` is the main shell.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    own_pid: Option<crate::process_table::Pid>,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -190,6 +198,8 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
             depth: self.depth + 1,
+            processes: self.processes.clone(),
+            own_pid: self.own_pid,
         }
     }
 }
@@ -207,6 +217,16 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// This session's synthetic process numbers.
+    pub const fn processes(&self) -> &crate::process_table::ProcessTable {
+        &self.processes
+    }
+
+    /// Marks this shell clone as running as numbered process `pid`.
+    pub const fn set_own_pid(&mut self, pid: crate::process_table::Pid) {
+        self.own_pid = Some(pid);
+    }
+
     /// Returns this shell's execution services, inherited by cloned subshells.
     pub const fn execution_services(&self) -> crate::execution::ExecutionServices {
         self.execution_services
@@ -413,6 +433,11 @@ pub struct SavedCommandStatus {
 
 #[inherent::inherent]
 impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
+    /// Returns the number of the logical process this shell runs as (`$$` for the main shell).
+    pub fn own_pid(&self) -> crate::process_table::Pid {
+        self.own_pid.unwrap_or_else(|| self.processes.shell_pid())
+    }
+
     /// Returns whether or not this shell is a subshell.
     pub fn is_subshell(&self) -> bool {
         self.depth > 0
