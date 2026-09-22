@@ -1,8 +1,10 @@
 use clap::Parser;
 use std::io::Write;
 
+#[cfg(unix)]
+use brush_core::sys;
 use brush_core::traps::TrapSignal;
-use brush_core::{ExecutionExitCode, ExecutionResult, builtins, sys};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins};
 
 /// Signal a job or process.
 #[derive(Parser)]
@@ -35,8 +37,11 @@ impl builtins::Command for KillCommand {
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut signal_zero = false;
 
-        // Default signal is SIGKILL.
+        // Bash's default is TERM. Unix keeps its existing default until upstream changes it.
+        #[cfg(unix)]
         let mut trap_signal = TrapSignal::Signal(nix::sys::signal::Signal::SIGKILL);
+        #[cfg(target_arch = "wasm32")]
+        let mut trap_signal: TrapSignal = "TERM".parse()?;
 
         // Try parsing the signal name (if specified).
         if let Some(signal_name) = &self.signal_name {
@@ -114,36 +119,100 @@ impl builtins::Command for KillCommand {
                 return Ok(ExecutionExitCode::InvalidUsage.into());
             };
 
-            if pid_or_job_spec.starts_with('%') {
-                // It's a job spec.
-                if let Some(job) = context.shell.jobs_mut().resolve_job_spec(pid_or_job_spec) {
-                    if signal_zero {
-                        job.check_signalable()?;
-                    } else {
-                        job.kill(trap_signal)?;
-                    }
-                } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {}: no such job",
-                        context.command_name,
-                        pid_or_job_spec
-                    )?;
-                    return Ok(ExecutionResult::general_error());
-                }
-            } else {
-                let pid = brush_core::int_utils::parse(pid_or_job_spec.as_str(), 10)?;
-
-                // It's a pid.
-                if signal_zero {
-                    sys::signal::check_signalable(pid)?;
-                } else {
-                    sys::signal::kill_process(pid, trap_signal)?;
-                }
+            let mut stderr = context.stderr();
+            if let Some(failure) = signal_target(
+                &mut *context.shell,
+                &context.command_name,
+                &mut stderr,
+                pid_or_job_spec,
+                trap_signal,
+                signal_zero,
+            )? {
+                return Ok(failure);
             }
         }
         Ok(ExecutionResult::success())
     }
+}
+
+/// Delivers a signal to a host process or job. Returns the failure status to report, or `None`
+/// when the target exists.
+#[cfg(unix)]
+fn signal_target<SE: brush_core::ShellExtensions>(
+    shell: &mut brush_core::Shell<SE>,
+    command_name: &str,
+    stderr: &mut impl Write,
+    target: &str,
+    signal: TrapSignal,
+    probe_only: bool,
+) -> Result<Option<ExecutionResult>, brush_core::Error> {
+    if target.starts_with('%') {
+        // It's a job spec.
+        if let Some(job) = shell.jobs_mut().resolve_job_spec(target) {
+            if probe_only {
+                job.check_signalable()?;
+            } else {
+                job.kill(signal)?;
+            }
+        } else {
+            writeln!(stderr, "{command_name}: {target}: no such job")?;
+            return Ok(Some(ExecutionResult::general_error()));
+        }
+    } else {
+        // It's a pid.
+        let pid = brush_core::int_utils::parse(target, 10)?;
+        if probe_only {
+            sys::signal::check_signalable(pid)?;
+        } else {
+            sys::signal::kill_process(pid, signal)?;
+        }
+    }
+    Ok(None)
+}
+
+/// Delivers a signal to a synthetic WASM process or job. Returns the failure status to report,
+/// or `None` when the target exists.
+#[cfg(target_arch = "wasm32")]
+fn signal_target<SE: brush_core::ShellExtensions>(
+    shell: &mut brush_core::Shell<SE>,
+    command_name: &str,
+    stderr: &mut impl Write,
+    target: &str,
+    signal: TrapSignal,
+    probe_only: bool,
+) -> Result<Option<ExecutionResult>, brush_core::Error> {
+    use brush_core::execution::process;
+    let table = shell.processes().clone();
+    let number = i32::try_from(signal)
+        .ok()
+        .and_then(|number| u8::try_from(number).ok())
+        .unwrap_or(process::signals::TERM);
+    if target.starts_with('%') {
+        let leader = shell
+            .jobs_mut()
+            .resolve_job_spec(target)
+            .and_then(|job| job.leader())
+            .filter(|pid| process::process_exists(&table, *pid));
+        let Some(leader) = leader else {
+            writeln!(stderr, "{command_name}: {target}: no such job")?;
+            return Ok(Some(ExecutionResult::general_error()));
+        };
+        if !probe_only {
+            process::signal_process_group(&table, leader, number);
+        }
+    } else {
+        let pid: brush_core::process_table::Pid = brush_core::int_utils::parse(target, 10)?;
+        let delivered = if probe_only {
+            process::process_exists(&table, pid)
+        } else {
+            process::signal_process(&table, pid, number)
+        };
+        if !delivered {
+            writeln!(stderr, "{command_name}: ({pid}) - No such process")?;
+            return Ok(Some(ExecutionResult::general_error()));
+        }
+    }
+    Ok(None)
 }
 
 fn print_signals(

@@ -119,9 +119,7 @@ impl TrapCommand {
     ) {
         context.shell.traps_mut().remove_handlers(signal);
         #[cfg(target_arch = "wasm32")]
-        brush_core::execution::process::set_pipe_disposition(
-            context.shell.traps().pipe_disposition(),
-        );
+        brush_core::execution::process::apply_trap_dispositions(context.shell.traps());
     }
 
     fn register_handler<I>(
@@ -143,9 +141,7 @@ impl TrapCommand {
                 source_info.clone(),
             );
             #[cfg(target_arch = "wasm32")]
-            brush_core::execution::process::set_pipe_disposition(
-                context.shell.traps().pipe_disposition(),
-            );
+            brush_core::execution::process::apply_trap_dispositions(context.shell.traps());
         }
     }
 }

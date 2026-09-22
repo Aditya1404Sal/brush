@@ -108,7 +108,7 @@ pub(super) struct ProcessState {
     pending: RefCell<Vec<u8>>,
     handling: Cell<bool>,
     waker: RefCell<Option<Waker>>,
-    children: RefCell<Vec<Weak<ProcessState>>>,
+    children: RefCell<Vec<Weak<Self>>>,
 }
 
 impl ProcessState {
@@ -221,10 +221,12 @@ pub fn inherited_dispositions(pipe: PipeDisposition) -> Dispositions {
     dispositions
 }
 
-/// Applies a shell's trap configuration to the running process. Signals with a handler take its
-/// disposition, and PIPE always follows the configuration, as before. A caught signal whose
-/// handler was removed returns to default. Signals the configuration never mentions keep their
-/// inherited disposition, such as a background job's ignored INT.
+/// Applies a shell's trap configuration to the running process.
+///
+/// Signals with a handler take its disposition, and PIPE always follows the configuration, as
+/// before. A caught signal whose handler was removed returns to default. Signals the
+/// configuration never mentions keep their inherited disposition, such as a background job's
+/// ignored INT.
 pub fn apply_trap_dispositions(traps: &TrapHandlerConfig) {
     let Some(state) = current() else {
         return;

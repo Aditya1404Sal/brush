@@ -76,7 +76,7 @@ mod help;
 mod history;
 #[cfg(feature = "builtin.jobs")]
 mod jobs;
-#[cfg(all(feature = "builtin.kill", unix))]
+#[cfg(all(feature = "builtin.kill", any(unix, target_arch = "wasm32")))]
 mod kill;
 #[cfg(feature = "builtin.let")]
 mod let_;
