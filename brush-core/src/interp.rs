@@ -929,17 +929,21 @@ impl Execute for ast::CompoundCommand {
                 let mut subshell = shell.clone();
                 #[cfg(target_arch = "wasm32")]
                 subshell.traps_mut().reset_pipe_for_subshell();
+                // The subshell runs only an EXIT trap it sets itself, when its body ends.
+                subshell.traps_mut().reset_exit_for_subshell();
+                #[cfg(target_arch = "wasm32")]
+                let disposition = subshell.traps().pipe_disposition();
+                let body = async {
+                    let result = list.execute(&mut subshell, params).await;
+                    subshell.exit_with_trap(result).await
+                };
 
                 // Handle errors within the subshell context to prevent fatal errors
                 // from propagating to the parent shell.
                 #[cfg(target_arch = "wasm32")]
-                let execution = crate::execution::process::run_process(
-                    subshell.traps().pipe_disposition(),
-                    list.execute(&mut subshell, params),
-                )
-                .await;
+                let execution = crate::execution::process::run_process(disposition, body).await;
                 #[cfg(not(target_arch = "wasm32"))]
-                let execution = list.execute(&mut subshell, params).await;
+                let execution = body.await;
                 let subshell_result = match execution {
                     Ok(result) => result,
                     Err(error) => {

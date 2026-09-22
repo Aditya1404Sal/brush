@@ -7,12 +7,33 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     ///
     /// This currently includes invoking the `EXIT` trap handler, if any.
     pub async fn on_exit(&mut self) -> Result<(), error::Error> {
+        self.run_exit_trap().await.map(|_| ())
+    }
+
+    /// Runs the `EXIT` trap handler, if any, and returns its result.
+    pub async fn run_exit_trap(&mut self) -> Result<ExecutionResult, error::Error> {
         if self.traps.handles(TrapSignal::Exit) {
             self.invoke_trap_handler(TrapSignal::Exit, &self.default_exec_params())
-                .await?;
+                .await
+        } else {
+            Ok(ExecutionResult::success())
         }
+    }
 
-        Ok(())
+    /// Runs the `EXIT` trap as the shell ends with `result`. As in bash, an `exit` inside the
+    /// trap sets the final status; otherwise `result` stands.
+    ///
+    /// # Arguments
+    ///
+    /// * `result`: The result of the commands the shell ran before ending.
+    pub async fn exit_with_trap(
+        &mut self,
+        result: Result<ExecutionResult, error::Error>,
+    ) -> Result<ExecutionResult, error::Error> {
+        match self.run_exit_trap().await {
+            Ok(trap) if trap.is_exit() => Ok(trap),
+            _ => result,
+        }
     }
 
     /// Invokes the handler registered for `signal`, if any.

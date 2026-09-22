@@ -245,6 +245,14 @@ impl TrapHandlerConfig {
         self.inherited_handlers.extend(caught);
     }
 
+    /// Stops delivering an inherited `EXIT` handler in a subshell while preserving `trap -p`
+    /// metadata: as in bash, a subshell runs only an `EXIT` trap it sets itself.
+    pub fn reset_exit_for_subshell(&mut self) {
+        if self.handlers.contains_key(&TrapSignal::Exit) {
+            self.inherited_handlers.insert(TrapSignal::Exit);
+        }
+    }
+
     /// Resets caught PIPE delivery in a WASM subshell while preserving `trap -p` metadata.
     pub fn reset_pipe_for_subshell(&mut self) {
         self.reset_caught_for_subshell();
