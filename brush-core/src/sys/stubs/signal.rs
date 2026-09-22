@@ -6,16 +6,37 @@ use crate::{error, sys, traps};
 #[allow(unnameable_types)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Signal {
+    /// Synthetic hangup, sent to leftover jobs when a finite shell invocation ends.
+    #[cfg(target_arch = "wasm32")]
+    SIGHUP = 1,
+    /// Synthetic interrupt.
+    #[cfg(target_arch = "wasm32")]
+    SIGINT = 2,
+    /// Synthetic uncatchable kill.
+    #[cfg(target_arch = "wasm32")]
+    SIGKILL = 9,
     /// Synthetic pipe-write signal on WASM; no host signal API is implied.
     #[cfg(target_arch = "wasm32")]
     SIGPIPE = 13,
+    /// Synthetic termination request, the default for `kill`.
+    #[cfg(target_arch = "wasm32")]
+    SIGTERM = 15,
 }
+
+#[cfg(target_arch = "wasm32")]
+const SIGNALS: [Signal; 5] = [
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGKILL,
+    Signal::SIGPIPE,
+    Signal::SIGTERM,
+];
 
 impl Signal {
     /// Returns an iterator over all possible signals.
     pub fn iterator() -> impl Iterator<Item = Self> {
         #[cfg(target_arch = "wasm32")]
-        return [Self::SIGPIPE].into_iter();
+        return SIGNALS.into_iter();
         #[cfg(not(target_arch = "wasm32"))]
         std::iter::empty()
     }
@@ -24,7 +45,11 @@ impl Signal {
     pub const fn as_str(self) -> &'static str {
         #[cfg(target_arch = "wasm32")]
         return match self {
+            Self::SIGHUP => "SIGHUP",
+            Self::SIGINT => "SIGINT",
+            Self::SIGKILL => "SIGKILL",
             Self::SIGPIPE => "SIGPIPE",
+            Self::SIGTERM => "SIGTERM",
         };
         #[cfg(not(target_arch = "wasm32"))]
         ""
@@ -37,8 +62,8 @@ impl Signal {
     )]
     pub fn from_str(s: &str) -> Result<Self, error::Error> {
         #[cfg(target_arch = "wasm32")]
-        if s == "SIGPIPE" {
-            return Ok(Self::SIGPIPE);
+        if let Some(signal) = SIGNALS.into_iter().find(|signal| signal.as_str() == s) {
+            return Ok(signal);
         }
         Err(error::ErrorKind::InvalidSignal(s.into()).into())
     }
@@ -49,8 +74,8 @@ impl TryFrom<i32> for Signal {
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         #[cfg(target_arch = "wasm32")]
-        if value == 13 {
-            return Ok(Self::SIGPIPE);
+        if let Some(signal) = SIGNALS.into_iter().find(|signal| *signal as i32 == value) {
+            return Ok(signal);
         }
         Err(error::ErrorKind::InvalidSignal(std::format!("{value}")).into())
     }
