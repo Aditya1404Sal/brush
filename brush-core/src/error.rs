@@ -21,10 +21,6 @@ pub struct Error {
 /// Monolithic error type for the shell
 #[derive(thiserror::Error, Debug)]
 pub enum ErrorKind {
-    /// A tilde expression was used without a valid HOME variable
-    #[error("cannot expand tilde expression with HOME not set")]
-    TildeWithoutValidHome,
-
     /// An attempt was made to assign a list to an array member
     #[error("cannot assign list to array member")]
     AssigningListToArrayMember,
