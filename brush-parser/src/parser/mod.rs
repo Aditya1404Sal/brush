@@ -33,6 +33,9 @@ pub struct ParserOptions {
     pub tilde_expansion_at_word_start: bool,
     /// Whether or not to perform tilde expansion for tildes after colons.
     pub tilde_expansion_after_colon: bool,
+    /// Whether or not to perform tilde expansion for a tilde right after the `=` of a word that
+    /// looks like an assignment (`name=~/x`), as bash does for such words on a command line.
+    pub tilde_expansion_after_assignment_equals: bool,
     /// Select the parser internal implementation
     pub parser_impl: ParserImpl,
 }
@@ -45,6 +48,7 @@ impl Default for ParserOptions {
             sh_mode: false,
             tilde_expansion_at_word_start: true,
             tilde_expansion_after_colon: false,
+            tilde_expansion_after_assignment_equals: false,
             parser_impl: ParserImpl::default(),
         }
     }
@@ -125,6 +129,9 @@ impl<R: std::io::BufRead> Parser<R> {
         #[builder(default = false)]
         /// Whether or not to perform tilde expansion for tildes after colons.
         tilde_expansion_after_colon: bool,
+        #[builder(default = false)]
+        /// Whether or not to perform tilde expansion right after the `=` of an assignment-like word.
+        tilde_expansion_after_assignment_equals: bool,
         #[builder(default)]
         /// Select the parser internal implementation
         parser_impl: ParserImpl,
@@ -135,6 +142,7 @@ impl<R: std::io::BufRead> Parser<R> {
             sh_mode,
             tilde_expansion_at_word_start,
             tilde_expansion_after_colon,
+            tilde_expansion_after_assignment_equals,
             parser_impl,
         };
         Self { reader, options }

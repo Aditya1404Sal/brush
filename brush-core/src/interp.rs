@@ -1773,7 +1773,8 @@ async fn expand_assignment_value(
                 } else {
                     // Array elements are treated as regular words, not assignments
                     let split_expanded_value =
-                        expansion::full_expand_and_split_word(shell, params, value).await?;
+                        expansion::full_expand_and_split_array_element(shell, params, value)
+                            .await?;
                     for expanded_value in split_expanded_value {
                         expanded_values.push((None, expanded_value.into()));
                     }
@@ -1836,9 +1837,12 @@ async fn apply_assignment(
                     elements.push((key, value));
                 } else {
                     // Array elements are treated as regular words, not assignments
-                    let values =
-                        expansion::full_expand_and_split_word(shell, params, unexpanded_value)
-                            .await?;
+                    let values = expansion::full_expand_and_split_array_element(
+                        shell,
+                        params,
+                        unexpanded_value,
+                    )
+                    .await?;
                     for value in values {
                         elements.push((None, value));
                     }
@@ -2163,7 +2167,8 @@ pub(crate) async fn setup_redirect(
             // If not specified, default to stdin (fd 0).
             let fd_num = fd_num.unwrap_or(0);
 
-            let mut expanded_word = expansion::basic_expand_word(shell, params, word).await?;
+            let mut expanded_word =
+                expansion::basic_expand_here_string(shell, params, word).await?;
             expanded_word.push('\n');
 
             let f = setup_open_file_with_contents(expanded_word.as_str())?;

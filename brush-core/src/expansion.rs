@@ -52,6 +52,10 @@ pub(crate) enum UnquotedBackslashHandling {
 pub(crate) struct ExpanderOptions {
     /// Whether to perform tilde-expansion.
     pub tilde_expand: bool,
+    /// Whether the word is expanded as a word of the command line, which (as in bash outside
+    /// POSIX mode) gets tilde expansion after its first `=` and after each `:` when it looks like
+    /// an assignment (`make DESTDIR=~/out`). Requires `tilde_expand`.
+    pub assignment_word_tilde: bool,
     /// Whether to perform brace-expansion.
     pub brace_expand: bool,
     /// Whether to perform command substitutions. If disabled, command substitutions
@@ -69,6 +73,7 @@ impl Default for ExpanderOptions {
     fn default() -> Self {
         Self {
             tilde_expand: true,
+            assignment_word_tilde: true,
             brace_expand: true,
             execute_command_substitutions: true,
             pathname_expand: true,
@@ -550,6 +555,7 @@ pub(crate) async fn basic_expand_heredoc_word(
     let mut expander = WordExpander::new(shell, params);
     expander.heredoc_mode = true;
     expander.disable_brace_expansion = true;
+    expander.assignment_word_tilde = false;
     expander.basic_expand_to_str(word_str.as_ref()).await
 }
 
@@ -588,6 +594,43 @@ pub(crate) async fn full_expand_and_split_word(
     expander.full_expand_with_splitting(word_str.as_ref()).await
 }
 
+/// Like [`full_expand_and_split_word`], for an element of a compound array assignment. Bash gives
+/// an element that looks like an assignment (`a=(x=~)`) no tilde expansion after its `=`.
+///
+/// # Arguments
+///
+/// * `shell` - The shell in which to perform expansion.
+/// * `params` - The execution parameters to use during expansion.
+/// * `word_str` - The element to expand, as a string.
+pub(crate) async fn full_expand_and_split_array_element(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    word_str: impl AsRef<str>,
+) -> Result<Vec<String>, error::Error> {
+    let mut expander = WordExpander::new(shell, params);
+    expander.assignment_word_tilde = false;
+    expander.full_expand_with_splitting(word_str.as_ref()).await
+}
+
+/// Like [`basic_expand_word`], for the word of a here-string (`<<< word`), which bash does not
+/// treat as an assignment-like word (`<<< x=~` stays literal).
+///
+/// # Arguments
+///
+/// * `shell` - The shell in which to perform expansion.
+/// * `params` - The execution parameters to use during expansion.
+/// * `word_str` - The word to expand, as a string.
+pub(crate) async fn basic_expand_here_string(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    word_str: impl AsRef<str>,
+) -> Result<String, error::Error> {
+    let mut expander = WordExpander::new(shell, params);
+    expander.disable_brace_expansion = true;
+    expander.assignment_word_tilde = false;
+    expander.basic_expand_to_str(word_str.as_ref()).await
+}
+
 /// Apply tilde-expansion, parameter expansion, command substitution, and arithmetic expansion;
 /// then perform field splitting and pathname expansion on the result.
 ///
@@ -623,6 +666,8 @@ pub(crate) async fn basic_expand_assignment_word(
     // Bash performs no brace expansion in this context.
     expander.disable_brace_expansion = true;
     expander.parser_options.tilde_expansion_after_colon = true;
+    // The value is not a word of its own: in `y=x=~` only the first `=` counts.
+    expander.assignment_word_tilde = false;
     expander.basic_expand_to_str(word_str.as_ref()).await
 }
 
@@ -667,6 +712,11 @@ struct WordExpander<'a, SE: extensions::ShellExtensions> {
     in_double_quotes: bool,
     /// Whether to use heredoc expansion semantics (literal quotes, no brace expansion).
     heredoc_mode: bool,
+    /// Whether the next word expanded is a command-line word that, if it looks like an
+    /// assignment, gets tilde expansion after its `=` and colons (see
+    /// [`ExpanderOptions::assignment_word_tilde`]). Cleared once that word is taken, so words
+    /// re-expanded inside it (such as `${x:-y=~}`) are not treated that way.
+    assignment_word_tilde: bool,
 }
 
 impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
@@ -675,6 +725,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Self {
             shell,
             params,
+            assignment_word_tilde: !parser_options.posix_mode,
             parser_options,
             disable_brace_expansion: false,
             disable_command_substitutions: false,
@@ -700,6 +751,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Self {
             shell,
             params,
+            assignment_word_tilde: options.tilde_expand
+                && options.assignment_word_tilde
+                && !parser_options.posix_mode,
             parser_options,
             disable_brace_expansion: !options.brace_expand,
             disable_command_substitutions: !options.execute_command_substitutions,
@@ -809,6 +863,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
     async fn basic_expand(&mut self, word: &str) -> Result<Expansion, error::Error> {
         tracing::debug!(target: trace_categories::EXPANSION, "Basic expanding: '{word}'");
 
+        // Bash tests the word as written, before brace expansion: `{x=~,y}` is not assignment-like.
+        let assignment_word = std::mem::take(&mut self.assignment_word_tilde)
+            && brush_parser::word::assignment_value_start(word).is_some();
+
         // Quick short circuit to avoid more expensive parsing. The characters below are
         // understood to be the *only* ones indicative of *possible* expansion. There's
         // still a possibility no expansion needs to be done, but that's okay; we'll still
@@ -829,7 +887,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         // Bash performs it before every other expansion and each result is a word of its
         // own; that is what keeps the results separate when IFS lacks a space.
         let Some(brace_words) = self.brace_expand_if_needed(word) else {
-            return self.expand_unbraced_word(word).await;
+            return self.expand_unbraced_word(word, assignment_word).await;
         };
 
         tracing::debug!(target: trace_categories::EXPANSION, "  => brace expanded to {brace_words:?}");
@@ -838,12 +896,16 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         // the `concatenate` flag of "${arr[@]}". With several results each one contributes
         // its fields and array semantics don't propagate.
         if let [only] = brace_words.as_slice() {
-            return self.expand_unbraced_word(only).await;
+            return self.expand_unbraced_word(only, assignment_word).await;
         }
 
         let mut fields = vec![];
         for brace_word in &brace_words {
-            fields.extend(self.expand_unbraced_word(brace_word).await?.fields);
+            fields.extend(
+                self.expand_unbraced_word(brace_word, assignment_word)
+                    .await?
+                    .fields,
+            );
         }
 
         Ok(Expansion {
@@ -854,12 +916,24 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
     /// Apply tilde-expansion, parameter expansion, command substitution and arithmetic
     /// expansion to a word that contains no brace expression (or is one result of one).
-    async fn expand_unbraced_word(&mut self, word: &str) -> Result<Expansion, error::Error> {
+    /// An `assignment_word` also gets tilde expansion after its first `=` and after colons.
+    async fn expand_unbraced_word(
+        &mut self,
+        word: &str,
+        assignment_word: bool,
+    ) -> Result<Expansion, error::Error> {
         // Heredoc mode only affects top-level parsing (literal quotes); recursive
         // expansion of parameter words (e.g., ${var:-"default"}) uses normal semantics.
         let pieces = if self.heredoc_mode {
             self.heredoc_mode = false;
             brush_parser::word::parse_heredoc(word, &self.parser_options)?
+        } else if assignment_word {
+            let options = brush_parser::ParserOptions {
+                tilde_expansion_after_colon: true,
+                tilde_expansion_after_assignment_equals: true,
+                ..self.parser_options.clone()
+            };
+            brush_parser::word::parse(word, &options)?
         } else {
             brush_parser::word::parse(word, &self.parser_options)?
         };

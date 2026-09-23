@@ -117,6 +117,27 @@ cases:
       PATH=/usr/bin:~:/bin:~/local
       echo "PATH: ${PATH}"
 
+  - name: "Tilde expansion: assignment-like words"
+    env:
+      HOME: /testhome
+    stdin: |
+      # Words that look like assignments get tilde expansion after their first `=` and after
+      # colons, wherever a command-line word appears; values, array elements, parameter words
+      # and here-strings do not, nor does anything in POSIX mode.
+      echo x=~/y x=~ x+=~ a[1]=~/z x=a:~/b:~ y=x=~
+      echo --prefix=~/x 1x=~ x-y=~ "x=~" x="~" x=a~ x=a:"~"
+      for w in x=~ y=~/z; do echo "$w"; done
+      case x=/testhome in x=~) echo case-matched;; esac
+      [[ x=~ == x=/testhome ]] && echo dbl
+      y=x=~:~; echo "$y"
+      a=(x=~ q); echo "${a[0]}"
+      echo "${u:-x=~}"
+      cat <<< x=~
+      echo {x=~,y}
+      f() { echo "$1"; }; f x=~
+      set -o posix
+      echo x=~/posix
+
   - name: "Tilde expansion: parameter defaults"
     env:
       HOME: /testhome

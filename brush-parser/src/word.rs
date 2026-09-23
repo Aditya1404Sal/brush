@@ -521,6 +521,57 @@ pub enum BraceExpressionMember {
     Child(Vec<BraceExpressionOrText>),
 }
 
+/// Returns the byte offset just past the first `=` of an assignment-like word.
+///
+/// A word is assignment-like when it starts with `name=`, `name+=` or `name[subscript]=`,
+/// unquoted. Bash applies the same test, on the raw word, to decide whether a command-line word
+/// gets tilde expansion after that `=`.
+///
+/// # Arguments
+///
+/// * `word` - The raw, unexpanded word.
+pub fn assignment_value_start(word: &str) -> Option<usize> {
+    let bytes = word.as_bytes();
+    if !bytes
+        .first()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+    {
+        return None;
+    }
+    let mut i = 1;
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'=' => return Some(i + 1),
+            b'+' if bytes.get(i + 1) == Some(&b'=') => return Some(i + 2),
+            b'[' => {
+                // Skip a (possibly nested) subscript; it must be followed by `=` or `+=`.
+                let mut depth = 0usize;
+                while let Some(&c) = bytes.get(i) {
+                    match c {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                return match (bytes.get(i + 1), bytes.get(i + 2)) {
+                    (Some(b'='), _) if depth == 0 => Some(i + 2),
+                    (Some(b'+'), Some(b'=')) if depth == 0 => Some(i + 3),
+                    _ => None,
+                };
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' => i += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Parse a word into its constituent pieces.
 ///
 /// # Arguments
@@ -872,6 +923,7 @@ peg::parser! {
             normal_escape_sequence() /
             // Allow tilde expression to be matched as a word piece (for tilde-after-colon expansion)
             enabled_tilde_expr_after_colon() /
+            enabled_tilde_expr_after_assignment_equals() /
             // Finally, match unquoted literal text.
             unquoted_literal_text(<stop_condition()>, in_command)
 
@@ -917,10 +969,21 @@ peg::parser! {
         rule unquoted_literal_text_piece<T>(stop_condition: rule<T>, in_command: bool) =
             is_true(in_command) extglob_pattern() /
             is_true(in_command) subshell_command() /
-            !stop_condition() !normal_escape_sequence() !enabled_tilde_expr_after_colon() [^'\'' | '\"' | '$' | '`'] {}
+            !stop_condition() !normal_escape_sequence() !enabled_tilde_expr_after_colon() !enabled_tilde_expr_after_assignment_equals() [^'\'' | '\"' | '$' | '`'] {}
 
         rule enabled_tilde_expr_after_colon() -> WordPiece =
             tilde_exprs_after_colon_enabled() last_char_is_colon() piece:tilde_expression_piece() { piece }
+
+        rule enabled_tilde_expr_after_assignment_equals() -> WordPiece =
+            tilde_exprs_after_assignment_equals_enabled() &"~" at_assignment_value_start() piece:tilde_expression_piece() { piece }
+
+        rule at_assignment_value_start() = #{|input, pos| {
+            if assignment_value_start(input) == Some(pos) {
+                peg::RuleResult::Matched(pos, ())
+            } else {
+                peg::RuleResult::Failed
+            }
+        }}
 
         rule last_char_is_colon() = #{|input, pos| {
             if pos == 0 {
@@ -1224,6 +1287,9 @@ peg::parser! {
         rule tilde_exprs_after_colon_enabled() -> () =
             &[_] {? if parser_options.tilde_expansion_after_colon { Ok(()) } else { Err("no tilde expansion after colon") } }
 
+        rule tilde_exprs_after_assignment_equals_enabled() -> () =
+            &[_] {? if parser_options.tilde_expansion_after_assignment_equals { Ok(()) } else { Err("no tilde expansion after assignment equals") } }
+
         // Assignment rules.
 
         pub(crate) rule name_equals_scalar_value() -> ast::Assignment =
@@ -1345,6 +1411,44 @@ mod tests {
             parsed[0].piece,
             WordPiece::TildeExpansion(TildeExpr::NthDirFromTopOfDirStack { n: 2, .. })
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_value_start_matches_bash_assignment_words() {
+        use super::assignment_value_start;
+        assert_eq!(assignment_value_start("x=~"), Some(2));
+        assert_eq!(assignment_value_start("_a1=~"), Some(4));
+        assert_eq!(assignment_value_start("x+=~"), Some(3));
+        assert_eq!(assignment_value_start("a[1]=~"), Some(5));
+        assert_eq!(assignment_value_start("a[b[1]]+=~"), Some(9));
+        assert_eq!(assignment_value_start("x=a=b"), Some(2));
+        for word in [
+            "~", "1x=~", "x-y=~", "=~", "\"x\"=~", "x", "a[1=~", "a[1]x=~", "-x=~",
+        ] {
+            assert_eq!(assignment_value_start(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn parse_tilde_after_assignment_equals() -> Result<()> {
+        let opts = ParserOptions {
+            tilde_expansion_after_assignment_equals: true,
+            ..ParserOptions::default()
+        };
+
+        let parsed = super::parse("x=~/y", &opts)?;
+        assert_eq!(parsed.len(), 3);
+        assert_matches!(&parsed[0].piece, WordPiece::Text(t) if t == "x=");
+        assert_matches!(parsed[1].piece, WordPiece::TildeExpansion(TildeExpr::Home));
+        assert_matches!(&parsed[2].piece, WordPiece::Text(t) if t == "/y");
+
+        // Only the first `=` counts, and only when the option is on.
+        let parsed = super::parse("x=a=~", &opts)?;
+        assert_eq!(parsed.len(), 1);
+        let parsed = super::parse("x=~", &ParserOptions::default())?;
+        assert_eq!(parsed.len(), 1);
 
         Ok(())
     }
