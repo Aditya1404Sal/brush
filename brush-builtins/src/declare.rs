@@ -285,11 +285,9 @@ impl DeclareCommand {
             Self::declaration_to_name_and_value(declaration)?;
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
-        // Special-case: `local -`
+        // Special-case: `local -` saves the `set` options, to restore when the function returns.
         if name == "-" && matches!(verb, DeclareVerb::Local) {
-            // TODO(local): `local -` allows shadowing the current `set` options (i.e., $-), with
-            // subsequent updates getting discarded when the current local scope is popped.
-            tracing::warn!("not yet implemented: local -");
+            context.shell.save_options_locally();
             return Ok(true);
         }
 

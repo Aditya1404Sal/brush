@@ -18,6 +18,7 @@ use crate::variables::{
 };
 use crate::{
     ShellFd, error, expansion, extendedtests, extensions, ioutils, jobs, openfiles, sys, timing,
+    traps,
 };
 
 /// Encapsulates the context of execution in a command pipeline.
@@ -1621,6 +1622,24 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         #[cfg(target_arch = "wasm32")]
         let pending = params.own_output_substitutions();
 
+        // Before its words are expanded, the command's text becomes BASH_COMMAND (unless a trap
+        // handler is running, whose commands leave it alone) and the DEBUG trap runs, as in bash.
+        if !context.shell.running_trap_handler() {
+            context.shell.env_mut().update_or_add(
+                "BASH_COMMAND",
+                ShellValueLiteral::Scalar(self.to_string()),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )?;
+        }
+        if context.shell.traps().handles(traps::TrapSignal::Debug) {
+            let _ = context
+                .shell
+                .invoke_trap_handler(traps::TrapSignal::Debug, &params)
+                .await?;
+        }
+
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
@@ -1859,9 +1878,6 @@ async fn execute_command<T: Into<String>>(
 
     // Arrange to pop off that ephemeral environment scope.
     cmd.post_execute = Some(|shell| shell.env_mut().pop_scope(EnvironmentScope::Command));
-
-    // Run through any pre-execution hooks as best effort.
-    let _ = commands::on_preexecute(&mut cmd).await;
 
     // Execute
     // TODO(jobs): do we need to move self back to foreground on error here?

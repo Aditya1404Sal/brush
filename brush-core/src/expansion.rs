@@ -1059,18 +1059,42 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             .set_extended_globbing(self.shell.options().extended_globbing)
             .set_case_insensitive(self.shell.options().case_insensitive_pathname_expansion);
 
+        // A non-empty GLOBIGNORE drops the matches it names and, as bash does, turns dotglob on.
+        let ignored: Vec<patterns::Pattern> = self
+            .shell
+            .env_str("GLOBIGNORE")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .split(':')
+                    .filter(|pattern| !pattern.is_empty())
+                    .map(|pattern| {
+                        patterns::Pattern::from(pattern)
+                            .set_extended_globbing(self.shell.options().extended_globbing)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let options = patterns::FilenameExpansionOptions {
-            require_dot_in_pattern_to_match_dot_files: !self.shell.options().glob_matches_dotfiles,
+            require_dot_in_pattern_to_match_dot_files: !self.shell.options().glob_matches_dotfiles
+                && ignored.is_empty(),
+            globstar: self.shell.options().enable_star_star_glob,
+        };
+        let keep = |path: &std::path::Path| {
+            let name = path.file_name().map(|name| name.to_string_lossy());
+            ignored.is_empty()
+                || (!matches!(name.as_deref(), Some("." | ".."))
+                    && !ignored.iter().any(|pattern| {
+                        pattern
+                            .exactly_matches(path.to_string_lossy().as_ref())
+                            .unwrap_or(false)
+                    }))
         };
 
         // On error (e.g. malformed pattern), default to NoGlob so the field
         // passes through as a literal rather than triggering failglob.
         let expansion = pattern
-            .expand(
-                self.shell.working_dir(),
-                Some(&patterns::Pattern::accept_all_expand_filter),
-                &options,
-            )
+            .expand(self.shell.working_dir(), Some(&keep), &options)
             .unwrap_or_default();
 
         if expansion.is_unmatched_glob()

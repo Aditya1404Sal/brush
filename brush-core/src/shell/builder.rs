@@ -271,6 +271,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             command_unit: None,
             alias_units: HashMap::new(),
             programs_started: 0,
+            local_option_saves: Vec::new(),
             parser_impl: crate::parser::ParserImpl::default(),
             key_bindings: None,
             history: None,

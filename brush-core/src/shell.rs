@@ -158,6 +158,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     programs_started: u64,
 
+    /// `set -o` options saved by `local -`, restored when the saving function returns.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) local_option_saves: Vec<Vec<(&'static str, bool)>>,
+
     /// Parser implementation to use.
     #[cfg_attr(feature = "serde", serde(skip))]
     parser_impl: crate::parser::ParserImpl,
@@ -221,6 +225,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             command_unit: self.command_unit,
             alias_units: self.alias_units.clone(),
             programs_started: self.programs_started,
+            local_option_saves: self.local_option_saves.clone(),
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
@@ -500,6 +505,36 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Restores the unit a program interrupted.
     pub(crate) const fn end_program(&mut self, previous: Option<(u64, usize)>) {
         self.command_unit = previous;
+    }
+
+    /// Saves the `set -o` options, as `local -` does, to restore when the function running now
+    /// returns.
+    pub fn save_options_locally(&mut self) {
+        let saved = crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
+            .iter()
+            .map(|option| (option.name, option.definition.get(&self.options)))
+            .collect();
+        self.local_option_saves.push(saved);
+    }
+
+    /// Restores the options the first `local -` since `mark` saved, and forgets the saves since.
+    pub(crate) fn restore_local_options(&mut self, mark: usize) {
+        if let Some(saved) = self.local_option_saves.get(mark).cloned() {
+            let options = crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO);
+            for (name, value) in saved {
+                if let Some(definition) = options.get(name) {
+                    definition.set(&mut self.options, value);
+                }
+            }
+        }
+        self.local_option_saves.truncate(mark);
+    }
+
+    /// Whether a trap handler is running.
+    pub fn running_trap_handler(&self) -> bool {
+        self.call_stack
+            .iter()
+            .any(|frame| frame.frame_type.is_trap_handler())
     }
 
     /// Sets the shell's name: `$0`, and the name its diagnostics start with, outside a script.

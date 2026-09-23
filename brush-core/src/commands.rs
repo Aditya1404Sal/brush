@@ -17,14 +17,14 @@ use crate::ExecutionExitCode;
 
 use crate::{
     ErrorKind, ExecutionControlFlow, ExecutionParameters, ExecutionResult, Shell, ShellFd,
-    builtins, commands, env, error, escape,
+    builtins, error, escape,
     extensions::{self, ShellExtensions},
     functions,
     interp::{self, Execute, ProcessGroupPolicy},
     openfiles::{self, OpenFile, OpenFiles},
     pathsearch, processes,
     results::ExecutionSpawnResult,
-    sys, trace_categories, traps, variables,
+    sys, trace_categories, traps,
 };
 
 /// Encapsulates the result of waiting for a command to complete.
@@ -261,31 +261,6 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
     cmd.inject_fds(other_files)?;
 
     Ok(cmd)
-}
-
-pub(crate) async fn on_preexecute(
-    cmd: &mut commands::SimpleCommand<'_, impl extensions::ShellExtensions>,
-) -> Result<(), error::Error> {
-    // Set BASH_COMMAND before invoking the DEBUG trap (and generally before
-    // executing commands).
-    let full_cmd = cmd.args.iter().map(|arg| arg.to_string()).join(" ");
-    cmd.shell.env_mut().update_or_add(
-        "BASH_COMMAND",
-        variables::ShellValueLiteral::Scalar(full_cmd),
-        |_| Ok(()),
-        env::EnvironmentLookup::Anywhere,
-        env::EnvironmentScope::Global,
-    )?;
-
-    // Fire the DEBUG trap if one is registered.
-    if cmd.shell.traps().handles(traps::TrapSignal::Debug) {
-        let _ = cmd
-            .shell
-            .invoke_trap_handler(traps::TrapSignal::Debug, &cmd.params)
-            .await?;
-    }
-
-    Ok(())
 }
 
 /// Represents a simple command to be executed.
@@ -954,6 +929,13 @@ pub(crate) async fn invoke_shell_function(
     // may still change the shell's persistent open files via builtins (e.g. `exec`).
     // `break` in a function body does not reach the caller's loops.
     let caller_loop_depth = std::mem::take(&mut context.shell.loop_depth);
+    let return_trap = context
+        .shell
+        .traps()
+        .get_handler(traps::TrapSignal::Return)
+        .map(|handler| handler.command.clone());
+    // `local -` in the body saves the options, which come back when it returns.
+    let option_saves = context.shell.local_option_saves.len();
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
@@ -968,6 +950,27 @@ pub(crate) async fn invoke_shell_function(
         result
     };
     context.shell.loop_depth = caller_loop_depth;
+    context.shell.restore_local_options(option_saves);
+
+    // The RETURN trap runs as the function returns when the function set it (or, with
+    // functrace, inherited it), as in bash.
+    let now = context
+        .shell
+        .traps()
+        .get_handler(traps::TrapSignal::Return)
+        .map(|handler| handler.command.clone());
+    if now.is_some()
+        && (now != return_trap
+            || context
+                .shell
+                .options()
+                .shell_functions_inherit_debug_and_return_traps)
+    {
+        let _ = context
+            .shell
+            .invoke_trap_handler(traps::TrapSignal::Return, &context.params)
+            .await;
+    }
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;

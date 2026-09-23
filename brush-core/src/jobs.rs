@@ -21,6 +21,9 @@ pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
 pub struct JobManager {
     /// The jobs that are currently managed by the shell.
     pub jobs: Vec<Job>,
+    /// Jobs `disown` took out of the table: they keep running, but `jobs` no longer lists them
+    /// and `wait` no longer waits for them.
+    disowned: Vec<Job>,
 }
 
 /// Represents a task that is part of a job.
@@ -163,6 +166,22 @@ impl JobManager {
         self.jobs
             .iter_mut()
             .find(|j| matches!(j.annotation, JobAnnotation::Previous))
+    }
+
+    /// Takes the job with this id out of the table, as `disown` does; returns whether there was
+    /// one.
+    pub fn disown(&mut self, id: usize) -> bool {
+        let Some(index) = self.jobs.iter().position(|job| job.id == id) else {
+            return false;
+        };
+        let job = self.jobs.remove(index);
+        if matches!(job.annotation, JobAnnotation::Current)
+            && let Some(previous) = self.prev_job_mut()
+        {
+            previous.annotation = JobAnnotation::Current;
+        }
+        self.disowned.push(job);
+        true
     }
 
     /// Tries to resolve the given job specification to a job.

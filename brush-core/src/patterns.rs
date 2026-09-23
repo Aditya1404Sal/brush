@@ -1,7 +1,10 @@
 //! Shell patterns
 
 use crate::{error, regex, sys, trace_categories};
-use std::{collections::VecDeque, path::Path};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
 /// Represents a piece of a shell pattern.
 #[derive(Clone, Debug)]
@@ -27,6 +30,8 @@ type PatternWord = Vec<PatternPiece>;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FilenameExpansionOptions {
     pub require_dot_in_pattern_to_match_dot_files: bool,
+    /// `globstar`: a `**` component matches any depth of directories.
+    pub globstar: bool,
 }
 
 /// Result of a pattern expansion, distinguishing "no glob metacharacters" from
@@ -256,7 +261,28 @@ impl Pattern {
             vec![working_dir.to_path_buf()]
         };
 
-        for component in components {
+        let component_count = components.len();
+        for (index, component) in components.into_iter().enumerate() {
+            if options.globstar
+                && matches!(component.as_slice(), [PatternPiece::Pattern(star)] if star == "**")
+            {
+                // Last, `**` names the directory and everything below it; before another
+                // component, the directory and every directory below it.
+                let last = index + 1 == component_count;
+                let allow_dot_files = !options.require_dot_in_pattern_to_match_dot_files;
+                for current_path in std::mem::take(&mut paths_so_far) {
+                    let mut found = vec![if last {
+                        PathBuf::from(std::format!("{}/", current_path.display()))
+                    } else {
+                        current_path.clone()
+                    }];
+                    walk_for_globstar(&current_path, !last, allow_dot_files, &mut found);
+                    found.sort();
+                    paths_so_far.append(&mut found);
+                }
+                continue;
+            }
+
             if !component.iter().any(|piece| {
                 matches!(piece, PatternPiece::Pattern(_))
                     && requires_expansion(piece.as_str(), self.enable_extended_globbing)
@@ -437,6 +463,31 @@ impl Pattern {
 /// Checks whether a string contains glob metacharacters that would trigger
 /// pathname expansion. Delegates to the pattern parser's grammar, which is
 /// the single source of truth for what constitutes a glob metacharacter.
+/// Everything below `dir` (directories only when `directories_only`), not following symbolic
+/// links and skipping dot files unless `allow_dot_files`, as bash's `globstar` walks.
+fn walk_for_globstar(
+    dir: &Path,
+    directories_only: bool,
+    allow_dot_files: bool,
+    found: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = dir.read_dir() else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if !allow_dot_files && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if is_dir || !directories_only {
+            found.push(entry.path());
+        }
+        if is_dir {
+            walk_for_globstar(&entry.path(), directories_only, allow_dot_files, found);
+        }
+    }
+}
+
 fn requires_expansion(s: &str, enable_extended_globbing: bool) -> bool {
     brush_parser::pattern::pattern_has_glob_metacharacters(s, enable_extended_globbing)
 }
