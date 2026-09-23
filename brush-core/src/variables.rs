@@ -1039,10 +1039,12 @@ fn get_key_for_indexed_array(
 ) -> Result<u64, error::Error> {
     let mut index_value = index_str.parse::<i64>().unwrap_or(0);
 
-    // Handle negative indices, but check for out-of-range values.
+    // A negative index counts back from one past the highest index, as in bash, so for a sparse
+    // array `-1` is the last element rather than the element count minus one.
     #[expect(clippy::cast_possible_wrap)]
     if index_value < 0 {
-        index_value += values.len() as i64;
+        let end = values.keys().next_back().map_or(0, |max| *max as i64 + 1);
+        index_value += end;
         if index_value < 0 {
             return Err(error::ErrorKind::ArrayIndexOutOfRange(index_str.to_owned()).into());
         }

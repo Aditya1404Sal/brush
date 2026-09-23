@@ -140,6 +140,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Last "SECONDS" offset requested.
     last_stopwatch_offset: u32,
 
+    /// How many loops enclose the command running now. `break` and `continue` outside any loop
+    /// are diagnosed rather than obeyed. A function body and a `( ... )` subshell start at 0; a
+    /// command substitution and `eval` see their caller's loops, as in bash.
+    pub(crate) loop_depth: usize,
+
     /// Parser implementation to use.
     #[cfg_attr(feature = "serde", serde(skip))]
     parser_impl: crate::parser::ParserImpl,
@@ -199,6 +204,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             program_location_cache: self.program_location_cache.clone(),
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
+            loop_depth: self.loop_depth,
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
@@ -439,6 +445,34 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
     pub(crate) const fn last_exit_status_change_count(&self) -> usize {
         self.last_exit_status_change_count
+    }
+
+    /// Empties the call stack, for a copy of this shell that stands for a newly started shell
+    /// process (whose line numbers and function names start afresh).
+    pub fn reset_call_stack(&mut self) {
+        self.call_stack = crate::callstack::CallStack::new();
+    }
+
+    /// How many loops enclose the command running now (see the field's documentation).
+    pub const fn loop_depth(&self) -> usize {
+        self.loop_depth
+    }
+
+    /// The prefix bash puts on a diagnostic: `NAME: line N: ` in a script or command string,
+    /// `NAME: ` in an interactive shell, where NAME is `$0`.
+    pub fn diagnostic_prefix(&self) -> String {
+        let name = self
+            .current_shell_name()
+            .map_or_else(|| "bash".to_owned(), |n| n.to_string());
+        if self.options.interactive {
+            return format!("{name}: ");
+        }
+        let line = self
+            .call_stack
+            .current_frame()
+            .and_then(|frame| frame.current_line())
+            .unwrap_or(1);
+        format!("{name}: line {line}: ")
     }
 }
 

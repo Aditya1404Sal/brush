@@ -206,7 +206,7 @@ impl DeclareCommand {
                 // For some reason, bash does not print an error message in this case.
                 Ok(false)
             }
-        } else if let Some(variable) = context.shell.env().get_using_policy(name, lookup) {
+        } else if let Some(variable) = context.shell.env().get_using_policy_raw(name, lookup) {
             let mut cs = variable.attribute_flags(context.shell);
             if cs.is_empty() {
                 cs.push('-');
@@ -283,6 +283,7 @@ impl DeclareCommand {
         // Extract the variable name and the initial value being assigned (if any).
         let (name, assigned_index, initial_value, name_is_array, append) =
             Self::declaration_to_name_and_value(declaration)?;
+        let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -`
         if name == "-" && matches!(verb, DeclareVerb::Local) {
@@ -345,11 +346,7 @@ impl DeclareCommand {
         }
 
         // Look up the variable.
-        if let Some(var) = context
-            .shell
-            .env_mut()
-            .get_mut_using_policy(name.as_str(), lookup)
-        {
+        if let Some(var) = self.existing_variable(context.shell, name.as_str(), lookup) {
             if self.make_associative_array.is_some() {
                 var.convert_to_associative_array()?;
             }
@@ -401,6 +398,46 @@ impl DeclareCommand {
         }
 
         Ok(true)
+    }
+
+    /// The variable a declaration updates. `-n` and `+n` change a nameref itself, not the
+    /// variable it names.
+    fn existing_variable<'a>(
+        &self,
+        shell: &'a mut brush_core::Shell<impl brush_core::ShellExtensions>,
+        name: &str,
+        lookup: EnvironmentLookup,
+    ) -> Option<&'a mut ShellVariable> {
+        if self.make_nameref.to_bool().is_some() {
+            shell.env_mut().get_mut_using_policy_raw(name, lookup)
+        } else {
+            shell.env_mut().get_mut_using_policy(name, lookup)
+        }
+    }
+
+    /// A value assigned to an integer variable (already one, or made one by this declaration)
+    /// is evaluated arithmetically, as in bash.
+    fn evaluate_if_integer(
+        &self,
+        context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+        name: &str,
+        value: Option<ShellValueLiteral>,
+    ) -> Result<Option<ShellValueLiteral>, brush_core::Error> {
+        let becomes_integer = match self.make_integer.to_bool() {
+            Some(integer) => integer,
+            None => context
+                .shell
+                .env()
+                .get(name)
+                .is_some_and(|(_, var)| var.is_treated_as_integer()),
+        };
+        match value {
+            Some(value) if becomes_integer => Ok(Some(
+                brush_core::arithmetic::eval_integer_literal(context.shell, value)
+                    .map_err(brush_core::Error::from)?,
+            )),
+            value => Ok(value),
+        }
     }
 
     #[expect(clippy::type_complexity)]

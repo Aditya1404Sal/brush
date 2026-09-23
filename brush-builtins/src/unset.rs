@@ -43,11 +43,12 @@ impl builtins::Command for UnsetCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        //
-        // TODO(nameref): implement nameref
-        //
+        // `unset -n` unsets a nameref itself; plain `unset` unsets the variable it names.
         if self.name_interpretation.name_references {
-            return brush_core::error::unimp("unset: name references are not yet implemented");
+            for name in &self.names {
+                context.shell.env_mut().unset_raw(name)?;
+            }
+            return Ok(ExecutionResult::success());
         }
 
         let unspecified = self.name_interpretation.unspecified();

@@ -233,14 +233,55 @@ impl ShellEnvironment {
     ///
     /// * `name` - The name of the variable to retrieve.
     pub fn get<S: AsRef<str>>(&self, name: S) -> Option<(EnvironmentScope, &ShellVariable)> {
+        let name = self.resolve_nameref(name.as_ref());
+        self.get_raw(name.as_ref())
+    }
+
+    /// Like [`Self::get`], but a nameref is returned itself rather than the variable it names.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the variable to retrieve.
+    pub fn get_raw(&self, name: &str) -> Option<(EnvironmentScope, &ShellVariable)> {
         // Look through scopes, from the top of the stack on down.
         for (scope_type, map) in self.scopes.iter().rev() {
-            if let Some(var) = map.get(name.as_ref()) {
+            if let Some(var) = map.get(name) {
                 return Some((*scope_type, var));
             }
         }
 
         None
+    }
+
+    /// The name a nameref ultimately refers to (`declare -n`), or `name` itself when it is not
+    /// a nameref. Chains are followed a bounded number of times, so a cycle ends rather than
+    /// loops.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to resolve.
+    pub fn resolve_nameref<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        const MAX_NAMEREF_HOPS: usize = 8;
+        let mut resolved = Cow::Borrowed(name);
+        for hop in 0..=MAX_NAMEREF_HOPS {
+            // A chain this long is a cycle (`declare -n a=b b=a`): bash expands it as unset.
+            if hop == MAX_NAMEREF_HOPS {
+                return Cow::Borrowed("");
+            }
+            let next = match self.get_raw(resolved.as_ref()) {
+                Some((_, var)) if var.is_treated_as_nameref() => match var.value() {
+                    ShellValue::String(target)
+                        if !target.is_empty() && target != resolved.as_ref() =>
+                    {
+                        target.clone()
+                    }
+                    _ => break,
+                },
+                _ => break,
+            };
+            resolved = Cow::Owned(next);
+        }
+        resolved
     }
 
     /// Tries to retrieve a mutable reference to the variable with the given name
@@ -253,9 +294,10 @@ impl ShellEnvironment {
         &mut self,
         name: S,
     ) -> Option<(EnvironmentScope, &mut ShellVariable)> {
+        let name = self.resolve_nameref(name.as_ref()).into_owned();
         // Look through scopes, from the top of the stack on down.
         for (scope_type, map) in self.scopes.iter_mut().rev() {
-            if let Some(var) = map.get_mut(name.as_ref()) {
+            if let Some(var) = map.get_mut(name.as_str()) {
                 return Some((*scope_type, var));
             }
         }
@@ -303,6 +345,17 @@ impl ShellEnvironment {
     ///
     /// * `name` - The name of the variable to unset.
     pub fn unset(&mut self, name: &str) -> Result<Option<ShellVariable>, error::Error> {
+        let name = self.resolve_nameref(name).into_owned();
+        self.unset_raw(name.as_str())
+    }
+
+    /// Like [`Self::unset`], but unsets a nameref itself (`unset -n`) rather than the variable it
+    /// names.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the variable to unset.
+    pub fn unset_raw(&mut self, name: &str) -> Result<Option<ShellVariable>, error::Error> {
         let mut local_count = 0;
         for (scope_type, map) in self.scopes.iter_mut().rev() {
             if matches!(scope_type, EnvironmentScope::Local) {
@@ -369,6 +422,22 @@ impl ShellEnvironment {
         name: N,
         lookup_policy: EnvironmentLookup,
     ) -> Option<&ShellVariable> {
+        let name = self.resolve_nameref(name.as_ref());
+        self.get_using_policy_raw(name.as_ref(), lookup_policy)
+    }
+
+    /// Like [`Self::get_using_policy`], but a nameref is returned itself rather than the variable
+    /// it names (for `declare -p`, which shows the nameref).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the variable to retrieve.
+    /// * `lookup_policy` - The policy to use when looking up the variable.
+    pub fn get_using_policy_raw(
+        &self,
+        name: &str,
+        lookup_policy: EnvironmentLookup,
+    ) -> Option<&ShellVariable> {
         let mut local_count = 0;
         for (scope_type, var_map) in self.scopes.iter().rev() {
             if matches!(scope_type, EnvironmentScope::Local) {
@@ -394,7 +463,7 @@ impl ShellEnvironment {
                 }
             }
 
-            if let Some(var) = var_map.get(name.as_ref()) {
+            if let Some(var) = var_map.get(name) {
                 return Some(var);
             }
 
@@ -416,6 +485,22 @@ impl ShellEnvironment {
     /// * `name` - The name of the variable to retrieve.
     /// * `lookup_policy` - The policy to use when looking up the variable.
     pub fn get_mut_using_policy<N: AsRef<str>>(
+        &mut self,
+        name: N,
+        lookup_policy: EnvironmentLookup,
+    ) -> Option<&mut ShellVariable> {
+        let name = self.resolve_nameref(name.as_ref()).into_owned();
+        self.get_mut_using_policy_raw(name, lookup_policy)
+    }
+
+    /// Like [`Self::get_mut_using_policy`], but a nameref is returned itself rather than the
+    /// variable it names (for `declare -n` and `declare +n`, which change the nameref).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the variable to retrieve.
+    /// * `lookup_policy` - The policy to use when looking up the variable.
+    pub fn get_mut_using_policy_raw<N: AsRef<str>>(
         &mut self,
         name: N,
         lookup_policy: EnvironmentLookup,
@@ -476,7 +561,8 @@ impl ShellEnvironment {
         lookup_policy: EnvironmentLookup,
         scope_if_creating: EnvironmentScope,
     ) -> Result<(), error::Error> {
-        let name = name.into();
+        // Assigning through a nameref assigns to (and if need be creates) the variable it names.
+        let name = self.resolve_nameref(&name.into()).into_owned();
 
         let auto_export = self.export_variables_on_modification;
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
@@ -516,7 +602,7 @@ impl ShellEnvironment {
         lookup_policy: EnvironmentLookup,
         scope_if_creating: EnvironmentScope,
     ) -> Result<(), error::Error> {
-        let name = name.into();
+        let name = self.resolve_nameref(&name.into()).into_owned();
 
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
             var.assign_at_index(index, value, false)?;

@@ -113,6 +113,46 @@ pub(crate) async fn expand_and_eval(
     expr.eval(shell)
 }
 
+/// Evaluates a value assigned to an integer (`declare -i`) variable, as bash does: the already
+/// expanded text is an arithmetic expression, and an empty value is 0.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to use for evaluation.
+/// * `value` - The expanded value being assigned.
+pub fn eval_integer_assignment(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    value: &str,
+) -> Result<i64, EvalError> {
+    if value.trim().is_empty() {
+        return Ok(0);
+    }
+    let expr = brush_parser::arithmetic::parse(value)
+        .map_err(|_e| EvalError::ParseError(value.to_owned()))?;
+    expr.eval(shell)
+}
+
+/// Evaluates every value in an assignment to an integer variable (see
+/// [`eval_integer_assignment`]).
+pub fn eval_integer_literal(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    literal: crate::variables::ShellValueLiteral,
+) -> Result<crate::variables::ShellValueLiteral, EvalError> {
+    use crate::variables::{ArrayLiteral, ShellValueLiteral};
+    Ok(match literal {
+        ShellValueLiteral::Scalar(value) => {
+            ShellValueLiteral::Scalar(eval_integer_assignment(shell, &value)?.to_string())
+        }
+        ShellValueLiteral::Array(ArrayLiteral(elements)) => {
+            let mut evaluated = Vec::with_capacity(elements.len());
+            for (key, value) in elements {
+                evaluated.push((key, eval_integer_assignment(shell, &value)?.to_string()));
+            }
+            ShellValueLiteral::Array(ArrayLiteral(evaluated))
+        }
+    })
+}
+
 /// Trait implemented by evaluatable arithmetic expressions.
 pub trait Evaluatable {
     /// Evaluate the given arithmetic expression, returning the resulting numeric value.

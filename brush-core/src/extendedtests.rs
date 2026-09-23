@@ -65,7 +65,33 @@ async fn apply_unary_predicate(
             .await;
     }
 
-    apply_unary_predicate_to_str(op, expanded_operand.as_str(), shell, params)
+    // `-v NAME[SUBSCRIPT]`: an indexed array's subscript is arithmetic, evaluated here where the
+    // shell can be changed; the check below then sees a plain number.
+    let operand = if matches!(op, ast::UnaryPredicate::ShellVariableIsSetAndAssigned) {
+        evaluate_subscript(shell, params, expanded_operand).await?
+    } else {
+        expanded_operand
+    };
+
+    apply_unary_predicate_to_str(op, operand.as_str(), shell, params)
+}
+
+async fn evaluate_subscript(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    operand: String,
+) -> Result<String, error::Error> {
+    let Some((name, index)) = operand.strip_suffix(']').and_then(|r| r.split_once('[')) else {
+        return Ok(operand);
+    };
+    let indexed = shell.env().get(name).is_some_and(|(_, var)| {
+        !matches!(var.value(), crate::ShellValue::AssociativeArray(_))
+    });
+    if !indexed || index == "@" || index == "*" || index.parse::<i64>().is_ok() {
+        return Ok(operand);
+    }
+    let index = arithmetic::expand_and_eval(shell, params, index, false).await?;
+    Ok(format!("{name}[{index}]"))
 }
 
 #[expect(clippy::too_many_lines)]
@@ -185,11 +211,27 @@ pub(crate) fn apply_unary_predicate_to_str(
                 Ok(false)
             }
         }
-        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(shell.env().is_set(operand)),
-        ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get(operand) {
+        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(variable_is_set(shell, operand)),
+        ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get_raw(operand) {
             Some((_, reffed)) => Ok(reffed.value().is_set() && reffed.is_treated_as_nameref()),
             None => Ok(false),
         },
+    }
+}
+
+/// `-v NAME` or `-v NAME[SUBSCRIPT]`: whether the variable, or that element of it, is set. An
+/// indexed array's subscript must already be evaluated to a number; an associative array's is a
+/// key; `@` and `*` ask whether the array has any element.
+fn variable_is_set(shell: &Shell<impl extensions::ShellExtensions>, operand: &str) -> bool {
+    let Some((name, index)) = operand.strip_suffix(']').and_then(|r| r.split_once('[')) else {
+        return shell.env().is_set(operand);
+    };
+    match shell.env().get(name) {
+        None => false,
+        Some((_, var)) if index == "@" || index == "*" => {
+            !var.value().element_values(shell).is_empty()
+        }
+        Some((_, var)) => var.value().get_at(index, shell).is_ok_and(|v| v.is_some()),
     }
 }
 

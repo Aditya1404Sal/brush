@@ -945,6 +945,8 @@ pub(crate) async fn invoke_shell_function(
     // so the parameters are passed through by shared reference rather than cloned. This prevents
     // direct mutation of the caller's `ExecutionParameters` open-file table, though the function
     // may still change the shell's persistent open files via builtins (e.g. `exec`).
+    // `break` in a function body does not reach the caller's loops.
+    let caller_loop_depth = std::mem::take(&mut context.shell.loop_depth);
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
@@ -958,6 +960,7 @@ pub(crate) async fn invoke_shell_function(
         context.shell.leave_function()?;
         result
     };
+    context.shell.loop_depth = caller_loop_depth;
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;

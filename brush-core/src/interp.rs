@@ -931,6 +931,8 @@ impl Execute for ast::CompoundCommand {
                 subshell.traps_mut().reset_pipe_for_subshell();
                 // The subshell runs only an EXIT trap it sets itself, when its body ends.
                 subshell.traps_mut().reset_exit_for_subshell();
+                // `break` in a `( ... )` does not reach the loops around it.
+                subshell.loop_depth = 0;
                 #[cfg(target_arch = "wasm32")]
                 let disposition = subshell.traps().pipe_disposition();
                 let body = async {
@@ -1115,7 +1117,10 @@ impl Execute for ast::ForClauseCommand {
                 EnvironmentScope::Global,
             )?;
 
-            result = self.body.list.execute(shell, params).await?;
+            shell.loop_depth += 1;
+            let body_result = self.body.list.execute(shell, params).await;
+            shell.loop_depth -= 1;
+            result = body_result?;
             if result.is_return_or_exit() {
                 break;
             }
@@ -1278,7 +1283,10 @@ impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
         condition_params.suppress_errexit = true;
 
         loop {
-            let condition_result = test_condition.execute(shell, &condition_params).await?;
+            shell.loop_depth += 1;
+            let condition_result = test_condition.execute(shell, &condition_params).await;
+            shell.loop_depth -= 1;
+            let condition_result = condition_result?;
 
             // Update status for condition
             shell.set_last_exit_status(condition_result.exit_code.into());
@@ -1296,7 +1304,10 @@ impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
                 break;
             }
 
-            result = body.list.execute(shell, params).await?;
+            shell.loop_depth += 1;
+            let body_result = body.list.execute(shell, params).await;
+            shell.loop_depth -= 1;
+            result = body_result?;
             if result.is_return_or_exit() {
                 break;
             }
@@ -1357,7 +1368,10 @@ impl Execute for ast::ArithmeticForClauseCommand {
                 }
             }
 
-            result = self.body.list.execute(shell, params).await?;
+            shell.loop_depth += 1;
+            let body_result = self.body.list.execute(shell, params).await;
+            shell.loop_depth -= 1;
+            result = body_result?;
             if result.is_return_or_exit() {
                 break;
             }
@@ -1811,6 +1825,12 @@ async fn apply_assignment(
             name
         }
     };
+    // Assigning through a nameref assigns to the variable it names.
+    let resolved_name = shell
+        .env()
+        .resolve_nameref(variable_name.as_str())
+        .into_owned();
+    let variable_name = &resolved_name;
 
     // Expand the values.
     let new_value = match &assignment.value {
@@ -1850,6 +1870,17 @@ async fn apply_assignment(
             }
             ShellValueLiteral::Array(ArrayLiteral(elements))
         }
+    };
+
+    // Assigning to an integer variable evaluates the value arithmetically.
+    let new_value = if shell
+        .env()
+        .get(variable_name)
+        .is_some_and(|(_, existing)| existing.is_treated_as_integer())
+    {
+        arithmetic::eval_integer_literal(shell, new_value)?
+    } else {
+        new_value
     };
 
     if shell.options().print_commands_and_arguments {
