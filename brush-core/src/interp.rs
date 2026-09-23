@@ -33,6 +33,10 @@ struct PipelineExecutionContext<'a, SE: extensions::ShellExtensions> {
 pub struct ExecutionParameters {
     /// The open files tracked by the current context.
     open_files: openfiles::OpenFiles,
+    /// Output process substitutions (`>(list)`) set up for the command these parameters are
+    /// for, waiting for it to finish (see `run_pending_output_substitutions`).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) output_substitutions: PendingOutputSubstitutions,
     /// Policy for how to manage spawned external processes.
     pub process_group_policy: ProcessGroupPolicy,
     /// Whether `errexit` (exit on error) behavior should be
@@ -883,6 +887,10 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
         match self {
             Self::Simple(simple) => simple.execute_in_pipeline(pipeline_context, params).await,
             Self::Compound(compound, redirects) => {
+                // `>(list)` substitutions in these redirects run once the command has finished.
+                #[cfg(target_arch = "wasm32")]
+                let pending = params.own_output_substitutions();
+
                 // Set up any additional redirects.
                 if let Some(redirects) = redirects {
                     for redirect in &redirects.0 {
@@ -890,10 +898,10 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                     }
                 }
 
-                Ok(compound
-                    .execute(&mut pipeline_context.shell, &params)
-                    .await?
-                    .into())
+                let result = compound.execute(&mut pipeline_context.shell, &params).await;
+                #[cfg(target_arch = "wasm32")]
+                run_pending_output_substitutions(&pipeline_context.shell, &pending).await;
+                Ok(result?.into())
             }
             Self::Function(func) => Ok(func
                 .execute(&mut pipeline_context.shell, &params)
@@ -1605,6 +1613,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             .as_ref()
             .map(|won| CommandPrefixOrSuffixItem::Word(won.clone()));
 
+        // `>(list)` substitutions among the arguments and redirects run once the command has
+        // finished.
+        #[cfg(target_arch = "wasm32")]
+        let pending = params.own_output_substitutions();
+
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
@@ -1625,12 +1638,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     }
                 }
                 CommandPrefixOrSuffixItem::ProcessSubstitution(kind, subshell_command) => {
-                    let (installed_fd_num, substitution_file) = setup_process_substitution(
-                        &context.shell,
-                        &params,
-                        kind,
-                        subshell_command,
-                    )?;
+                    let (installed_fd_num, substitution_file) =
+                        setup_process_substitution(&context.shell, &params, kind, subshell_command)
+                            .await?;
 
                     params
                         .open_files
@@ -1743,7 +1753,18 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 process_group_id: context.process_group_id,
             };
 
-            match execute_command(context, params, cmd_name, &assignments, &args).await {
+            let result = execute_command(context, params, cmd_name, &assignments, &args).await;
+            #[cfg(target_arch = "wasm32")]
+            let result = match result {
+                Ok(spawned) if !pending.is_empty() => {
+                    // The command must finish writing before the substitutions read it.
+                    let completed = ExecutionResult::from(spawned.wait().await?);
+                    run_pending_output_substitutions(parent_shell, &pending).await;
+                    Ok(completed.into())
+                }
+                other => other,
+            };
+            match result {
                 Ok(result) => Ok(result),
                 Err(err) => {
                     let _ = parent_shell.display_error(&mut stderr, &err);
@@ -2387,7 +2408,8 @@ pub(crate) async fn setup_redirect(
                                 params,
                                 substitution_kind,
                                 subshell_cmd,
-                            )?;
+                            )
+                            .await?;
 
                             let target_file = substitution_file.clone();
                             params.open_files.set_fd(substitution_fd, substitution_file);
@@ -2489,7 +2511,11 @@ const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> She
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn setup_process_substitution(
+#[expect(
+    clippy::unused_async,
+    reason = "shares its signature with the wasm version, which runs the substitution"
+)]
+async fn setup_process_substitution(
     shell: &Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
     kind: &ast::ProcessSubstitutionKind,
@@ -2543,13 +2569,141 @@ fn setup_process_substitution(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn setup_process_substitution(
-    _shell: &Shell<impl extensions::ShellExtensions>,
-    _params: &ExecutionParameters,
-    _kind: &ast::ProcessSubstitutionKind,
-    _subshell_cmd: &ast::SubshellCommand,
+async fn setup_process_substitution(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    kind: &ast::ProcessSubstitutionKind,
+    subshell_cmd: &ast::SubshellCommand,
 ) -> Result<(ShellFd, OpenFile), error::Error> {
-    error::unimp("process substitution on WASM")
+    // WASI has no pipes between processes, so a substitution is buffered: `<(list)` runs to
+    // completion first and the command reads what it wrote; `>(list)` keeps what the command
+    // writes and runs, with that as its input, once the command has finished.
+    let mut child_params = params.clone();
+    child_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+    let target_file = match kind {
+        ast::ProcessSubstitutionKind::Read => {
+            let (sink, output) = openfiles::memory_sink();
+            child_params.open_files.set_fd(OpenFiles::STDOUT_FD, sink);
+            run_substitution_list(shell, &subshell_cmd.list, &child_params).await;
+            let bytes = std::mem::take(
+                &mut *output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            openfiles::from_bytes(bytes)
+        }
+        ast::ProcessSubstitutionKind::Write => {
+            let (sink, input) = openfiles::memory_sink();
+            params.output_substitutions.push(PendingOutputSubstitution {
+                list: subshell_cmd.list.clone(),
+                params: child_params,
+                input,
+            });
+            sink
+        }
+    };
+
+    // As bash does, count down from 63 for a free descriptor.
+    let fd = (1..=63)
+        .rev()
+        .find(|fd| !params.open_files.contains_fd(*fd))
+        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
+    Ok((fd, target_file))
+}
+
+/// An output process substitution waiting for the command that writes to it to finish.
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct PendingOutputSubstitution {
+    list: ast::CompoundList,
+    params: ExecutionParameters,
+    input: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+/// The output substitutions one command has set up, shared by the clones of its parameters.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Default)]
+pub(crate) struct PendingOutputSubstitutions(
+    std::sync::Arc<std::sync::Mutex<Vec<PendingOutputSubstitution>>>,
+);
+
+#[cfg(target_arch = "wasm32")]
+impl PendingOutputSubstitutions {
+    fn push(&self, substitution: PendingOutputSubstitution) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(substitution);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    fn take(&self) -> Vec<PendingOutputSubstitution> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ExecutionParameters {
+    /// Gives these parameters a list of their own for `>(list)` substitutions, so the command
+    /// they are for runs only its own, and returns it.
+    fn own_output_substitutions(&mut self) -> PendingOutputSubstitutions {
+        self.output_substitutions = PendingOutputSubstitutions::default();
+        self.output_substitutions.clone()
+    }
+}
+
+/// Runs the pending output substitutions, in order, each with what was written to it as its
+/// input.
+#[cfg(target_arch = "wasm32")]
+async fn run_pending_output_substitutions(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    pending: &PendingOutputSubstitutions,
+) {
+    for substitution in pending.take() {
+        let input = std::mem::take(
+            &mut *substitution
+                .input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut params = substitution.params;
+        params
+            .open_files
+            .set_fd(OpenFiles::STDIN_FD, openfiles::from_bytes(input));
+        run_substitution_list(shell, &substitution.list, &params).await;
+    }
+}
+
+/// Runs a process substitution's list as a `( list )` subshell runs, reporting its errors.
+#[cfg(target_arch = "wasm32")]
+async fn run_substitution_list(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    list: &ast::CompoundList,
+    params: &ExecutionParameters,
+) {
+    let mut subshell = shell.clone();
+    subshell.traps_mut().reset_pipe_for_subshell();
+    subshell.traps_mut().reset_exit_for_subshell();
+    subshell.loop_depth = 0;
+    let disposition = subshell.traps().pipe_disposition();
+    let body = async {
+        let result = list.execute(&mut subshell, params).await;
+        subshell.exit_with_trap(result).await
+    };
+    if let Err(error) = crate::execution::process::run_process(disposition, body).await {
+        let mut stderr = params.stderr(shell);
+        let _ = shell.display_error(&mut stderr, &error);
+    }
 }
 
 fn spawn_command_task(
