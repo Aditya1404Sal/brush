@@ -145,6 +145,19 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// command substitution and `eval` see their caller's loops, as in bash.
     pub(crate) loop_depth: usize,
 
+    /// The top-level command running now, as (program, index): an alias defined while it runs
+    /// is not expanded until a later one, as bash reads a whole command before running any of it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    command_unit: Option<(u64, usize)>,
+
+    /// The top-level command each alias was defined in (see `command_unit`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    alias_units: HashMap<String, (u64, usize)>,
+
+    /// How many programs this shell has begun running; numbers `command_unit`s.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    programs_started: u64,
+
     /// Parser implementation to use.
     #[cfg_attr(feature = "serde", serde(skip))]
     parser_impl: crate::parser::ParserImpl,
@@ -205,6 +218,9 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
             loop_depth: self.loop_depth,
+            command_unit: self.command_unit,
+            alias_units: self.alias_units.clone(),
+            programs_started: self.programs_started,
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
@@ -452,6 +468,43 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// How many loops enclose the command running now (see the field's documentation).
     pub const fn loop_depth(&self) -> usize {
         self.loop_depth
+    }
+
+    /// Defines an alias as the `alias` builtin does: it is not expanded until the next top-level
+    /// command, since bash has already read the rest of the current one.
+    pub fn define_alias(&mut self, name: String, value: String) {
+        match self.command_unit {
+            Some(unit) => self.alias_units.insert(name.clone(), unit),
+            None => self.alias_units.remove(&name),
+        };
+        self.aliases.insert(name, value);
+    }
+
+    /// Whether the alias `name` may be expanded in the command running now.
+    pub(crate) fn alias_in_effect(&self, name: &str) -> bool {
+        self.command_unit.is_none() || self.alias_units.get(name) != self.command_unit.as_ref()
+    }
+
+    /// Marks the start of a program's top-level commands; returns its number and the unit it
+    /// interrupts, to restore with [`Self::end_program`].
+    pub(crate) const fn begin_program(&mut self) -> (u64, Option<(u64, usize)>) {
+        self.programs_started += 1;
+        (self.programs_started, self.command_unit)
+    }
+
+    /// Marks the start of top-level command `index` of program `program`.
+    pub(crate) const fn begin_command_unit(&mut self, program: u64, index: usize) {
+        self.command_unit = Some((program, index));
+    }
+
+    /// Restores the unit a program interrupted.
+    pub(crate) const fn end_program(&mut self, previous: Option<(u64, usize)>) {
+        self.command_unit = previous;
+    }
+
+    /// Sets the shell's name: `$0`, and the name its diagnostics start with, outside a script.
+    pub fn set_shell_name(&mut self, name: impl Into<String>) {
+        self.name = Some(name.into());
     }
 
     /// Sets `POSIXLY_CORRECT=y` while posix mode is on and unsets it when it goes off, as bash

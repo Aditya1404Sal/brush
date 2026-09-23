@@ -217,8 +217,10 @@ impl Execute for ast::Program {
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
+        let (program, interrupted) = shell.begin_program();
 
-        for command in &self.complete_commands {
+        for (index, command) in self.complete_commands.iter().enumerate() {
+            shell.begin_command_unit(program, index);
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -240,6 +242,7 @@ impl Execute for ast::Program {
             }
         }
 
+        shell.end_program(interrupted);
         Ok(result)
     }
 }
@@ -1690,6 +1693,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                             // Aliases are only expanded when `expand_aliases` is enabled; it's
                             // enabled by default for interactive shells.
                             if context.shell.options().expand_aliases
+                                && context.shell.alias_in_effect(cmd_name)
                                 && let Some(alias_value) =
                                     context.shell.aliases().get(cmd_name.as_str())
                             {

@@ -38,8 +38,7 @@ impl builtins::Command for AliasCommand {
                 {
                     context
                         .shell
-                        .aliases_mut()
-                        .insert(name.to_owned(), unexpanded_value.to_owned());
+                        .define_alias(name.to_owned(), unexpanded_value.to_owned());
                 } else if let Some(value) = context.shell.aliases().get(alias) {
                     write_alias_definition(context.stdout(), alias, value)?;
                 } else {
