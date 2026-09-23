@@ -4,6 +4,7 @@ use brush_core::{ExecutionResult, builtins};
 
 /// Remove jobs from the job table.
 #[derive(Parser)]
+#[clap(disable_help_flag = true)]
 pub(crate) struct DisownCommand {
     /// Keep the jobs in the table, only sparing them SIGHUP (which this shell never sends).
     #[arg(short = 'h')]
