@@ -16,6 +16,10 @@ pub struct Error {
     /// Whether or not the error should be considered a "fatal" error that would
     /// result in abnormal exit of a non-interactive shell.
     fatal: bool,
+
+    /// Whether the error was already shown where it happened, so that whatever handles it
+    /// later does not show it again.
+    reported: bool,
 }
 
 /// Monolithic error type for the shell
@@ -423,6 +427,7 @@ where
         Self {
             kind: convertible_to_kind.into(),
             fatal: false,
+            reported: false,
         }
     }
 }
@@ -433,6 +438,25 @@ impl Error {
     pub const fn into_fatal(mut self) -> Self {
         self.fatal = true;
         self
+    }
+
+    /// Marks the error as already shown where it happened.
+    #[must_use]
+    pub const fn into_reported(mut self) -> Self {
+        self.reported = true;
+        self
+    }
+
+    /// Whether the error was already shown where it happened.
+    pub const fn is_reported(&self) -> bool {
+        self.reported
+    }
+
+    /// Whether the error abandons the rest of the top-level command, as assigning to a
+    /// readonly variable does in bash: it passes through function calls rather than becoming
+    /// the call's status.
+    pub const fn abandons_command(&self) -> bool {
+        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_))
     }
 
     /// The reason a path could not be used, as the system words it ("No such file or

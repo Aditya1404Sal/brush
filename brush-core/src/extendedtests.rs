@@ -105,6 +105,29 @@ pub(crate) fn apply_unary_predicate_to_str(
     match op {
         ast::UnaryPredicate::StringHasNonZeroLength => Ok(!operand.is_empty()),
         ast::UnaryPredicate::StringHasZeroLength => Ok(operand.is_empty()),
+        // An empty path names no file, not the working directory it would resolve to.
+        ast::UnaryPredicate::FileExists
+        | ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsCharSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsDir
+        | ast::UnaryPredicate::FileExistsAndIsRegularFile
+        | ast::UnaryPredicate::FileExistsAndIsSetgid
+        | ast::UnaryPredicate::FileExistsAndIsSymlink
+        | ast::UnaryPredicate::FileExistsAndHasStickyBit
+        | ast::UnaryPredicate::FileExistsAndIsFifo
+        | ast::UnaryPredicate::FileExistsAndIsReadable
+        | ast::UnaryPredicate::FileExistsAndIsNotZeroLength
+        | ast::UnaryPredicate::FileExistsAndIsSetuid
+        | ast::UnaryPredicate::FileExistsAndIsWritable
+        | ast::UnaryPredicate::FileExistsAndIsExecutable
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId
+        | ast::UnaryPredicate::FileExistsAndModifiedSinceLastRead
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveUserId
+        | ast::UnaryPredicate::FileExistsAndIsSocket
+            if operand.is_empty() =>
+        {
+            Ok(false)
+        }
         ast::UnaryPredicate::FileExists => {
             let path = shell.absolute_path(Path::new(operand));
             Ok(path.exists())

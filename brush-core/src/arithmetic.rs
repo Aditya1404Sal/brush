@@ -246,6 +246,24 @@ fn get_var_value<'a>(
     shell: &'a Shell<impl extensions::ShellExtensions>,
     name: &str,
 ) -> Result<Cow<'a, str>, EvalError> {
+    // A nameref to an array element (`declare -n ref='arr[1]'`) reads that element.
+    let target = shell.env().resolve_nameref(name);
+    if let Some((base, index)) = target
+        .strip_suffix(']')
+        .and_then(|target| target.split_once('['))
+    {
+        let element = shell.env().get(base).and_then(|(_, var)| {
+            var.value()
+                .get_at(index, shell)
+                .ok()
+                .flatten()
+                .map(|value| value.to_string())
+        });
+        if let Some(element) = element {
+            return Ok(element.into());
+        }
+    }
+
     let value = shell.env_var(name).map(|var| var.resolve_value(shell));
 
     if let Some(value) = value

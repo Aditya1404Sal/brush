@@ -1120,14 +1120,28 @@ impl Execute for ast::ForClauseCommand {
                 }
             }
 
-            // Update the variable.
-            shell.env_mut().update_or_add(
-                &self.variable_name,
-                ShellValueLiteral::Scalar(value),
-                |_| Ok(()),
-                EnvironmentLookup::Anywhere,
-                EnvironmentScope::Global,
-            )?;
+            // Update the variable. A nameref control variable is pointed at each word in turn
+            // rather than assigned through, as bash does.
+            let nameref = shell
+                .env()
+                .get_raw(&self.variable_name)
+                .is_some_and(|(_, var)| var.is_treated_as_nameref());
+            if nameref {
+                if let Some(var) = shell
+                    .env_mut()
+                    .get_mut_using_policy_raw(&self.variable_name, EnvironmentLookup::Anywhere)
+                {
+                    var.assign(ShellValueLiteral::Scalar(value), false)?;
+                }
+            } else {
+                shell.env_mut().update_or_add(
+                    &self.variable_name,
+                    ShellValueLiteral::Scalar(value),
+                    |_| Ok(()),
+                    EnvironmentLookup::Anywhere,
+                    EnvironmentScope::Global,
+                )?;
+            }
 
             shell.loop_depth += 1;
             let body_result = self.body.list.execute(shell, params).await;
@@ -1791,6 +1805,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             };
             match result {
                 Ok(result) => Ok(result),
+                Err(err) if err.abandons_command() => Err(err),
                 Err(err) => {
                     let _ = parent_shell.display_error(&mut stderr, &err);
 
@@ -2008,7 +2023,8 @@ async fn apply_assignment(
     required_scope: Option<EnvironmentScope>,
     creation_scope: EnvironmentScope,
 ) -> Result<(), error::Error> {
-    // Assigning to a readonly variable ends a non-interactive shell, as in bash.
+    // Assigning to a readonly variable abandons the rest of the top-level command, as in bash:
+    // the error propagates to the program, which reports it and carries on with the next one.
     apply_assignment_unchecked(
         assignment,
         shell,
@@ -2019,10 +2035,14 @@ async fn apply_assignment(
     )
     .await
     .map_err(|error| match error.kind() {
-        error::ErrorKind::ReadonlyVariable => error::Error::from(
-            error::ErrorKind::ReadonlyVariableNamed(assignment.name.base_name().to_owned()),
-        )
-        .into_fatal(),
+        // Reported here, where LINENO names the assignment, even inside a function.
+        error::ErrorKind::ReadonlyVariable => {
+            let error = error::Error::from(error::ErrorKind::ReadonlyVariableNamed(
+                assignment.name.base_name().to_owned(),
+            ));
+            let _ = shell.display_error(&mut params.stderr(shell), &error);
+            error.into_reported()
+        }
         // Bash names the element: `a[-3]: bad array subscript`.
         error::ErrorKind::ArrayIndexOutOfRange(index) => error::ErrorKind::ArrayIndexOutOfRange(
             format!("{}[{index}]", assignment.name.base_name()),
