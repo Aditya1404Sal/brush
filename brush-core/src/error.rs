@@ -492,10 +492,11 @@ impl Error {
         shell: &Shell<impl extensions::ShellExtensions>,
     ) -> results::ExecutionResult {
         let next_control_flow = self.to_control_flow(shell);
-        // An unset variable (`set -u`, `${x?}`) ends a non-interactive shell with 127, as in bash;
-        // under `set -e`, or in a subshell ended by it, the status is 1.
+        // An unset variable (`set -u`, `${x?}`) ends `bash -c` with 127, as in bash; a script
+        // read from a file or standard input, `set -e`, or a subshell ended by it gives 1.
         let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
             && shell.depth() == 0
+            && shell.options().command_string_mode
             && !shell.options().exit_on_nonzero_command_exit
             && matches!(
                 self.kind,
