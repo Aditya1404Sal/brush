@@ -58,7 +58,7 @@ impl builtins::Command for EnableCommand {
                 if let Some(builtin) = context.shell.builtin_mut(name) {
                     builtin.disabled = self.disable;
                 } else {
-                    writeln!(context.stderr(), "{name}: not a shell builtin")?;
+                    context.report(format_args!("{name}: not a shell builtin"))?;
                     result = ExecutionResult::general_error();
                 }
             }

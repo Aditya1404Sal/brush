@@ -37,14 +37,13 @@ impl builtins::Command for HashCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut result = ExecutionResult::success();
-        let cmd = &context.command_name;
 
         if self.remove_all {
             context.shell.program_location_cache_mut().reset();
         } else if self.remove {
             for name in &self.names {
                 if !context.shell.program_location_cache_mut().unset(name) {
-                    writeln!(context.stderr(), "{cmd}: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                     result = ExecutionResult::general_error();
                 }
             }
@@ -72,7 +71,7 @@ impl builtins::Command for HashCommand {
                         )?;
                     }
                 } else {
-                    writeln!(context.stderr(), "{cmd}: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                     result = ExecutionResult::general_error();
                 }
             }
@@ -83,11 +82,7 @@ impl builtins::Command for HashCommand {
 
             for name in &self.names {
                 if is_dir {
-                    writeln!(
-                        context.stderr(),
-                        "{cmd}: {}: Is a directory",
-                        path.display()
-                    )?;
+                    context.report(format_args!("{}: Is a directory", path.display()))?;
                     result = ExecutionResult::general_error();
                     continue;
                 }
@@ -113,7 +108,7 @@ impl builtins::Command for HashCommand {
                     .find_first_executable_in_path_using_cache(name)
                     .is_none()
                 {
-                    writeln!(context.stderr(), "{cmd}: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                     result = ExecutionResult::general_error();
                 }
             }

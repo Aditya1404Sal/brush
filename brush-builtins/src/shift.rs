@@ -1,11 +1,13 @@
 use clap::Parser;
+use std::io::Write;
 
-use brush_core::{ExecutionExitCode, ExecutionResult, builtins};
+use brush_core::{ExecutionResult, builtins};
 
 /// Shift positional arguments.
 #[derive(Parser)]
 pub(crate) struct ShiftCommand {
     /// Number of positions to shift the arguments by (defaults to 1).
+    #[arg(allow_hyphen_values = true)]
     n: Option<i32>,
 }
 
@@ -19,7 +21,12 @@ impl builtins::Command for ShiftCommand {
         let n = self.n.unwrap_or(1);
 
         if n < 0 {
-            return Ok(ExecutionExitCode::InvalidUsage.into());
+            let prefix = context.shell.diagnostic_prefix();
+            writeln!(
+                context.stderr(),
+                "{prefix}shift: {n}: shift count out of range"
+            )?;
+            return Ok(ExecutionResult::general_error());
         }
 
         #[expect(clippy::cast_sign_loss)]
@@ -27,8 +34,9 @@ impl builtins::Command for ShiftCommand {
 
         let args = context.shell.current_shell_args_mut();
 
+        // Shifting past the last parameter changes nothing and fails quietly, as in bash.
         if n > args.len() {
-            return Ok(ExecutionExitCode::InvalidUsage.into());
+            return Ok(ExecutionResult::general_error());
         }
 
         args.drain(0..n);

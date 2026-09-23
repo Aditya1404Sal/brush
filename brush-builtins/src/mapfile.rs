@@ -1,6 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Read;
-use std::io::Write;
 
 use clap::Parser;
 
@@ -59,23 +58,17 @@ impl builtins::Command for MapFileCommand {
 
         if let Some(origin) = self.origin {
             if origin < 0 {
-                writeln!(
-                    context.stderr(),
-                    "{}: {origin}: invalid array origin",
-                    context.command_name
-                )?;
+                context.report(format_args!("{origin}: invalid array origin"))?;
                 return Ok(ExecutionExitCode::GeneralError.into());
             }
         }
 
         if let Some((_, var)) = context.shell.env().get(&self.array_var_name) {
             if var.value().is_associative_array() {
-                writeln!(
-                    context.stderr(),
-                    "{}: {}: not an indexed array",
-                    context.command_name,
+                context.report(format_args!(
+                    "{}: not an indexed array",
                     self.array_var_name
-                )?;
+                ))?;
                 return Ok(ExecutionExitCode::GeneralError.into());
             }
         }

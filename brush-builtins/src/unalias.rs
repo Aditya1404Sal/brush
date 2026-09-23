@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
@@ -28,12 +27,7 @@ impl builtins::Command for UnaliasCommand {
         } else {
             for alias in &self.aliases {
                 if context.shell.aliases_mut().remove(alias).is_none() {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {}: not found",
-                        context.command_name,
-                        alias
-                    )?;
+                    context.report(format_args!("{alias}: not found"))?;
                     exit_code = ExecutionResult::general_error();
                 }
             }

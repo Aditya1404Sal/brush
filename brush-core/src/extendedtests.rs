@@ -84,9 +84,10 @@ async fn evaluate_subscript(
     let Some((name, index)) = operand.strip_suffix(']').and_then(|r| r.split_once('[')) else {
         return Ok(operand);
     };
-    let indexed = shell.env().get(name).is_some_and(|(_, var)| {
-        !matches!(var.value(), crate::ShellValue::AssociativeArray(_))
-    });
+    let indexed = shell
+        .env()
+        .get(name)
+        .is_some_and(|(_, var)| !matches!(var.value(), crate::ShellValue::AssociativeArray(_)));
     if !indexed || index == "@" || index == "*" || index.parse::<i64>().is_ok() {
         return Ok(operand);
     }
@@ -540,32 +541,24 @@ pub(crate) fn apply_binary_predicate_to_strs(
             // TODO(test): According to docs, should be lexicographical order of the current locale.
             Ok(left > right)
         }
-        ast::BinaryPredicate::ArithmeticEqualTo => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left == right,
-        )),
-        ast::BinaryPredicate::ArithmeticNotEqualTo => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left != right,
-        )),
-        ast::BinaryPredicate::ArithmeticLessThan => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left < right,
-        )),
-        ast::BinaryPredicate::ArithmeticLessThanOrEqualTo => Ok(
-            apply_test_binary_arithmetic_predicate(left, right, |left, right| left <= right),
-        ),
-        ast::BinaryPredicate::ArithmeticGreaterThan => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left > right,
-        )),
-        ast::BinaryPredicate::ArithmeticGreaterThanOrEqualTo => Ok(
-            apply_test_binary_arithmetic_predicate(left, right, |left, right| left >= right),
-        ),
+        ast::BinaryPredicate::ArithmeticEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left == right)
+        }
+        ast::BinaryPredicate::ArithmeticNotEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left != right)
+        }
+        ast::BinaryPredicate::ArithmeticLessThan => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left < right)
+        }
+        ast::BinaryPredicate::ArithmeticLessThanOrEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left <= right)
+        }
+        ast::BinaryPredicate::ArithmeticGreaterThan => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left > right)
+        }
+        ast::BinaryPredicate::ArithmeticGreaterThanOrEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left >= right)
+        }
         ast::BinaryPredicate::StringExactlyMatchesPattern => {
             let pattern = patterns::Pattern::from(right)
                 .set_extended_globbing(shell.options().extended_globbing)
@@ -591,16 +584,16 @@ fn apply_test_binary_arithmetic_predicate(
     left: &str,
     right: &str,
     op: fn(i64, i64) -> bool,
-) -> bool {
-    // We trim leading/trailing whitespace (including newlines) before parsing integers.
-    let left: Result<i64, _> = left.trim().parse();
-    let right: Result<i64, _> = right.trim().parse();
-
-    if let (Ok(left), Ok(right)) = (left, right) {
-        op(left, right)
-    } else {
-        false
-    }
+) -> Result<bool, error::Error> {
+    // Leading and trailing whitespace (including newlines) is allowed around each integer; any
+    // other operand is an error, as in bash (`[ 1 -eq x ]` is status 2).
+    let parse = |operand: &str| {
+        operand
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| error::ErrorKind::IntegerExpressionExpected(operand.to_owned()))
+    };
+    Ok(op(parse(left)?, parse(right)?))
 }
 
 fn left_file_is_older_or_does_not_exist_when_right_does(

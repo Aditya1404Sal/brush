@@ -34,7 +34,7 @@ pub enum ErrorKind {
     ConvertingIndexedArrayToAssociativeArray,
 
     /// An error occurred while sourcing the indicated script file.
-    #[error("failed to source file: {0}")]
+    #[error("{}: {}", .0.display(), io_message(.1))]
     FailedSourcingFile(PathBuf, #[source] std::io::Error),
 
     /// The process or process group does not exist.
@@ -54,7 +54,7 @@ pub enum ErrorKind {
     CannotAssignToSpecialParameter,
 
     /// Checked expansion error.
-    #[error("expansion error: {0}")]
+    #[error("{0}")]
     CheckedExpansionError(String),
 
     /// A reference was made to an unknown shell function.
@@ -62,11 +62,11 @@ pub enum ErrorKind {
     FunctionNotFound(String),
 
     /// Command was not found.
-    #[error("command not found: {0}")]
+    #[error("{0}: command not found")]
     CommandNotFound(String),
 
     /// Not a builtin.
-    #[error("not a shell builtin: {0}")]
+    #[error("{0}: not a shell builtin")]
     BuiltinNotFound(String),
 
     /// The working directory does not exist.
@@ -127,12 +127,16 @@ pub enum ErrorKind {
     #[error("invalid redirection target")]
     InvalidRedirection,
 
+    /// A redirection target expanded to no word or to several (`> $empty`).
+    #[error("{0}: ambiguous redirect")]
+    AmbiguousRedirect(String),
+
     /// An error occurred while redirecting input or output with the given file.
-    #[error("failed to redirect to {0}: {1}")]
+    #[error("{0}: {1}")]
     RedirectionFailure(String, String),
 
     /// An error occurred evaluating an arithmetic expression.
-    #[error("arithmetic evaluation error: {0}")]
+    #[error("{0}")]
     EvalError(#[from] crate::arithmetic::EvalError),
 
     /// The given string could not be parsed as an integer.
@@ -164,6 +168,10 @@ pub enum ErrorKind {
     #[error("cannot mutate readonly variable")]
     ReadonlyVariable,
 
+    /// An attempt was made to assign to the named readonly variable.
+    #[error("{0}: readonly variable")]
+    ReadonlyVariableNamed(String),
+
     /// The indicated pattern is invalid.
     #[error("invalid pattern: '{0}'")]
     InvalidPattern(String),
@@ -177,7 +185,7 @@ pub enum ErrorKind {
     InvalidRegexError(fancy_regex::Error, String),
 
     /// An I/O error occurred.
-    #[error("i/o error: {0}")]
+    #[error("{}", io_message(.0))]
     IoError(#[from] std::io::Error),
 
     /// Invalid substitution syntax.
@@ -237,7 +245,7 @@ pub enum ErrorKind {
     OpenFileNotWritable(&'static str),
 
     /// Bad file descriptor.
-    #[error("bad file descriptor: {0}")]
+    #[error("{0}: Bad file descriptor")]
     BadFileDescriptor(ShellFd),
 
     /// Printf failure
@@ -260,8 +268,12 @@ pub enum ErrorKind {
     #[error("system time error: {0}")]
     TimeError(#[from] std::time::SystemTimeError),
 
+    /// A `test` operand that must be an integer is not one.
+    #[error("{0}: integer expression expected")]
+    IntegerExpressionExpected(String),
+
     /// Array index out of range.
-    #[error("array index out of range: {0}")]
+    #[error("{0}: bad array subscript")]
     ArrayIndexOutOfRange(String),
 
     /// Unhandled key code.
@@ -281,7 +293,7 @@ pub enum ErrorKind {
     HistoryNotEnabled,
 
     /// Expanding an unset variable.
-    #[error("expanding unset variable: {0}")]
+    #[error("{0}: unbound variable")]
     ExpandingUnsetVariable(String),
 
     /// An internal error occurred.
@@ -366,6 +378,7 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::ParseError(..) => Self::InvalidUsage,
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
+            ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
@@ -409,6 +422,17 @@ impl Error {
     pub const fn into_fatal(mut self) -> Self {
         self.fatal = true;
         self
+    }
+
+    /// The reason a path could not be used, as the system words it ("No such file or
+    /// directory", "Not a directory"), for a diagnostic that names the path itself.
+    pub fn path_reason(&self) -> String {
+        match &self.kind {
+            ErrorKind::IoError(error) => io_message(error),
+            ErrorKind::NotADirectory(_) => "Not a directory".to_owned(),
+            ErrorKind::WorkingDirMissing(_) => "No such file or directory".to_owned(),
+            kind => kind.to_string(),
+        }
     }
 
     /// Returns whether or not this error is fatal.
@@ -457,13 +481,34 @@ impl Error {
         shell: &Shell<impl extensions::ShellExtensions>,
     ) -> results::ExecutionResult {
         let next_control_flow = self.to_control_flow(shell);
-        let exit_code = results::ExecutionExitCode::from(&self);
+        // An unset variable (`set -u`, `${x?}`) ends a non-interactive shell with 127, as in bash;
+        // a subshell ended by it reports 1.
+        let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
+            && shell.depth() == 0
+            && matches!(
+                self.kind,
+                ErrorKind::ExpandingUnsetVariable(..) | ErrorKind::CheckedExpansionError(..)
+            ) {
+            results::ExecutionExitCode::NotFound
+        } else {
+            results::ExecutionExitCode::from(&self)
+        };
 
         results::ExecutionResult {
             next_control_flow,
             exit_code,
             terminating_signal: None,
         }
+    }
+}
+
+/// An I/O error's message as bash words it: the system's description, without the
+/// ` (os error N)` Rust appends.
+pub fn io_message(error: &std::io::Error) -> String {
+    let text = error.to_string();
+    match text.rsplit_once(" (os error ") {
+        Some((message, _)) if text.ends_with(')') => message.to_owned(),
+        _ => text,
     }
 }
 

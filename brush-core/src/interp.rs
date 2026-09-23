@@ -1465,7 +1465,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                     if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
                     {
-                        writeln!(params.stderr(&context.shell), "error: {e}")?;
+                        let _ = context
+                            .shell
+                            .display_error(&mut params.stderr(&context.shell), &e);
                         return Ok(ExecutionResult::general_error().into());
                     }
                 }
@@ -1802,8 +1804,40 @@ async fn expand_assignment_value(
     Ok(expanded)
 }
 
-#[expect(clippy::too_many_lines)]
 async fn apply_assignment(
+    assignment: &ast::Assignment,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    export: bool,
+    required_scope: Option<EnvironmentScope>,
+    creation_scope: EnvironmentScope,
+) -> Result<(), error::Error> {
+    // Assigning to a readonly variable ends a non-interactive shell, as in bash.
+    apply_assignment_unchecked(
+        assignment,
+        shell,
+        params,
+        export,
+        required_scope,
+        creation_scope,
+    )
+    .await
+    .map_err(|error| match error.kind() {
+        error::ErrorKind::ReadonlyVariable => error::Error::from(
+            error::ErrorKind::ReadonlyVariableNamed(assignment.name.base_name().to_owned()),
+        )
+        .into_fatal(),
+        // Bash names the element: `a[-3]: bad array subscript`.
+        error::ErrorKind::ArrayIndexOutOfRange(index) => error::ErrorKind::ArrayIndexOutOfRange(
+            format!("{}[{index}]", assignment.name.base_name()),
+        )
+        .into(),
+        _ => error,
+    })
+}
+
+#[expect(clippy::too_many_lines)]
+async fn apply_assignment_unchecked(
     assignment: &ast::Assignment,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
@@ -1993,7 +2027,7 @@ pub(crate) async fn setup_redirect(
             let mut expanded_fields =
                 expansion::full_expand_and_split_word(shell, params, f).await?;
             if expanded_fields.len() != 1 {
-                return Err(error::ErrorKind::InvalidRedirection.into());
+                return Err(error::ErrorKind::AmbiguousRedirect(f.value.clone()).into());
             }
 
             let expanded_file_path = expanded_fields.remove(0);
@@ -2009,11 +2043,13 @@ pub(crate) async fn setup_redirect(
                         expansion::full_expand_and_split_word(shell, params, f).await?;
 
                     if expanded_fields.len() != 1 {
-                        return Err(error::ErrorKind::InvalidRedirection.into());
+                        return Err(error::ErrorKind::AmbiguousRedirect(f.value.clone()).into());
                     }
 
+                    // Diagnostics name the file as the script did, not its absolute path.
+                    let written_path = expanded_fields.remove(0);
                     let expanded_file_path: PathBuf =
-                        shell.absolute_path(Path::new(expanded_fields.remove(0).as_str()));
+                        shell.absolute_path(Path::new(written_path.as_str()));
 
                     let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
                     match kind {
@@ -2067,10 +2103,16 @@ pub(crate) async fn setup_redirect(
                     let opened_file = shell
                         .open_file(&options, &expanded_file_path, params)
                         .map_err(|err| {
-                            error::ErrorKind::RedirectionFailure(
-                                expanded_file_path.to_string_lossy().to_string(),
-                                err.to_string(),
-                            )
+                            let message = if err.kind() == std::io::ErrorKind::AlreadyExists
+                                && shell
+                                    .options()
+                                    .disallow_overwriting_regular_files_via_output_redirection
+                            {
+                                "cannot overwrite existing file".to_owned()
+                            } else {
+                                error::io_message(&err)
+                            };
+                            error::ErrorKind::RedirectionFailure(written_path.clone(), message)
                         })?;
 
                     params.open_files.set_fd(fd_num, opened_file);
@@ -2109,7 +2151,7 @@ pub(crate) async fn setup_redirect(
                         expansion::full_expand_and_split_word(shell, params, word).await?;
 
                     if expanded_fields.len() != 1 {
-                        return Err(error::ErrorKind::InvalidRedirection.into());
+                        return Err(error::ErrorKind::AmbiguousRedirect(word.value.clone()).into());
                     }
 
                     let mut expanded = expanded_fields.remove(0);
@@ -2239,7 +2281,7 @@ fn setup_redirect_output_and_error_to(
         .map_err(|err| {
             error::ErrorKind::RedirectionFailure(
                 abs_file_path.to_string_lossy().to_string(),
-                err.to_string(),
+                error::io_message(&err),
             )
         })?;
 

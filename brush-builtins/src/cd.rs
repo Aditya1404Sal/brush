@@ -50,7 +50,7 @@ impl builtins::Command for CdCommand {
                 if let Some(oldpwd) = context.shell.env_str("OLDPWD") {
                     PathBuf::from(oldpwd.to_string())
                 } else {
-                    writeln!(context.stderr(), "OLDPWD not set")?;
+                    context.report("OLDPWD not set")?;
                     return Ok(ExecutionResult::general_error());
                 }
             } else {
@@ -62,7 +62,7 @@ impl builtins::Command for CdCommand {
             if let Some(home_var) = context.shell.env_str("HOME") {
                 PathBuf::from(home_var.to_string())
             } else {
-                writeln!(context.stderr(), "HOME not set")?;
+                context.report("HOME not set")?;
                 return Ok(ExecutionResult::general_error());
             }
         };
@@ -81,7 +81,12 @@ impl builtins::Command for CdCommand {
             target_dir = context.shell.absolute_path(target_dir).canonicalize()?;
         }
 
-        context.shell.set_working_dir(&target_dir)?;
+        if let Err(error) = context.shell.set_working_dir(&target_dir) {
+            // As bash words it: the operand as given, then the reason.
+            let shown = self.target_dir.as_ref().unwrap_or(&target_dir);
+            context.report(format_args!("{}: {}", shown.display(), error.path_reason()))?;
+            return Ok(ExecutionResult::general_error());
+        }
 
         // Bash compatibility
         // https://www.gnu.org/software/bash/manual/bash.html#index-cd

@@ -13,7 +13,7 @@ const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
     /// Division by zero.
-    #[error("division by zero")]
+    #[error("division by 0")]
     DivideByZero,
 
     /// Negative exponent.
@@ -37,12 +37,16 @@ pub enum EvalError {
     FailedToUpdateEnvironment,
 
     /// Failed to parse an arithmetic expression.
-    #[error("failed to parse expression: {0}")]
+    #[error("syntax error: operand expected")]
     ParseError(String),
 
     /// Error expanding an unset variable.
-    #[error("expanding unset variable: {0}")]
+    #[error("{0}: unbound variable")]
     ExpandingUnsetVariable(String),
+
+    /// An error in the named expression, worded as bash reports it.
+    #[error("{}", in_expression_message(.0, .1))]
+    InExpression(String, Box<Self>),
 
     /// Expression recursion level exceeded.
     #[error("expression recursion level exceeded")]
@@ -99,8 +103,12 @@ pub(crate) async fn expand_and_eval(
         .map_err(|_e| EvalError::FailedToExpandExpression(expr.to_owned()))?;
 
     // Now parse.
-    let expr = brush_parser::arithmetic::parse(&expanded_self)
-        .map_err(|_e| EvalError::ParseError(expanded_self))?;
+    let expr = brush_parser::arithmetic::parse(&expanded_self).map_err(|_e| {
+        EvalError::InExpression(
+            expanded_self.clone(),
+            Box::new(EvalError::ParseError(expanded_self.clone())),
+        )
+    })?;
 
     // Trace if applicable.
     if trace_if_needed && shell.options().print_commands_and_arguments {
@@ -111,6 +119,27 @@ pub(crate) async fn expand_and_eval(
 
     // Now evaluate.
     expr.eval(shell)
+        .map_err(|error| EvalError::InExpression(expanded_self.clone(), Box::new(error)))
+}
+
+/// Bash's wording for an arithmetic error: `EXPR: message (error token is "TOKEN")`, where the
+/// token is the part of the expression where evaluation failed.
+fn in_expression_message(expr: &str, error: &EvalError) -> String {
+    let token = match error {
+        EvalError::DivideByZero => expr
+            .rsplit_once(['/', '%'])
+            .map(|(_, rest)| rest.trim().to_owned()),
+        EvalError::NegativeExponent => expr
+            .rsplit_once("**")
+            .map(|(_, rest)| rest.trim().trim_start_matches('-').to_owned()),
+        EvalError::ParseError(_) => expr.trim_end().chars().last().map(String::from),
+        _ => None,
+    };
+    match (error, token) {
+        (EvalError::ExpandingUnsetVariable(_), _) => error.to_string(),
+        (_, Some(token)) => format!("{expr}: {error} (error token is \"{}\")", token.trim()),
+        (_, None) => format!("{expr}: {error}"),
+    }
 }
 
 /// Evaluates a value assigned to an integer (`declare -i`) variable, as bash does: the already

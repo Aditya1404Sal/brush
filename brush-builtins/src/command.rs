@@ -59,7 +59,7 @@ impl CommandCommand {
                 .next()
             else {
                 if self.print_verbose_description {
-                    writeln!(context.stderr(), "command: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                 }
                 continue;
             };

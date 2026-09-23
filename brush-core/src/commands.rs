@@ -61,6 +61,13 @@ impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
         self.params.stderr(self.shell)
     }
 
+    /// Writes a builtin's diagnostic as bash does: `NAME: line N: BUILTIN: message`.
+    pub fn report(&self, message: impl std::fmt::Display) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let prefix = self.shell.diagnostic_prefix();
+        writeln!(self.stderr(), "{prefix}{}: {message}", self.command_name)
+    }
+
     /// Returns the file descriptor with the given number. Returns `None`
     /// if the file descriptor is not open.
     ///
@@ -1061,7 +1068,12 @@ async fn run_substitution_command(
     // If we failed to parse, then we'll fall below and handle it there.
     if let Ok(program) = &parse_result {
         if let Some(redir) = try_unwrap_bare_input_redir_program(program) {
-            interp::setup_redirect(&mut shell, &mut params, redir).await?;
+            // A file that cannot be read is reported and fails the substitution (status 1), as
+            // in bash; it does not end the command using the substitution.
+            if let Err(error) = interp::setup_redirect(&mut shell, &mut params, redir).await {
+                let _ = shell.display_error(&mut params.stderr(&shell), &error);
+                return Ok(ExecutionResult::general_error());
+            }
             #[cfg(target_arch = "wasm32")]
             futures::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell)).await?;
             #[cfg(not(target_arch = "wasm32"))]

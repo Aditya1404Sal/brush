@@ -40,10 +40,7 @@ impl builtins::Command for ShoptCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.set && self.unset {
-            writeln!(
-                context.stderr(),
-                "cannot set and unset shell options simultaneously"
-            )?;
+            context.report("cannot set and unset shell options simultaneously")?;
             return Ok(ExecutionExitCode::InvalidUsage.into());
         }
 
@@ -137,12 +134,7 @@ impl builtins::Command for ShoptCommand {
                         }
                     }
                 } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {}: invalid shell option name",
-                        context.command_name,
-                        option_name
-                    )?;
+                    context.report(format_args!("{option_name}: invalid shell option name"))?;
                     return_value = ExecutionResult::general_error();
                 }
             }

@@ -134,7 +134,7 @@ impl builtins::Command for DeclareCommand {
         };
 
         if matches!(verb, DeclareVerb::Local) && !context.shell.in_function() {
-            writeln!(context.stderr(), "can only be used in a function")?;
+            context.report("can only be used in a function")?;
             return Ok(ExecutionResult::general_error());
         }
 
@@ -179,7 +179,7 @@ impl DeclareCommand {
         let name = match declaration {
             brush_core::CommandArg::String(s) => s,
             brush_core::CommandArg::Assignment(_) => {
-                writeln!(context.stderr(), "declare: {declaration}: not found")?;
+                context.report(format_args!("{declaration}: not found"))?;
                 return Ok(false);
             }
         };
@@ -227,7 +227,7 @@ impl DeclareCommand {
 
             Ok(true)
         } else {
-            writeln!(context.stderr(), "declare: {name}: not found")?;
+            context.report(format_args!("{name}: not found"))?;
             Ok(false)
         }
     }
@@ -295,11 +295,7 @@ impl DeclareCommand {
 
         // Make sure it's a valid name.
         if !env::valid_variable_name(name.as_str()) {
-            writeln!(
-                context.stderr(),
-                "{}: {name}: not a valid variable name",
-                context.command_name
-            )?;
+            context.report(format_args!("`{name}': not a valid identifier"))?;
             return Ok(false);
         }
 

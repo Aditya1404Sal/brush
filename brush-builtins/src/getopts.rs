@@ -298,7 +298,8 @@ fn resolve_option_argument<SE: brush_core::ShellExtensions>(
                 if is_opterr_enabled(context) {
                     writeln!(
                         context.stderr(),
-                        "getopts: option requires an argument -- {c}"
+                        "{}: option requires an argument -- {c}",
+                        shell_name(context)
                     )?;
                 }
                 (String::from("?"), None)
@@ -326,7 +327,11 @@ fn report_unknown_option<SE: brush_core::ShellExtensions>(
     c: char,
 ) -> Result<(String, Option<String>), brush_core::Error> {
     if !spec.silent_errors && is_opterr_enabled(context) {
-        writeln!(context.stderr(), "getopts: illegal option -- {c}")?;
+        writeln!(
+            context.stderr(),
+            "{}: illegal option -- {c}",
+            shell_name(context)
+        )?;
     }
 
     let optarg = if spec.silent_errors {
@@ -388,6 +393,16 @@ fn update_variables<SE: brush_core::ShellExtensions>(
     )?;
 
     Ok(result.exit_code)
+}
+
+/// Bash prefixes getopts' diagnostics with `$0` alone, as the program whose options they are.
+fn shell_name<SE: brush_core::ShellExtensions>(
+    context: &brush_core::ExecutionContext<'_, SE>,
+) -> String {
+    context
+        .shell
+        .current_shell_name()
+        .map_or_else(|| "bash".to_owned(), |name| name.to_string())
 }
 
 /// Returns whether OPTERR is enabled (i.e., getopts should print error messages).

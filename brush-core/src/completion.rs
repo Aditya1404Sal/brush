@@ -698,7 +698,8 @@ impl Spec {
                     }
                 }
                 CompleteAction::Variable => {
-                    for (key, _) in shell.env().iter() {
+                    // Variables are stored unordered; bash enumerates them sorted by name.
+                    for (key, _) in shell.env().iter().sorted_by_key(|v| v.0) {
                         if key.starts_with(token) {
                             candidates.push(key.to_owned());
                         }

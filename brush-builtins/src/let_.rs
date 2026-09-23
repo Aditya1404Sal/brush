@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::io::Write;
 
 use brush_core::{ExecutionExitCode, ExecutionResult, arithmetic::Evaluatable, builtins};
 
@@ -21,7 +20,7 @@ impl builtins::Command for LetCommand {
         let mut result = ExecutionExitCode::InvalidUsage.into();
 
         if self.exprs.is_empty() {
-            writeln!(context.stderr(), "missing expression")?;
+            context.report("expression expected")?;
             return Ok(result);
         }
 

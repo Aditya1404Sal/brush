@@ -81,7 +81,7 @@ impl ExportCommand {
                             func.export();
                         }
                     } else {
-                        writeln!(context.stderr(), "{s}: not a function")?;
+                        context.report(format_args!("{s}: not a function"))?;
                         return Ok(ExecutionExitCode::InvalidUsage.into());
                     }
                 }
@@ -98,8 +98,9 @@ impl ExportCommand {
             brush_core::CommandArg::Assignment(assignment) => {
                 let name = match &assignment.name {
                     ast::AssignmentName::VariableName(name) => name,
-                    ast::AssignmentName::ArrayElementName(_, _) => {
-                        writeln!(context.stderr(), "not a valid variable name")?;
+                    ast::AssignmentName::ArrayElementName(name, index) => {
+                        context
+                            .report(format_args!("`{name}[{index}]': not a valid identifier"))?;
                         return Ok(ExecutionExitCode::InvalidUsage.into());
                     }
                 };

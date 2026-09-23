@@ -368,6 +368,7 @@ impl builtins::Command for SetCommand {
             {
                 option_def.set(context.shell.options_mut(), value);
             } else {
+                context.report(format_args!("{option_name}: invalid option name"))?;
                 result = ExecutionExitCode::InvalidUsage.into();
             }
         }

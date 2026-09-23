@@ -48,12 +48,7 @@ impl builtins::Command for KillCommand {
             if let Ok(parsed_trap_signal) = TrapSignal::try_from(signal_name.as_str()) {
                 trap_signal = parsed_trap_signal;
             } else {
-                writeln!(
-                    context.stderr(),
-                    "{}: invalid signal name: {}",
-                    context.command_name,
-                    signal_name
-                )?;
+                context.report(format_args!("{signal_name}: invalid signal specification"))?;
                 return Ok(ExecutionExitCode::InvalidUsage.into());
             }
         }
@@ -68,12 +63,9 @@ impl builtins::Command for KillCommand {
                 if let Ok(parsed_trap_signal) = TrapSignal::try_from(*signal_number as i32) {
                     trap_signal = parsed_trap_signal;
                 } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: invalid signal number: {}",
-                        context.command_name,
-                        signal_number
-                    )?;
+                    context.report(format_args!(
+                        "{signal_number}: invalid signal specification"
+                    ))?;
                     return Ok(ExecutionExitCode::InvalidUsage.into());
                 }
             }
@@ -91,22 +83,15 @@ impl builtins::Command for KillCommand {
                     signal_zero = false;
                     trap_signal = parsed_trap_signal;
                 } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {}: invalid signal specification",
-                        context.command_name,
-                        possible_sigspec
-                    )?;
+                    context.report(format_args!(
+                        "{possible_sigspec}: invalid signal specification"
+                    ))?;
                     return Ok(ExecutionResult::general_error());
                 }
             } else if pid_or_job_spec.is_none() {
                 pid_or_job_spec = Some(arg);
             } else {
-                writeln!(
-                    context.stderr(),
-                    "{}: too many jobs or processes specified",
-                    context.command_name
-                )?;
+                context.report("too many jobs or processes specified")?;
                 return Ok(ExecutionExitCode::InvalidUsage.into());
             }
         }
@@ -115,7 +100,7 @@ impl builtins::Command for KillCommand {
             return print_signals(&context, self.args.as_ref());
         } else {
             let Some(pid_or_job_spec) = pid_or_job_spec else {
-                writeln!(context.stderr(), "{}: invalid usage", context.command_name)?;
+                context.report("usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]")?;
                 return Ok(ExecutionExitCode::InvalidUsage.into());
             };
 

@@ -1,6 +1,5 @@
 use clap::Parser;
 use itertools::Itertools;
-use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
@@ -44,11 +43,7 @@ impl builtins::Command for AliasCommand {
                 } else if let Some(value) = context.shell.aliases().get(alias) {
                     write_alias_definition(context.stdout(), alias, value)?;
                 } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {alias}: not found",
-                        context.command_name
-                    )?;
+                    context.report(format_args!("{alias}: not found"))?;
                     exit_code = ExecutionResult::general_error();
                 }
             }

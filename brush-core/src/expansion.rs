@@ -1407,6 +1407,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     .expand_parameter_allowing_unset(&parameter, indirect)
                     .await?;
                 let error_message = error_message.as_ref().map_or("", |v| v.as_str());
+                let null_counts = matches!(
+                    test_type,
+                    brush_parser::word::ParameterTestType::UnsetOrNull
+                );
 
                 match (test_type, expanded_parameter.classify()) {
                     (_, ParameterState::NonZeroLength)
@@ -1416,8 +1420,19 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     ) => Ok(expanded_parameter),
                     _ => {
                         let result = self.basic_expand_to_str(error_message).await?;
-                        let err: error::Error =
-                            error::ErrorKind::CheckedExpansionError(result).into();
+                        // As bash words it: `NAME: message`, with a default message.
+                        let message = if !result.is_empty() {
+                            result
+                        } else if null_counts {
+                            "parameter null or not set".to_owned()
+                        } else {
+                            "parameter not set".to_owned()
+                        };
+                        let err: error::Error = error::ErrorKind::CheckedExpansionError(format!(
+                            "{}: {message}",
+                            diagnostic_name(&parameter)
+                        ))
+                        .into();
 
                         // Expansion errors are fatal per POSIX spec
                         Err(err.into_fatal())
@@ -1944,7 +1959,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             Ok(Expansion::undefined())
         } else {
             let err: error::Error =
-                error::ErrorKind::ExpandingUnsetVariable(parameter.to_string()).into();
+                error::ErrorKind::ExpandingUnsetVariable(diagnostic_name(parameter)).into();
             Err(err.into_fatal())
         }
     }
@@ -2490,5 +2505,19 @@ mod tests {
         assert_eq!(to_initial_capitals("ab bc cd"), String::from("Ab Bc Cd"));
         assert_eq!(to_initial_capitals(" a "), String::from(" A "));
         assert_eq!(to_initial_capitals(""), String::new());
+    }
+}
+
+/// A parameter as bash names it in a diagnostic: `x`, `a[1]`, `$1`, `$@`.
+fn diagnostic_name(parameter: &brush_parser::word::Parameter) -> String {
+    use brush_parser::word::Parameter;
+    match parameter {
+        Parameter::Positional(n) => format!("${n}"),
+        Parameter::Special(special) => format!("${special}"),
+        Parameter::Named(name) => name.clone(),
+        Parameter::NamedWithIndex { name, index } => format!("{name}[{index}]"),
+        Parameter::NamedWithAllIndices { name, concatenate } => {
+            format!("{name}[{}]", if *concatenate { '*' } else { '@' })
+        }
     }
 }

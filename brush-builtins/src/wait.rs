@@ -66,12 +66,7 @@ impl builtins::Command for WaitCommand {
                     if let Some(job) = context.shell.jobs_mut().resolve_job_spec(id) {
                         result = job.wait().await?;
                     } else {
-                        writeln!(
-                            context.stderr(),
-                            "{}: no such job: {}",
-                            context.command_name,
-                            id
-                        )?;
+                        context.report(format_args!("{id}: no such job"))?;
 
                         result = ExecutionExitCode::GeneralError.into();
                     }
@@ -90,11 +85,8 @@ impl builtins::Command for WaitCommand {
                         if let Some(job) = job {
                             result = job.wait().await?;
                         } else {
-                            writeln!(
-                                context.stderr(),
-                                "{}: pid {pid} is not a child of this shell",
-                                context.command_name
-                            )?;
+                            context
+                                .report(format_args!("pid {pid} is not a child of this shell"))?;
                             result = ExecutionExitCode::from(127).into();
                         }
                     }

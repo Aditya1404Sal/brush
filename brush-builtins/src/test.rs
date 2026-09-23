@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::io::Write;
 
 use brush_core::{
     ErrorKind, ExecutionExitCode, ExecutionParameters, ExecutionResult, Shell, builtins, tests,
@@ -40,7 +39,7 @@ impl builtins::Command for TestCommand {
             match args.last() {
                 Some(s) if s == "]" => (),
                 None | Some(_) => {
-                    writeln!(context.stderr(), "[: missing ']'")?;
+                    context.report("missing `]'")?;
                     return Ok(ExecutionExitCode::InvalidUsage.into());
                 }
             }

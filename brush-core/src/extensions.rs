@@ -36,8 +36,8 @@ pub trait ErrorFormatter: Clone + Default + Send + Sync + 'static {
         error: &error::Error,
         shell: &Shell<impl extensions::ShellExtensions>,
     ) -> String {
-        let _ = shell;
-        std::format!("error: {error:#}\n")
+        // As bash words it: `NAME: line N: message`.
+        std::format!("{}{error:#}\n", shell.diagnostic_prefix())
     }
 }
 
