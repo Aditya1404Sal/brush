@@ -38,23 +38,33 @@ impl builtins::Command for JobsCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        // As bash does, notice the jobs that have finished: they are listed once, as Done.
+        let finished = context.shell.jobs_mut().poll()?;
+        let mut listed: Vec<&jobs::Job> = context
+            .shell
+            .jobs()
+            .jobs
+            .iter()
+            .chain(finished.iter().map(|(job, _)| job))
+            .collect();
+        listed.sort_by_key(|job| job.id);
+
         if self.also_show_pids {
             #[cfg(target_arch = "wasm32")]
             {
-                for job in &context.shell.jobs().jobs {
-                    let pids = job
+                // As bash lays it out: `[N]+  1234 Running                    cmd &`.
+                for job in &listed {
+                    let pid = job
                         .pids()
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>();
+                        .first()
+                        .map_or_else(String::new, ToString::to_string);
                     writeln!(
                         context.stdout(),
-                        "[{}]{} {}\t{}\t{}",
+                        "[{}]{} {pid:>5} {:<27}{}",
                         job.id,
                         job.annotation(),
-                        pids.join(" "),
-                        job.state,
-                        job.command_line
+                        job.state.to_string(),
+                        job.display_command()
                     )?;
                 }
                 return Ok(ExecutionResult::success());
@@ -67,7 +77,7 @@ impl builtins::Command for JobsCommand {
         }
 
         if self.job_specs.is_empty() {
-            for job in &context.shell.jobs().jobs {
+            for job in listed {
                 self.display_job(&context, job)?;
             }
         } else {

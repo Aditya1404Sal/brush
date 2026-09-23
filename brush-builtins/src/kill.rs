@@ -71,12 +71,15 @@ impl builtins::Command for KillCommand {
             }
         }
 
-        // Look through the remaining args for a pid/job spec or a -sigspec style option.
-        let mut pid_or_job_spec = None;
+        // Look through the remaining args for a -sigspec style option, then the pids and job
+        // specs to signal.
+        let mut targets = Vec::new();
         for arg in &self.args {
             // See if this is -sigspec syntax. The sigspec may be a signal name
             // (e.g., -TERM) or a signal number (e.g., -9, including -0).
-            if let Some(possible_sigspec) = arg.strip_prefix("-") {
+            if targets.is_empty()
+                && let Some(possible_sigspec) = arg.strip_prefix("-")
+            {
                 if Ok(0) == possible_sigspec.parse::<i32>() {
                     signal_zero = true;
                 } else if let Ok(parsed_trap_signal) = possible_sigspec.parse::<TrapSignal>() {
@@ -88,35 +91,36 @@ impl builtins::Command for KillCommand {
                     ))?;
                     return Ok(ExecutionResult::general_error());
                 }
-            } else if pid_or_job_spec.is_none() {
-                pid_or_job_spec = Some(arg);
             } else {
-                context.report("too many jobs or processes specified")?;
-                return Ok(ExecutionExitCode::InvalidUsage.into());
+                targets.push(arg);
             }
         }
 
         if self.list_signals {
-            return print_signals(&context, self.args.as_ref());
+            print_signals(&context, self.args.as_ref())
         } else {
-            let Some(pid_or_job_spec) = pid_or_job_spec else {
+            if targets.is_empty() {
                 context.report("usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]")?;
                 return Ok(ExecutionExitCode::InvalidUsage.into());
-            };
-
-            let mut stderr = context.stderr();
-            if let Some(failure) = signal_target(
-                &mut *context.shell,
-                &context.command_name,
-                &mut stderr,
-                pid_or_job_spec,
-                trap_signal,
-                signal_zero,
-            )? {
-                return Ok(failure);
             }
+
+            // Each target is signalled; the status is a failure if any of them failed.
+            let mut stderr = context.stderr();
+            let mut result = ExecutionResult::success();
+            for target in targets {
+                if let Some(failure) = signal_target(
+                    &mut *context.shell,
+                    &context.command_name,
+                    &mut stderr,
+                    target,
+                    trap_signal,
+                    signal_zero,
+                )? {
+                    result = failure;
+                }
+            }
+            Ok(result)
         }
-        Ok(ExecutionResult::success())
     }
 }
 

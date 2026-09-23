@@ -942,6 +942,8 @@ impl Execute for ast::CompoundCommand {
                 subshell.traps_mut().reset_exit_for_subshell();
                 // `break` in a `( ... )` does not reach the loops around it.
                 subshell.loop_depth = 0;
+                // Nor does it list the jobs around it, as a pipeline stage does.
+                subshell.jobs_mut().jobs.clear();
                 #[cfg(target_arch = "wasm32")]
                 let disposition = subshell.traps().pipe_disposition();
                 let body = async {

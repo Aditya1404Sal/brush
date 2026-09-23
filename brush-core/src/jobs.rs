@@ -122,11 +122,12 @@ impl JobManager {
         reason = "push() guarantees the vector length is >= 1"
     )]
     pub fn add_as_current(&mut self, mut job: Job) -> &Job {
+        // The current job becomes the previous one, and the previous one loses its mark.
         for j in &mut self.jobs {
-            if matches!(j.annotation, JobAnnotation::Current) {
-                j.annotation = JobAnnotation::Previous;
-                break;
-            }
+            j.annotation = match j.annotation {
+                JobAnnotation::Current => JobAnnotation::Previous,
+                JobAnnotation::Previous | JobAnnotation::None => JobAnnotation::None,
+            };
         }
 
         // Allocate above the highest live id — `len() + 1` collides once jobs are removed out of
@@ -166,6 +167,15 @@ impl JobManager {
         self.jobs
             .iter_mut()
             .find(|j| matches!(j.annotation, JobAnnotation::Previous))
+    }
+
+    /// The table a pipeline stage or command substitution starts with: its parent's jobs, to
+    /// list only, as bash lists them there.
+    pub(crate) fn listing_copy(&self) -> Self {
+        Self {
+            jobs: self.jobs.iter().map(Job::listing_copy).collect(),
+            disowned: Vec::new(),
+        }
     }
 
     /// Takes the job with this id out of the table, as `disown` does; returns whether there was
@@ -290,7 +300,7 @@ pub enum JobAnnotation {
 impl Display for JobAnnotation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::None => write!(f, ""),
+            Self::None => write!(f, " "),
             Self::Current => write!(f, "+"),
             Self::Previous => write!(f, "-"),
         }
@@ -322,14 +332,22 @@ pub struct Job {
 
     /// Numbers reported for this job; the last is `$!`.
     pids: Vec<crate::process_table::Pid>,
+
+    /// A copy a pipeline stage or command substitution keeps of its parent's job, to list it
+    /// as bash does; it has no tasks, never completes, and cannot be waited for.
+    listing_only: bool,
 }
 
+/// A job's line as `jobs` prints it, as bash lays it out: `[N]+  Running                    cmd &`.
 impl Display for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[{}]{:3}{}\t{}",
-            self.id, self.annotation, self.state, self.command_line
+            "[{}]{}  {:<27}{}",
+            self.id,
+            self.annotation,
+            self.state.to_string(),
+            self.display_command()
         )
     }
 }
@@ -355,6 +373,30 @@ impl Job {
             state,
             leader: None,
             pids: Vec::new(),
+            listing_only: false,
+        }
+    }
+
+    /// The command as `jobs` shows it: with ` &` while it runs in the background.
+    pub fn display_command(&self) -> String {
+        match self.state {
+            JobState::Running => std::format!("{} &", self.command_line),
+            _ => self.command_line.clone(),
+        }
+    }
+
+    /// A copy of this job for listing only (see `listing_only`).
+    fn listing_copy(&self) -> Self {
+        Self {
+            tasks: VecDeque::new(),
+            pgid: self.pgid,
+            annotation: self.annotation.clone(),
+            id: self.id,
+            command_line: self.command_line.clone(),
+            state: self.state.clone(),
+            leader: self.leader,
+            pids: self.pids.clone(),
+            listing_only: true,
         }
     }
 
@@ -426,6 +468,9 @@ impl Job {
         &mut self,
     ) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
         let mut result: Option<Result<ExecutionResult, error::Error>> = None;
+        if self.listing_only {
+            return Ok(None);
+        }
 
         tracing::debug!(target: trace_categories::JOBS, "Polling job {} for completion...", self.id);
 
