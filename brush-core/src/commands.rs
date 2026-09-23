@@ -1061,7 +1061,7 @@ async fn run_substitution_command(
     command: String,
 ) -> Result<ExecutionResult, error::Error> {
     // Parse the string into a whole shell program.
-    let parse_result = shell.parse_string(command);
+    let parse_result = shell.parse_string(command.as_str());
 
     // Check for a command that is only an input redirection ("< file").
     // If detected, emulate `cat file` to stdout and return immediately.
@@ -1087,7 +1087,7 @@ async fn run_substitution_command(
 
     // Handle the parse result using default shell behavior.
     shell
-        .run_parsed_result(parse_result, &source_info, &params)
+        .run_parsed_result(parse_result, Some(&command), &source_info, &params)
         .await
 }
 

@@ -22,13 +22,21 @@ impl builtins::Command for DotCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         // TODO(dot): Handle trap inheritance.
-        context
+        let result = context
             .shell
             .source_script(
                 Path::new(&self.script_path),
                 self.script_args.iter(),
                 &context.params,
             )
-            .await
+            .await;
+        match result {
+            // Bash reports a script it cannot read without naming `source`, and carries on.
+            Err(error) if matches!(error.kind(), brush_core::ErrorKind::FailedSourcingFile(..)) => {
+                context.shell.display_error(&mut context.stderr(), &error)?;
+                Ok(brush_core::ExecutionResult::general_error())
+            }
+            result => result,
+        }
     }
 }

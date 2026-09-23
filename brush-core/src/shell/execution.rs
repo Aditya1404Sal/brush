@@ -133,11 +133,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         params: &ExecutionParameters,
         call_type: callstack::ScriptCallType,
     ) -> Result<ExecutionResult, error::Error> {
-        let mut reader = std::io::BufReader::new(file);
-        let mut parser = brush_parser::Parser::new(&mut reader, &self.parser_options());
+        // The text is kept to word a syntax error as bash does.
+        let mut text = String::new();
+        std::io::BufReader::new(file).read_to_string(&mut text)?;
 
         tracing::debug!(target: trace_categories::PARSE, "Parsing sourced file: {}", source_info.source);
-        let parse_result = parser.parse_program();
+        let parse_result = self.parse_string(text.as_str());
 
         let script_positional_args = args.map(Into::into);
 
@@ -156,13 +157,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             );
             frame
                 .shell()
-                .run_parsed_result(parse_result, source_info, params)
+                .run_parsed_result(parse_result, Some(&text), source_info, params)
                 .await
         }
         #[cfg(not(any(target_arch = "wasm32", test)))]
         {
             let result = self
-                .run_parsed_result(parse_result, source_info, params)
+                .run_parsed_result(parse_result, Some(&text), source_info, params)
                 .await;
             self.call_stack.pop();
             result
@@ -182,8 +183,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         source_info: &crate::SourceInfo,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
-        let parse_result = self.parse_string(command);
-        self.run_parsed_result(parse_result, source_info, params)
+        let command: String = command.into();
+        let parse_result = self.parse_string(command.as_str());
+        self.run_parsed_result(parse_result, Some(&command), source_info, params)
             .await
     }
 
@@ -247,20 +249,21 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         Ok(result)
     }
 
+    /// Runs a parsed program, or reports why it did not parse. `source` is the text that was
+    /// parsed, when known, so a syntax error can be worded as bash words it.
     pub(crate) async fn run_parsed_result(
         &mut self,
         parse_result: Result<brush_parser::ast::Program, brush_parser::ParseError>,
+        source: Option<&str>,
         source_info: &crate::SourceInfo,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         // If parsing succeeded, run the program. If there's a parse error, it's fatal (per spec).
         let result = match parse_result {
             Ok(prog) => self.run_program(prog, params).await,
-            Err(parse_err) => Err(error::Error::from(error::ErrorKind::ParseError(
-                parse_err,
-                source_info.clone(),
-            ))
-            .into_fatal()),
+            Err(parse_err) => Err(self
+                .syntax_error(parse_err, source, source_info)
+                .into_fatal()),
         };
 
         // Report any errors.
@@ -275,6 +278,33 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
                 Ok(result)
             }
         }
+    }
+
+    /// A parse error, worded as bash words it when the parsed text is known. Bash names what it
+    /// was parsing: a trap handler as `exit trap`, otherwise the source (`-c`, `eval`, a path).
+    fn syntax_error(
+        &self,
+        error: brush_parser::ParseError,
+        source: Option<&str>,
+        source_info: &crate::SourceInfo,
+    ) -> error::Error {
+        let Some(source) = source else {
+            return error::ErrorKind::ParseError(error, source_info.clone()).into();
+        };
+        let origin = match self
+            .call_stack
+            .current_frame()
+            .map(|frame| &frame.frame_type)
+        {
+            Some(callstack::FrameType::TrapHandler(signal)) => {
+                std::format!("{} trap", signal.to_string().to_lowercase())
+            }
+            // Command strings and the substitutions inside them.
+            _ if matches!(source_info.source.as_str(), "main" | "environment") => "-c".to_owned(),
+            _ => source_info.source.clone(),
+        };
+        let lines = brush_parser::bash_diagnostic(&error, source, &self.parser_options());
+        error::ErrorKind::SyntaxError { origin, lines }.into()
     }
 
     /// Executes the given parsed shell program, returning the resulting exit status.

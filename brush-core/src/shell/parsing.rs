@@ -33,9 +33,13 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
     /// Returns the options that should be used for parsing shell programs; reflects
     /// the current configuration state of the shell and may change over time.
+    ///
+    /// Extended glob syntax always parses: a whole script is parsed before any of it runs, so a
+    /// script that enables `extglob` and then uses it would otherwise fail. Whether a pattern
+    /// matches as an extended glob follows the `extglob` option when it is matched.
     pub const fn parser_options(&self) -> brush_parser::ParserOptions {
         brush_parser::ParserOptions {
-            enable_extended_globbing: self.options.extended_globbing,
+            enable_extended_globbing: true,
             posix_mode: self.options.posix_mode,
             sh_mode: self.options.sh_mode,
             tilde_expansion_at_word_start: true,

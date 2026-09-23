@@ -354,6 +354,7 @@ impl WordField {
         Self(vec![])
     }
 
+    /// The length in characters, not bytes, as in a UTF-8 locale; slicing counts the same way.
     pub fn len(&self) -> usize {
         self.0.iter().fold(0, |acc, piece| acc + piece.len())
     }
@@ -445,8 +446,8 @@ impl ExpansionPiece {
         }
     }
 
-    const fn len(&self) -> usize {
-        self.as_str().len()
+    fn len(&self) -> usize {
+        self.as_str().chars().count()
     }
 
     fn make_unsplittable(self) -> Self {
@@ -797,7 +798,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             let pattern = self
                 .basic_expand_pattern(word)
                 .await?
-                .set_extended_globbing(self.parser_options.enable_extended_globbing);
+                .set_extended_globbing(self.shell.options().extended_globbing);
 
             Ok(Some(pattern))
         } else {
@@ -1055,7 +1056,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
     fn expand_pathnames_in_field(&self, field: WordField) -> Result<Vec<String>, error::Error> {
         let pattern = patterns::Pattern::from(field.clone())
-            .set_extended_globbing(self.parser_options.enable_extended_globbing)
+            .set_extended_globbing(self.shell.options().extended_globbing)
             .set_case_insensitive(self.shell.options().case_insensitive_pathname_expansion);
 
         let options = patterns::FilenameExpansionOptions {
@@ -1240,13 +1241,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 )
             }
             brush_parser::word::TildeExpr::WorkingDir => self.shell.working_dir().to_string_lossy(),
-            brush_parser::word::TildeExpr::OldWorkingDir => {
-                if let Some(old_pwd) = self.shell.env_str("OLDPWD") {
-                    old_pwd
-                } else {
-                    Cow::Borrowed("~-")
-                }
-            }
+            // With OLDPWD unset (declared, as at startup, but given no value), `~-` stays as is.
+            brush_parser::word::TildeExpr::OldWorkingDir => match self.shell.env_str("OLDPWD") {
+                Some(old_pwd) if self.shell.env().is_set("OLDPWD") => old_pwd,
+                _ => Cow::Borrowed("~-"),
+            },
             brush_parser::word::TildeExpr::NthDirFromBottomOfDirStack { n } => {
                 let dir_stack_count = self.shell.directory_stack().len();
 
@@ -1779,7 +1778,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self
                     .basic_expand_pattern(pattern.as_str())
                     .await?
-                    .set_extended_globbing(self.parser_options.enable_extended_globbing)
+                    .set_extended_globbing(self.shell.options().extended_globbing)
                     .set_case_insensitive(self.shell.options().case_insensitive_conditionals);
 
                 // If no replacement was provided, then we replace with an empty string.
@@ -2057,13 +2056,25 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     .expand_array_index(index.as_str(), is_set_assoc_array)
                     .await?;
 
-                // Index into the array.
-                if let Some((_, var)) = self.shell.env().get(name)
-                    && let Ok(Some(value)) = var.value().get_at(index_to_use.as_str(), self.shell)
-                {
-                    Ok(Expansion::from(value.to_string()))
-                } else {
-                    self.undefined_expansion(parameter, allow_unset_vars)
+                // Index into the array. A negative index before the first element is reported, as
+                // bash does, and expands to nothing.
+                let element = self.shell.env().get(name).map(|(_, var)| {
+                    var.value()
+                        .get_at(index_to_use.as_str(), self.shell)
+                        .map(|value| value.map(|value| value.to_string()))
+                });
+                match element {
+                    Some(Ok(Some(value))) => Ok(Expansion::from(value)),
+                    Some(Err(error))
+                        if matches!(error.kind(), error::ErrorKind::ArrayIndexOutOfRange(_)) =>
+                    {
+                        let error: error::Error =
+                            error::ErrorKind::ArrayIndexOutOfRange(name.clone()).into();
+                        let mut stderr = self.params.stderr(self.shell);
+                        let _ = self.shell.display_error(&mut stderr, &error);
+                        Ok(Expansion::from(String::new()))
+                    }
+                    _ => self.undefined_expansion(parameter, allow_unset_vars),
                 }
             }
             brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate } => {
@@ -2262,9 +2273,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::ParameterTransformOp::PromptExpand => {
                 prompt::expand_prompt(self.shell, self.params, s).await
             }
-            brush_parser::word::ParameterTransformOp::CapitalizeInitial => {
-                Ok(to_initial_capitals(s))
-            }
+            brush_parser::word::ParameterTransformOp::CapitalizeInitial => Ok(capitalize_first(s)),
             brush_parser::word::ParameterTransformOp::ExpandEscapeSequences => {
                 let (result, _) =
                     escape::expand_backslash_escapes(s, escape::EscapeExpansionMode::AnsiCQuotes)?;
@@ -2338,23 +2347,12 @@ fn coalesce_expansions(expansions: Vec<Expansion>) -> Expansion {
         })
 }
 
-fn to_initial_capitals(s: &str) -> String {
-    let mut result = String::new();
-    let mut capitalize_next = true;
-
-    for c in s.chars() {
-        if c.is_whitespace() {
-            capitalize_next = true;
-            result.push(c);
-        } else if capitalize_next {
-            result.push_str(c.to_uppercase().to_string().as_str());
-            capitalize_next = false;
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
+/// The string with its first character in upper case, as `${x@u}` gives.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 async fn transform_expansion<F, FReturn>(
@@ -2405,6 +2403,20 @@ fn may_contain_braces_to_expand(s: &str) -> bool {
     }
 
     saw_opening_brace && saw_closing_brace
+}
+
+/// A parameter as bash names it in a diagnostic: `x`, `a[1]`, `$1`, `$@`.
+fn diagnostic_name(parameter: &brush_parser::word::Parameter) -> String {
+    use brush_parser::word::Parameter;
+    match parameter {
+        Parameter::Positional(n) => format!("${n}"),
+        Parameter::Special(special) => format!("${special}"),
+        Parameter::Named(name) => name.clone(),
+        Parameter::NamedWithIndex { name, index } => format!("{name}[{index}]"),
+        Parameter::NamedWithAllIndices { name, concatenate } => {
+            format!("{name}[{}]", if *concatenate { '*' } else { '@' })
+        }
+    }
 }
 
 #[expect(clippy::panic_in_result_fn)]
@@ -2501,23 +2513,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_initial_capitals() {
-        assert_eq!(to_initial_capitals("ab bc cd"), String::from("Ab Bc Cd"));
-        assert_eq!(to_initial_capitals(" a "), String::from(" A "));
-        assert_eq!(to_initial_capitals(""), String::new());
-    }
-}
-
-/// A parameter as bash names it in a diagnostic: `x`, `a[1]`, `$1`, `$@`.
-fn diagnostic_name(parameter: &brush_parser::word::Parameter) -> String {
-    use brush_parser::word::Parameter;
-    match parameter {
-        Parameter::Positional(n) => format!("${n}"),
-        Parameter::Special(special) => format!("${special}"),
-        Parameter::Named(name) => name.clone(),
-        Parameter::NamedWithIndex { name, index } => format!("{name}[{index}]"),
-        Parameter::NamedWithAllIndices { name, concatenate } => {
-            format!("{name}[{}]", if *concatenate { '*' } else { '@' })
-        }
+    fn test_capitalize_first() {
+        assert_eq!(capitalize_first("ab bc cd"), String::from("Ab bc cd"));
+        assert_eq!(capitalize_first(" a "), String::from(" a "));
+        assert_eq!(capitalize_first("é"), String::from("É"));
+        assert_eq!(capitalize_first(""), String::new());
     }
 }

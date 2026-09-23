@@ -475,9 +475,10 @@ async fn apply_binary_predicate(
         // (nocasematch).
         ast::BinaryPredicate::StringExactlyMatchesPattern => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
+            // Bash matches `[[ == ]]` patterns as extended globs whether or not extglob is on.
             let pattern = expansion::basic_expand_pattern(shell, params, right)
                 .await?
-                .set_extended_globbing(shell.options().extended_globbing)
+                .set_extended_globbing(true)
                 .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
             if shell.options().print_commands_and_arguments {
@@ -495,9 +496,10 @@ async fn apply_binary_predicate(
         }
         ast::BinaryPredicate::StringDoesNotExactlyMatchPattern => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
+            // Bash matches `[[ == ]]` patterns as extended globs whether or not extglob is on.
             let pattern = expansion::basic_expand_pattern(shell, params, right)
                 .await?
-                .set_extended_globbing(shell.options().extended_globbing)
+                .set_extended_globbing(true)
                 .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
             if shell.options().print_commands_and_arguments {

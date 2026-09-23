@@ -102,10 +102,11 @@ impl builtins::Command for ShoptCommand {
                 };
 
                 if let Some(option_definition) = option_definition {
-                    if self.set {
-                        option_definition.set(context.shell.options_mut(), true);
-                    } else if self.unset {
-                        option_definition.set(context.shell.options_mut(), false);
+                    if self.set || self.unset {
+                        option_definition.set(context.shell.options_mut(), self.set);
+                        if self.set_o_names_only && option_name == "posix" {
+                            context.shell.sync_posixly_correct()?;
+                        }
                     } else {
                         let option_value = option_definition.get(context.shell.options());
                         if !option_value {

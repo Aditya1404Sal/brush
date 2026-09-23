@@ -117,9 +117,9 @@ pub enum TokenizerError {
     UnterminatedCommandSubstitution,
 
     /// An unterminated arithmetic or other expansion was encountered at the end of the input
-    /// stream.
+    /// stream; it wanted the given closing character.
     #[error("unterminated expansion")]
-    UnterminatedExpansion,
+    UnterminatedExpansion(char),
 
     /// An error occurred decoding UTF-8 characters in the input stream.
     #[error("failed to decode UTF-8 characters")]
@@ -154,7 +154,7 @@ impl TokenizerError {
                 | Self::UnterminatedDoubleQuote(..)
                 | Self::UnterminatedBackquote(..)
                 | Self::UnterminatedCommandSubstitution
-                | Self::UnterminatedExpansion
+                | Self::UnterminatedExpansion(_)
                 | Self::UnterminatedVariable
                 | Self::UnterminatedExtendedGlob(..)
                 | Self::UnterminatedHereDocuments(..)
@@ -679,7 +679,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     state.append_char(self.next_char()?.unwrap());
                 }
                 TokenEndReason::EndOfInput => {
-                    return Err(TokenizerError::UnterminatedExpansion);
+                    return Err(TokenizerError::UnterminatedExpansion(terminating_char));
                 }
                 _ => (),
             }
@@ -1665,7 +1665,7 @@ HERE2
         // so it goes through consume_nested_construct and yields UnterminatedExpansion.
         assert_matches!(
             tokenize_str("$("),
-            Err(TokenizerError::UnterminatedExpansion)
+            Err(TokenizerError::UnterminatedExpansion(_))
         );
     }
 
@@ -1673,7 +1673,7 @@ HERE2
     fn tokenize_unterminated_arithmetic_expansion() {
         assert_matches!(
             tokenize_str("$(("),
-            Err(TokenizerError::UnterminatedExpansion)
+            Err(TokenizerError::UnterminatedExpansion(_))
         );
     }
 
@@ -1681,7 +1681,7 @@ HERE2
     fn tokenize_unterminated_legacy_arithmetic_expansion() {
         assert_matches!(
             tokenize_str("$["),
-            Err(TokenizerError::UnterminatedExpansion)
+            Err(TokenizerError::UnterminatedExpansion(_))
         );
     }
 

@@ -297,10 +297,6 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         // Add in any open files provided.
         shell.open_files.update_from(options.fds.into_iter());
 
-        // TODO(patterns): Without this a script that sets extglob will fail because we
-        // parse the entire script with the same settings.
-        shell.options.extended_globbing = true;
-
         // If requested, seed parameters from environment.
         if !options.do_not_inherit_env {
             wellknownvars::inherit_env_vars(&mut shell)?;
@@ -458,12 +454,28 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         self.loop_depth
     }
 
+    /// Sets `POSIXLY_CORRECT=y` while posix mode is on and unsets it when it goes off, as bash
+    /// does when `set -o posix` changes.
+    pub fn sync_posixly_correct(&mut self) -> Result<(), error::Error> {
+        if self.options.posix_mode {
+            self.env
+                .set_global("POSIXLY_CORRECT", crate::variables::ShellVariable::new("y"))?;
+        } else {
+            self.env.unset("POSIXLY_CORRECT")?;
+        }
+        Ok(())
+    }
+
+    /// The name diagnostics start with: the shell's name (`$0`), as bash uses.
+    pub fn diagnostic_name(&self) -> String {
+        self.current_shell_name()
+            .map_or_else(|| "bash".to_owned(), |n| n.to_string())
+    }
+
     /// The prefix bash puts on a diagnostic: `NAME: line N: ` in a script or command string,
     /// `NAME: ` in an interactive shell, where NAME is `$0`.
     pub fn diagnostic_prefix(&self) -> String {
-        let name = self
-            .current_shell_name()
-            .map_or_else(|| "bash".to_owned(), |n| n.to_string());
+        let name = self.diagnostic_name();
         if self.options.interactive {
             return format!("{name}: ");
         }

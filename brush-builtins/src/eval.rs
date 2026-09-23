@@ -25,7 +25,11 @@ impl builtins::Command for EvalCommand {
             // providing the raw string being eval'd.
             // TODO(source-info): Provide the location of the specific tokens that make up
             // `self.args`.
-            let source_info = context.shell.call_stack().current_pos_as_source_info();
+            let source_info = brush_core::SourceInfo {
+                // Bash names eval'd text `eval` in its diagnostics.
+                source: "eval".to_owned(),
+                ..context.shell.call_stack().current_pos_as_source_info()
+            };
 
             // Return the direct result of running the string; we intentionally
             // pass through the result and honor its requested control flow. eval

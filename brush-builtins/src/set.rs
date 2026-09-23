@@ -367,6 +367,9 @@ impl builtins::Command for SetCommand {
                     .get(option_name.as_str())
             {
                 option_def.set(context.shell.options_mut(), value);
+                if option_name == "posix" {
+                    context.shell.sync_posixly_correct()?;
+                }
             } else {
                 context.report(format_args!("{option_name}: invalid option name"))?;
                 result = ExecutionExitCode::InvalidUsage.into();

@@ -1,6 +1,7 @@
 //! Definition of shell behavior traits and defaults.
 
 use crate::{Shell, error, extensions};
+use std::fmt::Write as _;
 
 /// Trait for static shell extensions. Collects all associated types needed to
 /// instantiate a shell into a single containing struct.
@@ -36,7 +37,16 @@ pub trait ErrorFormatter: Clone + Default + Send + Sync + 'static {
         error: &error::Error,
         shell: &Shell<impl extensions::ShellExtensions>,
     ) -> String {
-        // As bash words it: `NAME: line N: message`.
+        // As bash words it: `NAME: line N: message`, or for a syntax error, one
+        // `NAME: ORIGIN: line N: …` line per diagnostic line.
+        if let error::ErrorKind::SyntaxError { origin, lines } = error.kind() {
+            let name = shell.diagnostic_name();
+            let mut text = String::new();
+            for line in lines {
+                let _ = writeln!(text, "{name}: {origin}: {line}");
+            }
+            return text;
+        }
         std::format!("{}{error:#}\n", shell.diagnostic_prefix())
     }
 }

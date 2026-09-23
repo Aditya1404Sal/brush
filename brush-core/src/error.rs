@@ -204,6 +204,17 @@ pub enum ErrorKind {
     #[error("{1}: {0}")]
     ParseError(crate::parser::ParseError, crate::SourceInfo),
 
+    /// A syntax error in bash's words (see [`brush_parser::bash_diagnostic`]): each line follows
+    /// the `NAME: ORIGIN: ` prefix, where ORIGIN names what was being parsed (`-c`, `eval`, a
+    /// script path, `exit trap`).
+    #[error("{origin}: {}", .lines.join("\n"))]
+    SyntaxError {
+        /// What was being parsed.
+        origin: String,
+        /// The diagnostic lines, without prefix.
+        lines: Vec<String>,
+    },
+
     /// An error occurred while parsing a function body.
     #[error("{0}: {1}")]
     FunctionParseError(String, crate::parser::ParseError),
@@ -375,7 +386,7 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::Unimplemented(..) | ErrorKind::UnimplementedAndTracked(..) => {
                 Self::Unimplemented
             }
-            ErrorKind::ParseError(..) => Self::InvalidUsage,
+            ErrorKind::ParseError(..) | ErrorKind::SyntaxError { .. } => Self::InvalidUsage,
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
@@ -482,9 +493,10 @@ impl Error {
     ) -> results::ExecutionResult {
         let next_control_flow = self.to_control_flow(shell);
         // An unset variable (`set -u`, `${x?}`) ends a non-interactive shell with 127, as in bash;
-        // a subshell ended by it reports 1.
+        // under `set -e`, or in a subshell ended by it, the status is 1.
         let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
             && shell.depth() == 0
+            && !shell.options().exit_on_nonzero_command_exit
             && matches!(
                 self.kind,
                 ErrorKind::ExpandingUnsetVariable(..) | ErrorKind::CheckedExpansionError(..)
