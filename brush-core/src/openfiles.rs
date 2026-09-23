@@ -400,7 +400,10 @@ impl std::io::Read for OpenFile {
             )),
             // The handle is shared behind an `Arc`; read through a shared reference (`&File`
             // and `&PipeReader` both implement `Read`).
-            Self::File(f) => f.as_ref().read(buf),
+            Self::File(f) => f
+                .as_ref()
+                .read(buf)
+                .map_err(|error| directory_read_error(f, error)),
             Self::PipeReader(reader) => reader.as_ref().read(buf),
             Self::PipeWriter(_) => Err(std::io::Error::other(
                 error::ErrorKind::OpenFileNotReadable("pipe writer"),
@@ -408,6 +411,18 @@ impl std::io::Read for OpenFile {
             Self::Stream(s) => s.read(buf),
         }
     }
+}
+
+/// A failed read of a directory, as Linux reports it: WASI says "Bad file descriptor" where
+/// Linux says "Is a directory".
+fn directory_read_error(file: &std::fs::File, error: std::io::Error) -> std::io::Error {
+    #[cfg(any(unix, target_os = "wasi"))]
+    if file.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+        return std::io::Error::from_raw_os_error(libc::EISDIR);
+    }
+    #[cfg(not(any(unix, target_os = "wasi")))]
+    let _ = file;
+    error
 }
 
 impl std::io::Write for OpenFile {
