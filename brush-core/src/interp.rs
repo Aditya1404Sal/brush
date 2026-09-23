@@ -60,9 +60,8 @@ impl ExecutionParameters {
     ///
     /// * `shell` - The shell context.
     pub fn stdin(&self, shell: &Shell<impl extensions::ShellExtensions>) -> OpenFile {
-        self.try_stdin(shell).unwrap_or_else(|| {
-            ioutils::FailingReaderWriter::new("standard input not available").into()
-        })
+        self.try_stdin(shell)
+            .unwrap_or_else(|| ioutils::FailingReaderWriter::new("Bad file descriptor").into())
     }
 
     /// Tries to retrieve the standard input file. Returns `None` if not set.
@@ -83,9 +82,8 @@ impl ExecutionParameters {
     ///
     /// * `shell` - The shell context.
     pub fn stdout(&self, shell: &Shell<impl extensions::ShellExtensions>) -> OpenFile {
-        self.try_stdout(shell).unwrap_or_else(|| {
-            ioutils::FailingReaderWriter::new("standard output not available").into()
-        })
+        self.try_stdout(shell)
+            .unwrap_or_else(|| ioutils::FailingReaderWriter::new("Bad file descriptor").into())
     }
 
     /// Tries to retrieve the standard output file. Returns `None` if not set.
@@ -105,9 +103,8 @@ impl ExecutionParameters {
     ///
     /// * `shell` - The shell context.
     pub fn stderr(&self, shell: &Shell<impl extensions::ShellExtensions>) -> OpenFile {
-        self.try_stderr(shell).unwrap_or_else(|| {
-            ioutils::FailingReaderWriter::new("standard error not available").into()
-        })
+        self.try_stderr(shell)
+            .unwrap_or_else(|| ioutils::FailingReaderWriter::new("Bad file descriptor").into())
     }
 
     /// Tries to retrieve the standard error file. Returns `None` if not set.
@@ -963,6 +960,7 @@ impl Execute for ast::CompoundCommand {
                 Ok(ExecutionResult::from(subshell_result.exit_code))
             }
             Self::ForClause(f) => f.execute(shell, params).await,
+            Self::SelectClause(s) => s.execute(shell, params).await,
             Self::CaseClause(c) => c.execute(shell, params).await,
             Self::IfClause(i) => i.execute(shell, params).await,
             Self::WhileClause(w) => (WhileOrUntil::While, w).execute(shell, params).await,
@@ -1137,6 +1135,161 @@ impl Execute for ast::ForClauseCommand {
         shell.set_last_exit_status(result.exit_code.into());
         Ok(result)
     }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl Execute for ast::SelectClauseCommand {
+    /// As bash runs `select`: the menu and the `PS3` prompt go to standard error, a line read
+    /// from standard input sets `REPLY`, and the variable gets the chosen value (empty for a
+    /// line that names none). An empty line shows the menu again; the end of input ends the
+    /// loop with status 1 after printing a newline.
+    async fn execute(
+        &self,
+        shell: &mut Shell<impl extensions::ShellExtensions>,
+        params: &ExecutionParameters,
+    ) -> Result<ExecutionResult, error::Error> {
+        use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+        let values = if let Some(unexpanded_values) = &self.values {
+            expand_words(shell, params, unexpanded_values).await?
+        } else {
+            shell.current_shell_args().to_vec()
+        };
+        let mut result = ExecutionResult::success();
+        if values.is_empty() {
+            return Ok(result);
+        }
+        let columns = shell
+            .env_str("COLUMNS")
+            .and_then(|columns| columns.parse::<usize>().ok())
+            .filter(|columns| *columns > 0)
+            .unwrap_or(80);
+        let menu = select_menu(&values, columns);
+        let mut show_menu = true;
+        loop {
+            let prompt = shell
+                .env_str("PS3")
+                .map_or_else(|| "#? ".to_owned(), |prompt| prompt.into_owned());
+            let mut stderr = params.stderr(shell);
+            if show_menu {
+                stderr.async_io().write_all(menu.as_bytes()).await?;
+            }
+            stderr.async_io().write_all(prompt.as_bytes()).await?;
+            stderr.async_io().flush().await?;
+
+            // One line, a byte at a time, so later readers see the rest of the input.
+            let mut stdin = params.stdin(shell);
+            let mut line = Vec::new();
+            let mut ended = true;
+            let mut byte = [0];
+            while stdin.async_io().read(&mut byte).await? == 1 {
+                ended = false;
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            if ended {
+                params.stdout(shell).async_io().write_all(b"\n").await?;
+                result = ExecutionResult::general_error();
+                break;
+            }
+            let reply = String::from_utf8_lossy(&line).into_owned();
+            shell.env_mut().update_or_add(
+                "REPLY",
+                ShellValueLiteral::Scalar(reply.clone()),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )?;
+            if reply.is_empty() {
+                show_menu = true;
+                continue;
+            }
+            let chosen = reply
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|choice| values.get(choice.checked_sub(1)?))
+                .cloned()
+                .unwrap_or_default();
+            shell.env_mut().update_or_add(
+                &self.variable_name,
+                ShellValueLiteral::Scalar(chosen),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )?;
+
+            shell.loop_depth += 1;
+            let body_result = self.body.list.execute(shell, params).await;
+            shell.loop_depth -= 1;
+            result = body_result?;
+            if result.is_return_or_exit() {
+                break;
+            }
+            let is_break = result.is_break();
+            result.next_control_flow = result.next_control_flow.try_decrement_loop_levels();
+            if is_break || result.is_continue() {
+                break;
+            }
+            show_menu = false;
+        }
+
+        shell.set_last_exit_status(result.exit_code.into());
+        Ok(result)
+    }
+}
+
+/// The menu `select` shows, laid out as bash lays it out: numbered entries in as many columns as
+/// fit, filled down each column, padded with tabs and spaces.
+fn select_menu(values: &[String], columns: usize) -> String {
+    let count = values.len();
+    let digits = count.to_string().len();
+    let widest = values
+        .iter()
+        .map(|value| value.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Each entry is `N) value`, and columns are two spaces apart.
+    let width = widest + digits + 2 + 2;
+    let mut cols = (columns / width).max(1);
+    let mut rows = count.div_ceil(cols);
+    cols = count.div_ceil(rows);
+    if rows == 1 {
+        rows = cols;
+    }
+    let first_digits = rows.to_string().len();
+    let mut menu = String::new();
+    for row in 0..rows {
+        let mut index = row;
+        let mut position = 0;
+        loop {
+            let digits = if position == 0 { first_digits } else { digits };
+            let entry = std::format!("{:>digits$}) {}", index + 1, values[index]);
+            let length = entry.chars().count();
+            menu.push_str(&entry);
+            index += rows;
+            if index >= count {
+                break;
+            }
+            // bash's `indent`: tabs to each tab stop within reach, then spaces.
+            let (mut from, to) = (position + length, position + width);
+            while from < to {
+                if to / 8 > from / 8 {
+                    menu.push('\t');
+                    from += 8 - from % 8;
+                } else {
+                    menu.push(' ');
+                    from += 1;
+                }
+            }
+            position += width;
+        }
+        menu.push('\n');
+    }
+    menu
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -2034,6 +2187,33 @@ pub(crate) async fn setup_redirect(
             setup_redirect_output_and_error_to(shell, params, &expanded_file_path, *append)?;
         }
 
+        ast::IoRedirect::NamedFd(variable, kind, target) => {
+            // `{fd}>&-` closes the descriptor the variable holds.
+            if matches!(target, ast::IoFileRedirectTarget::Duplicate(word) if word.value == "-") {
+                let fd = shell
+                    .env_str(variable)
+                    .and_then(|value| value.parse::<ShellFd>().ok())
+                    .ok_or_else(|| {
+                        error::ErrorKind::AmbiguousRedirect(format!("{{{variable}}}"))
+                    })?;
+                params.open_files.remove_fd(fd);
+                return Ok(());
+            }
+            // Otherwise the lowest free descriptor from 10 up, as bash allocates.
+            let fd = (10..ShellFd::MAX)
+                .find(|fd| params.try_fd(shell, *fd).is_none())
+                .ok_or(error::ErrorKind::InvalidRedirection)?;
+            let redirect = ast::IoRedirect::File(Some(fd), kind.clone(), target.clone());
+            Box::pin(setup_redirect(shell, params, &redirect)).await?;
+            shell.env_mut().update_or_add(
+                variable,
+                ShellValueLiteral::Scalar(fd.to_string()),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )?;
+        }
+
         ast::IoRedirect::File(specified_fd_num, kind, target) => {
             match target {
                 ast::IoFileRedirectTarget::Filename(f) => {
@@ -2163,6 +2343,8 @@ pub(crate) async fn setup_redirect(
                         false
                     };
 
+                    // `N>&-` closes N; `N>&M-` moves M to N, closing M.
+                    let mut closed_fd = fd_num;
                     if expanded.is_empty() {
                         // Nothing to do
                     } else if expanded.chars().all(|c: char| c.is_ascii_digit()) {
@@ -2176,6 +2358,7 @@ pub(crate) async fn setup_redirect(
                         };
 
                         params.open_files.set_fd(fd_num, target_file);
+                        closed_fd = source_fd_num;
                     } else if fd_num == 1 && !dash {
                         // Special case for compatibility: redirect stdout and stderr to the file
                         // given by `expanded`.
@@ -2187,8 +2370,8 @@ pub(crate) async fn setup_redirect(
                     }
 
                     if dash {
-                        // Close the specified fd. Ignore it if it's not valid.
-                        params.open_files.remove_fd(fd_num);
+                        // Ignore a descriptor that is not open.
+                        params.open_files.remove_fd(closed_fd);
                     }
                 }
 

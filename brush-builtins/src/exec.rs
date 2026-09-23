@@ -61,12 +61,30 @@ impl builtins::Command for ExecCommand {
             return cmd_cmd.execute(context).await;
         }
 
-        // wasm32: there is no execve and no process image to replace. The redirection-only and
-        // subshell forms above need no process and work unchanged; replacing the shell with a
-        // command has no faithful equivalent on this platform, so it is reported, not emulated.
+        // wasm32: there is no execve and no process image to replace. The command runs, and the
+        // shell then ends with its status, as it would once replaced. The EXIT trap does not run:
+        // it belonged to the shell that is gone.
         #[cfg(target_arch = "wasm32")]
         {
-            brush_core::error::unimp("exec of a command is not supported on this platform")
+            if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
+                return brush_core::error::unimp("exec -a, -c and -l");
+            }
+            let command = crate::command::CommandCommand {
+                command_and_args: self.args.clone(),
+                ..Default::default()
+            };
+            let shell = context.shell;
+            let inner = brush_core::ExecutionContext {
+                shell: &mut *shell,
+                command_name: context.command_name,
+                params: context.params,
+            };
+            let mut result = command.execute(inner).await?;
+            shell
+                .traps_mut()
+                .remove_handlers(brush_core::traps::TrapSignal::Exit);
+            result.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
+            Ok(result)
         }
 
         #[cfg(unix)]

@@ -36,6 +36,22 @@ impl PathCache {
         self.cache.insert(name.into(), path);
     }
 
+    /// Returns whether the cache holds no paths.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// Returns the cached names and their paths, sorted by name.
+    pub fn entries(&self) -> Vec<(&str, &std::path::Path)> {
+        let mut entries: Vec<_> = self
+            .cache
+            .iter()
+            .map(|(name, path)| (name.as_str(), path.as_path()))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
     /// Projects the cache into a shell value.
     pub fn to_value(&self) -> Result<variables::ShellValue, error::Error> {
         let pairs = self

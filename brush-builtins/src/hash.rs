@@ -92,6 +92,18 @@ impl builtins::Command for HashCommand {
                     .program_location_cache_mut()
                     .set(name, path.clone());
             }
+        } else if self.names.is_empty() {
+            // With no names, bash lists the table. Its hit counts start at zero here: commands
+            // hashed without being run from a path have none.
+            let cache = context.shell.program_location_cache();
+            if cache.is_empty() {
+                writeln!(context.stdout(), "hash: hash table empty")?;
+            } else {
+                writeln!(context.stdout(), "hits\tcommand")?;
+                for (_, path) in cache.entries() {
+                    writeln!(context.stdout(), "   0\t{}", path.display())?;
+                }
+            }
         } else {
             for name in &self.names {
                 // Remove from the cache if already hashed.

@@ -1,8 +1,6 @@
 use clap::Parser;
 
-use brush_core::{
-    ErrorKind, ExecutionExitCode, ExecutionParameters, ExecutionResult, Shell, builtins, tests,
-};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins, tests};
 
 /// Evaluate test expression.
 #[derive(Parser)]
@@ -47,7 +45,11 @@ impl builtins::Command for TestCommand {
             args = &args[0..args.len() - 1];
         }
 
-        if execute_test(context.shell, &context.params, args)? {
+        let Ok(test_command) = brush_parser::test_command::parse(args) else {
+            context.report(syntax_error(args))?;
+            return Ok(ExecutionExitCode::InvalidUsage.into());
+        };
+        if tests::eval_expr(&test_command, context.shell, &context.params)? {
             Ok(ExecutionResult::success())
         } else {
             Ok(ExecutionResult::general_error())
@@ -55,12 +57,12 @@ impl builtins::Command for TestCommand {
     }
 }
 
-fn execute_test(
-    shell: &mut Shell<impl brush_core::ShellExtensions>,
-    params: &ExecutionParameters,
-    args: &[String],
-) -> Result<bool, brush_core::Error> {
-    let test_command =
-        brush_parser::test_command::parse(args).map_err(ErrorKind::TestCommandParseError)?;
-    tests::eval_expr(&test_command, shell, params)
+/// Why `test` could not read its arguments, as bash words it: with two arguments the first must
+/// be a unary operator, with three the second must be a binary operator.
+fn syntax_error(args: &[String]) -> String {
+    match args {
+        [first, _] => std::format!("{first}: unary operator expected"),
+        [_, second, _] => std::format!("{second}: binary operator expected"),
+        _ => "too many arguments".to_owned(),
+    }
 }

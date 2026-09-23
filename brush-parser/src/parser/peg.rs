@@ -100,6 +100,7 @@ peg::parser! {
             b:brace_group() { ast::CompoundCommand::BraceGroup(b) } /
             s:subshell() { ast::CompoundCommand::Subshell(s) } /
             f:for_clause() { ast::CompoundCommand::ForClause(f) } /
+            non_posix_extensions_enabled() s:select_clause() { ast::CompoundCommand::SelectClause(s) } /
             c:case_clause() { ast::CompoundCommand::CaseClause(c) } /
             i:if_clause() { ast::CompoundCommand::IfClause(i) } /
             w:while_clause() { ast::CompoundCommand::WhileClause(w) } /
@@ -132,7 +133,8 @@ peg::parser! {
         // TODO(arithmetic): evaluate arithmetic end; the semicolon is used in arithmetic for loops.
         rule arithmetic_end() -> () =
             specific_operator(")") specific_operator(")") {} /
-            specific_operator(";") {}
+            specific_operator(";") {} /
+            specific_operator(";;") {}
 
         rule subshell() -> ast::SubshellCommand =
             start:specific_operator("(") list:compound_list() end:specific_operator(")") {
@@ -173,20 +175,42 @@ peg::parser! {
                 ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
             }
 
+        // N.B. select is a non-sh extension; its grammar is the for loop's.
+        rule select_clause() -> ast::SelectClauseCommand =
+            s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:do_group() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: w, body: d, loc }
+            } /
+            s:specific_word("select") n:name() sequential_sep()? d:do_group() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            }
+
         // N.B. The arithmetic for loop is a non-sh extension.
         rule arithmetic_for_clause() -> ast::ArithmeticForClauseCommand =
             s:specific_word("for")
             specific_operator("(") specific_operator("(")
-                initializer:arithmetic_expression()? specific_operator(";")
-                condition:arithmetic_expression()? specific_operator(";")
-                updater:arithmetic_expression()?
+                clauses:arithmetic_for_clauses()
             specific_operator(")") specific_operator(")")
             body:arithmetic_for_body() {
+                let (initializer, condition, updater) = clauses;
                 let start = s.location();
                 let end = &body.loc;
                 let loc = SourceSpan::within(start, end);
                 ast::ArithmeticForClauseCommand { initializer, condition, updater, body, loc }
             }
+
+        // An empty condition leaves `;;`, which reads as one operator (a case terminator).
+        rule arithmetic_for_clauses() -> (
+            Option<ast::UnexpandedArithmeticExpr>,
+            Option<ast::UnexpandedArithmeticExpr>,
+            Option<ast::UnexpandedArithmeticExpr>,
+        ) =
+            initializer:arithmetic_expression()? specific_operator(";")
+                condition:arithmetic_expression()? specific_operator(";")
+                updater:arithmetic_expression()? { (initializer, condition, updater) } /
+            initializer:arithmetic_expression()? specific_operator(";;")
+                updater:arithmetic_expression()? { (initializer, None, updater) }
 
         rule arithmetic_for_body() -> ast::DoGroupCommand =
             sequential_sep()? body:do_group() { body } /
@@ -525,6 +549,10 @@ peg::parser! {
 
         // N.B. here strings are extensions to the POSIX standard.
         rule io_redirect() -> ast::IoRedirect =
+            non_posix_extensions_enabled() v:io_variable() f:io_file() {
+                    let (kind, target) = f;
+                    ast::IoRedirect::NamedFd(v, kind, target)
+                } /
             n:io_number()? f:io_file() {
                     let (kind, target) = f;
                     ast::IoRedirect::File(n, kind, target)
@@ -692,6 +720,16 @@ peg::parser! {
 
         // N.B. An I/O number must be a string of only digits, and it must be
         // followed by a '<' or '>' character (but not consume them). We also
+        // `{name}` directly before a redirection operator names a variable to hold the
+        // descriptor the shell allocates.
+        rule io_variable() -> String =
+            [Token::Word(w, loc) if braced_name(w).is_some()]
+            &([Token::Operator(o, redir_loc) if
+                    o.starts_with(['<', '>']) &&
+                    locations_are_contiguous(loc, redir_loc)]) {?
+                braced_name(w).map(str::to_owned).ok_or("io variable")
+            }
+
         // need to make sure that there was no space between the number and the
         // redirection operator; unfortunately we don't have the space anymore
         // but we can infer it by looking at the tokens' locations.
@@ -824,4 +862,15 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
 
         result
     }
+}
+
+/// The variable name in `{name}`: a letter or underscore, then letters, digits and underscores.
+fn braced_name(word: &str) -> Option<&str> {
+    let name = word.strip_prefix('{')?.strip_suffix('}')?;
+    let mut chars = name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(name)
 }

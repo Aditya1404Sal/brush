@@ -280,7 +280,7 @@ pub enum ErrorKind {
     TimeError(#[from] std::time::SystemTimeError),
 
     /// A `test` operand that must be an integer is not one.
-    #[error("{0}: integer expression expected")]
+    #[error("{0}: integer expected")]
     IntegerExpressionExpected(String),
 
     /// Array index out of range.

@@ -427,6 +427,9 @@ pub enum CompoundCommand {
     Subshell(SubshellCommand),
     /// A for clause, which loops over a set of values.
     ForClause(ForClauseCommand),
+    /// A select clause, which offers a numbered menu of values and runs a command with the one
+    /// chosen.
+    SelectClause(SelectClauseCommand),
     /// A case clause, which selects a command based on a value and a set of
     /// pattern-based filters.
     CaseClause(CaseClauseCommand),
@@ -452,6 +455,7 @@ impl SourceLocation for CompoundCommand {
             Self::BraceGroup(b) => b.location(),
             Self::Subshell(s) => s.location(),
             Self::ForClause(f) => f.location(),
+            Self::SelectClause(s) => s.location(),
             Self::CaseClause(c) => c.location(),
             Self::IfClause(i) => i.location(),
             Self::WhileClause(w) => w.location(),
@@ -474,6 +478,7 @@ impl Display for CompoundCommand {
             }
             Self::Subshell(subshell_command) => write!(f, "{subshell_command}"),
             Self::ForClause(for_clause_command) => write!(f, "{for_clause_command}"),
+            Self::SelectClause(select_clause_command) => write!(f, "{select_clause_command}"),
             Self::CaseClause(case_clause_command) => {
                 write!(f, "{case_clause_command}")
             }
@@ -594,6 +599,52 @@ impl Display for ForClauseCommand {
 
         writeln!(f, ";")?;
 
+        write!(f, "{}", self.body)
+    }
+}
+
+/// A select clause, which offers a numbered menu of values and runs a command with the one
+/// chosen.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(
+    any(test, feature = "serde"),
+    derive(PartialEq, Eq, serde::Serialize, serde::Deserialize)
+)]
+pub struct SelectClauseCommand {
+    /// The name of the variable set to the chosen value.
+    pub variable_name: String,
+    /// The values offered; the positional parameters when absent.
+    pub values: Option<Vec<Word>>,
+    /// The command to run for each choice.
+    pub body: DoGroupCommand,
+    /// Location of the select command.
+    pub loc: SourceSpan,
+}
+
+impl Node for SelectClauseCommand {}
+
+impl SourceLocation for SelectClauseCommand {
+    fn location(&self) -> Option<SourceSpan> {
+        Some(self.loc.clone())
+    }
+}
+
+impl Display for SelectClauseCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "select {} in ", self.variable_name)?;
+        if let Some(values) = &self.values {
+            write!(
+                f,
+                "{}",
+                values
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )?;
+        }
+        writeln!(f, ";")?;
         write!(f, "{}", self.body)
     }
 }
@@ -1545,6 +1596,9 @@ pub enum IoRedirect {
     HereString(Option<IoFd>, Word),
     /// Redirection of both standard output and standard error (with optional append).
     OutputAndError(Word, bool),
+    /// Redirection to or from a file through a descriptor the shell allocates and stores in the
+    /// named variable (`{fd}>file`); `{fd}>&-` closes the descriptor the variable holds.
+    NamedFd(String, IoFileRedirectKind, IoFileRedirectTarget),
 }
 
 impl Node for IoRedirect {}
@@ -1565,6 +1619,9 @@ impl Display for IoRedirect {
                 }
 
                 write!(f, "{kind} {target}")?;
+            }
+            Self::NamedFd(variable, kind, target) => {
+                write!(f, "{{{variable}}}{kind} {target}")?;
             }
             Self::OutputAndError(target, append) => {
                 write!(f, "&>")?;

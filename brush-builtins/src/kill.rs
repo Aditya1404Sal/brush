@@ -140,7 +140,8 @@ fn signal_target<SE: brush_core::ShellExtensions>(
                 job.kill(signal)?;
             }
         } else {
-            writeln!(stderr, "{command_name}: {target}: no such job")?;
+            let prefix = shell.diagnostic_prefix();
+            writeln!(stderr, "{prefix}{command_name}: {target}: no such job")?;
             return Ok(Some(ExecutionResult::general_error()));
         }
     } else {
@@ -179,7 +180,8 @@ fn signal_target<SE: brush_core::ShellExtensions>(
             .and_then(|job| job.leader())
             .filter(|pid| process::process_exists(&table, *pid));
         let Some(leader) = leader else {
-            writeln!(stderr, "{command_name}: {target}: no such job")?;
+            let prefix = shell.diagnostic_prefix();
+            writeln!(stderr, "{prefix}{command_name}: {target}: no such job")?;
             return Ok(Some(ExecutionResult::general_error()));
         };
         if !probe_only {
@@ -233,7 +235,7 @@ fn print_signals(
                     writeln!(context.stdout(), "{s}")?;
                 }
                 Err(e) => {
-                    writeln!(context.stderr(), "{e}")?;
+                    context.report(format_args!("{e}"))?;
                     exit_code = ExecutionResult::general_error();
                 }
             }
