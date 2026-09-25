@@ -51,6 +51,7 @@ pub(crate) struct HistoryCommand {
 struct HistoryConfig {
     default_history_file_path: Option<PathBuf>,
     time_format: Option<String>,
+    diagnostic_prefix: String,
 }
 
 impl builtins::Command for HistoryCommand {
@@ -60,10 +61,13 @@ impl builtins::Command for HistoryCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
-        // Retrieve the shell's history config while we still can.
+        // Retrieve the shell's history config -- and the diagnostic prefix a numeric-argument
+        // error needs -- while `context.shell` is still borrowed immutably; `history_mut()`
+        // right below needs it mutably.
         let config = HistoryConfig {
             default_history_file_path: context.shell.history_file_path(),
             time_format: context.shell.history_time_format(),
+            diagnostic_prefix: context.shell.diagnostic_prefix(),
         };
 
         let stdout = context.stdout();
@@ -181,7 +185,13 @@ impl HistoryCommand {
         }
 
         if let Some(args) = &self.expand_args {
-            return expand_and_print(args, history, &mut stdout, &mut stderr);
+            return expand_and_print(
+                args,
+                history,
+                &config.diagnostic_prefix,
+                &mut stdout,
+                &mut stderr,
+            );
         }
 
         if let Some(args) = &self.append_args_to_session {
@@ -190,7 +200,7 @@ impl HistoryCommand {
         }
 
         let max_entries: Option<usize> = if let Some(arg) = self.args.first() {
-            match parse_count_arg(arg, &mut stderr)? {
+            match parse_count_arg(arg, &config.diagnostic_prefix, &mut stderr)? {
                 Ok(value) => Some(value),
                 Err(result) => return Ok(result),
             }
@@ -239,25 +249,32 @@ fn display_history(
 }
 
 /// Parses `history`'s own trailing `N` argument (how many recent entries to show); on failure,
-/// writes bash's own wording for it and returns the exit code to report instead.
+/// writes bash's own wording for it (with its usual `NAME: line N: ` diagnostic prefix) and
+/// returns the exit code to report instead.
 fn parse_count_arg(
     arg: &str,
+    diagnostic_prefix: &str,
     mut stderr: impl Write,
 ) -> Result<Result<usize, ExecutionResult>, brush_core::Error> {
     if let Ok(value) = arg.parse::<usize>() {
         Ok(Ok(value))
     } else {
-        writeln!(stderr, "{arg}: numeric argument required")?;
+        writeln!(
+            stderr,
+            "{diagnostic_prefix}history: {arg}: numeric argument required"
+        )?;
         Ok(Err(ExecutionExitCode::InvalidUsage.into()))
     }
 }
 
 /// Implements `history -p`: expands each argument's `!`-event designators and prints the
-/// result, or reports "event not found" for one that doesn't resolve -- matching bash's own
-/// per-argument handling (one bad reference doesn't stop the rest from being printed).
+/// result, or reports bash's own "history expansion failed" wording for one that doesn't
+/// resolve -- matching bash's own per-argument handling (one bad reference doesn't stop the
+/// rest from being printed).
 fn expand_and_print(
     args: &[String],
     history: &history::History,
+    diagnostic_prefix: &str,
     mut stdout: impl Write,
     mut stderr: impl Write,
 ) -> Result<ExecutionResult, brush_core::Error> {
@@ -266,7 +283,10 @@ fn expand_and_print(
         match expand_history_references(arg, history) {
             Ok(expanded) => writeln!(stdout, "{expanded}")?,
             Err(event) => {
-                writeln!(stderr, "history: {event}: event not found")?;
+                writeln!(
+                    stderr,
+                    "{diagnostic_prefix}history: {event}: history expansion failed"
+                )?;
                 failed = true;
             }
         }
@@ -346,7 +366,7 @@ fn most_recent_matching(
 }
 
 /// Applies bash's `!`-event designators to `text` and returns the expanded result, or the
-/// unresolved token (for an "event not found" diagnostic) if one doesn't match anything.
+/// unresolved token (for a "history expansion failed" diagnostic) if one doesn't match anything.
 ///
 /// Covers the designators bash documents as selecting an event: `!!` (the previous command),
 /// `!N` (absolute item N), `!-N` (N items back), `!string` (the most recent item starting with
