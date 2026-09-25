@@ -7,7 +7,8 @@ use brush_core::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, built
 #[derive(Parser)]
 pub(crate) struct ReturnCommand {
     /// The exit code to return.
-    code: Option<i32>,
+    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+    code: Vec<String>,
 }
 
 impl builtins::Command for ReturnCommand {
@@ -17,18 +18,21 @@ impl builtins::Command for ReturnCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        #[expect(clippy::cast_sign_loss)]
-        let code_8bit = if let Some(code_32bit) = &self.code {
-            (code_32bit & 0xFF) as u8
-        } else {
-            context.shell.last_exit_status()
-        };
-
         if context.shell.in_function() || context.shell.in_sourced_script() {
+            let code_8bit = match crate::exit::status_operand(&context, &self.code)? {
+                crate::exit::StatusOperand::Status(code) => code,
+                crate::exit::StatusOperand::None => context.shell.last_exit_status(),
+                crate::exit::StatusOperand::NotANumber => 2,
+                // As in bash, more than one operand ends the shell, with status 1.
+                crate::exit::StatusOperand::TooMany => {
+                    let mut result = ExecutionResult::new(1);
+                    result.next_control_flow = ExecutionControlFlow::ExitShell;
+                    return Ok(result);
+                }
+            };
             context.shell.note_status_before_return();
             let mut result = ExecutionResult::new(code_8bit);
             result.next_control_flow = ExecutionControlFlow::ReturnFromFunctionOrScript;
-
             Ok(result)
         } else {
             let _ = writeln!(

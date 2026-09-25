@@ -27,8 +27,11 @@ pub(crate) struct CdCommand {
 
     /// By default it is the value of the HOME shell variable. If `TARGET_DIR` is "-", it is
     /// converted to $OLDPWD.
-    #[arg(allow_hyphen_values = true)]
     target_dir: Option<String>,
+
+    /// Operands after the first, which bash refuses.
+    #[arg(hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for CdCommand {
@@ -41,6 +44,11 @@ impl builtins::Command for CdCommand {
         // TODO(cd): implement 'cd -@'
         if self.file_with_xattr_as_dir {
             return error::unimp("cd -@");
+        }
+
+        if !self.extra.is_empty() {
+            context.report("too many arguments")?;
+            return Ok(ExecutionResult::new(2));
         }
 
         let mut should_print = false;

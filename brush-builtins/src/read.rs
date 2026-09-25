@@ -5,7 +5,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-use brush_core::{ErrorKind, builtins, env, error, variables};
+use brush_core::{builtins, env, error, variables};
 
 #[cfg(target_arch = "wasm32")]
 use futures::{
@@ -56,12 +56,12 @@ pub(crate) struct ReadCommand {
 
     /// Read only the first N characters or until a specified
     /// delimiter is reached, whichever happens first.
-    #[clap(short = 'n', value_name = "COUNT")]
-    return_after_n_chars: Option<usize>,
+    #[clap(short = 'n', value_name = "COUNT", value_parser = parse_count)]
+    return_after_n_chars: Option<Count>,
 
     /// Read exactly N characters, ignoring any specified delimiter.
-    #[clap(short = 'N', value_name = "COUNT")]
-    return_after_n_chars_no_delimiter: Option<usize>,
+    #[clap(short = 'N', value_name = "COUNT", value_parser = parse_count)]
+    return_after_n_chars_no_delimiter: Option<Count>,
 
     /// Prompt to display before reading.
     #[clap(short = 'p')]
@@ -102,6 +102,20 @@ impl builtins::Command for ReadCommand {
             return error::unimp("read -i");
         }
 
+        // A count that is not a number fails, in bash's words.
+        for count in [
+            &self.return_after_n_chars,
+            &self.return_after_n_chars_no_delimiter,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Count::Invalid(text) = count {
+                context.report(format_args!("{text}: invalid number"))?;
+                return Ok(brush_core::ExecutionResult::general_error());
+            }
+        }
+
         // Validate timeout value if provided.
         if let Some(result) = self.validate_timeout(&context).await? {
             return Ok(result);
@@ -114,9 +128,12 @@ impl builtins::Command for ReadCommand {
         );
 
         // Retrieve the file.
-        let input_stream = context
-            .try_fd(fd_num)
-            .ok_or_else(|| ErrorKind::BadFileDescriptor(fd_num))?;
+        let Some(input_stream) = context.try_fd(fd_num) else {
+            context.report(format_args!(
+                "{fd_num}: invalid file descriptor: Bad file descriptor"
+            ))?;
+            return Ok(brush_core::ExecutionResult::general_error());
+        };
 
         // Retrieve effective value of IFS for splitting.
         // We convert to owned String to release the borrow before the mutable borrow
@@ -168,6 +185,33 @@ impl builtins::Command for ReadCommand {
 
         Ok(result)
     }
+}
+
+/// A character count given to `-n` or `-N`, kept when it is not a number so that `read` can
+/// report it as bash does.
+#[derive(Clone, Debug)]
+enum Count {
+    Valid(usize),
+    Invalid(String),
+}
+
+impl Count {
+    const fn value(&self) -> Option<usize> {
+        match self {
+            Self::Valid(count) => Some(*count),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "clap value parsers return a Result"
+)]
+fn parse_count(text: &str) -> Result<Count, std::convert::Infallible> {
+    Ok(text
+        .parse()
+        .map_or_else(|_| Count::Invalid(text.to_owned()), Count::Valid))
 }
 
 /// Assigns read input to shell variables based on the specified options.
@@ -721,7 +765,9 @@ impl ReadCommand {
 
         let char_limit = self
             .return_after_n_chars_no_delimiter
-            .or(self.return_after_n_chars);
+            .as_ref()
+            .or(self.return_after_n_chars.as_ref())
+            .and_then(Count::value);
 
         let terminal = input_file.is_terminal();
 
