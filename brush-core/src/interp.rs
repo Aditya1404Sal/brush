@@ -1229,8 +1229,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 // `(( ))`, `[[ ]]` and `( )` are commands in their own right: they become
                 // BASH_COMMAND, and the DEBUG trap runs before `(( ))` and `[[ ]]`, as in bash.
                 let text = match compound {
+                    // The expression as written, blanks and all (`((  1  ))`).
                     ast::CompoundCommand::Arithmetic(arithmetic) => {
-                        Some((format!("(( {} ))", arithmetic.expr.value), true))
+                        Some((arithmetic.to_string(), true))
                     }
                     ast::CompoundCommand::ExtendedTest(test) => {
                         Some((format!("[[ {test} ]]"), true))
