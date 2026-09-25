@@ -13,6 +13,7 @@ pub mod arithmetic;
 mod braceexpansion;
 pub mod builtins;
 pub mod callstack;
+pub mod casemap;
 pub mod commands;
 pub mod completion;
 pub mod env;

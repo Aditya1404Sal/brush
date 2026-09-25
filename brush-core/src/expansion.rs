@@ -1952,7 +1952,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| c.to_uppercase())
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| {
+                        std::iter::once(crate::casemap::to_upper(c))
+                    })
                 })
                 .await
             }
@@ -1965,9 +1967,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_string(s.as_str(), expanded_pattern.as_ref(), |str| {
-                        str.to_uppercase()
-                    })
+                    Self::pattern_to_string(
+                        s.as_str(),
+                        expanded_pattern.as_ref(),
+                        crate::casemap::upper,
+                    )
                 })
                 .await
             }
@@ -1980,7 +1984,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| c.to_lowercase())
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| {
+                        std::iter::once(crate::casemap::to_lower(c))
+                    })
                 })
                 .await
             }
@@ -1993,9 +1999,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_string(s.as_str(), expanded_pattern.as_ref(), |str| {
-                        str.to_lowercase()
-                    })
+                    Self::pattern_to_string(
+                        s.as_str(),
+                        expanded_pattern.as_ref(),
+                        crate::casemap::lower,
+                    )
                 })
                 .await
             }
@@ -2109,7 +2117,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), toggle_char_case)
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| {
+                        std::iter::once(crate::casemap::toggle(c))
+                    })
                 })
                 .await
             }
@@ -2122,9 +2132,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_string(s.as_str(), expanded_pattern.as_ref(), |str| {
-                        str.chars().flat_map(toggle_char_case).collect()
-                    })
+                    Self::pattern_to_string(
+                        s.as_str(),
+                        expanded_pattern.as_ref(),
+                        crate::casemap::toggled,
+                    )
                 })
                 .await
             }
@@ -2651,8 +2663,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     Ok(escape::force_quote(s, escape::QuoteMode::SingleQuote))
                 }
             }
-            brush_parser::word::ParameterTransformOp::ToLowerCase => Ok(s.to_lowercase()),
-            brush_parser::word::ParameterTransformOp::ToUpperCase => Ok(s.to_uppercase()),
+            brush_parser::word::ParameterTransformOp::ToLowerCase => Ok(crate::casemap::lower(s)),
+            brush_parser::word::ParameterTransformOp::ToUpperCase => Ok(crate::casemap::upper(s)),
             brush_parser::word::ParameterTransformOp::ToAssignmentLogic
             | brush_parser::word::ParameterTransformOp::ToAttributeFlags => {
                 unreachable!("covered in caller")
@@ -2738,18 +2750,6 @@ fn element_list(values: impl IntoIterator<Item = String>, concatenate: bool) -> 
     }
 }
 
-/// The character with its case toggled (`${v~}`, `${v~~}`).
-fn toggle_char_case(c: char) -> std::vec::IntoIter<char> {
-    let toggled: Vec<char> = if c.is_uppercase() {
-        c.to_lowercase().collect()
-    } else if c.is_lowercase() {
-        c.to_uppercase().collect()
-    } else {
-        vec![c]
-    };
-    toggled.into_iter()
-}
-
 fn coalesce_expansions(expansions: Vec<Expansion>) -> Expansion {
     expansions
         .into_iter()
@@ -2778,7 +2778,9 @@ fn coalesce_expansions(expansions: Vec<Expansion>) -> Expansion {
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     chars.next().map_or_else(String::new, |first| {
-        first.to_uppercase().chain(chars).collect()
+        std::iter::once(crate::casemap::to_upper(first))
+            .chain(chars)
+            .collect()
     })
 }
 

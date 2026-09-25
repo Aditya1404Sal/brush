@@ -479,14 +479,18 @@ impl ShellVariable {
         } else {
             match update_transform {
                 ShellVariableUpdateTransform::None => (),
-                ShellVariableUpdateTransform::Lowercase => *s = (*s).to_lowercase(),
-                ShellVariableUpdateTransform::Uppercase => *s = (*s).to_uppercase(),
+                // One character for one, as bash converts (see `casemap`).
+                ShellVariableUpdateTransform::Lowercase => *s = crate::casemap::lower(s),
+                ShellVariableUpdateTransform::Uppercase => *s = crate::casemap::upper(s),
                 ShellVariableUpdateTransform::Capitalize => {
                     // This isn't really title-case; only the first character is capitalized.
-                    *s = s.to_lowercase();
-                    if let Some(c) = s.chars().next() {
-                        s.replace_range(0..1, &c.to_uppercase().to_string());
-                    }
+                    let mut chars = s.chars();
+                    *s = chars
+                        .next()
+                        .map(crate::casemap::to_upper)
+                        .into_iter()
+                        .chain(chars.map(crate::casemap::to_lower))
+                        .collect();
                 }
             }
         }
