@@ -263,7 +263,7 @@ impl Execute for ast::CompoundList {
 
             if run_async {
                 #[cfg(target_arch = "wasm32")]
-                if shell.processes().running_jobs() >= jobs::MAX_RUNNING_JOBS {
+                if !job_slot_available(shell).await {
                     writeln!(
                         params.stderr(shell),
                         "bash: fork: retry: Resource temporarily unavailable"
@@ -387,6 +387,25 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         leader,
         pids,
     ))
+}
+
+/// Turns the jobs already started get to finish before the job cap refuses another one.
+#[cfg(target_arch = "wasm32")]
+const JOB_SLOT_TURNS: usize = 64;
+
+/// Whether another background job may start: fewer than [`jobs::MAX_RUNNING_JOBS`] run in the
+/// whole session. Starting a job does not run it, so a tight `&` loop reaches the cap with jobs
+/// that have not had a turn yet; they get a few turns to finish before the cap refuses a job.
+#[cfg(target_arch = "wasm32")]
+async fn job_slot_available(shell: &Shell<impl extensions::ShellExtensions>) -> bool {
+    let services = shell.execution_services();
+    for _ in 0..JOB_SLOT_TURNS {
+        if shell.processes().running_jobs() < jobs::MAX_RUNNING_JOBS {
+            return true;
+        }
+        (services.yield_now)().await;
+    }
+    shell.processes().running_jobs() < jobs::MAX_RUNNING_JOBS
 }
 
 /// The body of a background list that is exactly one plain `( list )`.
