@@ -2200,7 +2200,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
-        let mut redirect_failed = false;
+        let mut redirects = vec![];
         let mut alias_follows = false;
 
         // `set -x` traces a simple command to the standard error it had before its own
@@ -2218,43 +2218,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
             params.install_word_process_substitutions();
             match item {
-                CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
-                    // Bash expands a here-document or here-string given to a program it runs in
-                    // a child process there, so the expansion's side effects are lost.
-                    let result = if matches!(
-                        redirect,
-                        ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
-                    ) && runs_as_process(&context.shell, &args)
-                    {
-                        let mut child = Shell::clone(&context.shell);
-                        setup_redirect(&mut child, &mut params, redirect).await
-                    } else {
-                        setup_redirect(&mut context.shell, &mut params, redirect).await
-                    };
-                    if let Err(e) = result {
-                        // An expansion error that ends the shell (a bad substitution in a
-                        // file name) or abandons the top-level command (failglob) still does, as
-                        // in bash; in a here-document or here-string, or any other failed
-                        // redirection, it fails the command.
-                        if (e.is_fatal() || e.abandons_command())
-                            && !matches!(
-                                redirect,
-                                ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
-                            )
-                        {
-                            return Err(e);
-                        }
-                        let _ = context
-                            .shell
-                            .display_error(&mut params.stderr(&context.shell), &e);
-                        // Without a command, the assignments still take effect, as in bash.
-                        if self.word_or_name.is_none() {
-                            redirect_failed = true;
-                            continue;
-                        }
-                        return Ok(ExecutionResult::general_error().into());
-                    }
-                }
+                // Bash expands the command's words first, then its assignments, and makes its
+                // redirections last.
+                CommandPrefixOrSuffixItem::IoRedirect(redirect) => redirects.push(redirect),
                 CommandPrefixOrSuffixItem::ProcessSubstitution(kind, subshell_command) => {
                     let (installed_fd_num, substitution_file) =
                         setup_process_substitution(&context.shell, &params, kind, subshell_command)
@@ -2401,6 +2367,8 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 cmd_name,
                 &assignments,
                 &args,
+                &redirects,
+                &mut stderr,
             )
             .await;
             #[cfg(target_arch = "wasm32")]
@@ -2446,6 +2414,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // argument".
             context.shell.update_last_arg_variable(None);
 
+            // Then the redirections; one that fails fails the statement, but the assignments
+            // still took effect, as in bash.
+            let redirect_failed =
+                !setup_command_redirects(&mut context.shell, &mut params, &redirects, &args)
+                    .await?;
             if redirect_failed {
                 context.shell.set_last_exit_status(1);
                 return Ok(ExecutionResult::general_error().into());
@@ -2465,6 +2438,45 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             Ok(ExecutionResult::new(context.shell.last_exit_status()).into())
         }
     }
+}
+
+/// Sets up a simple command's redirections, which bash makes after it expands the command's
+/// words and assignments. Returns whether they all succeeded: one that fails is reported and
+/// fails the command, unless it ends the shell or abandons the top-level command.
+async fn setup_command_redirects(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
+    redirects: &[&ast::IoRedirect],
+    args: &[CommandArg],
+) -> Result<bool, error::Error> {
+    for redirect in redirects {
+        params.install_word_process_substitutions();
+        let here = matches!(
+            redirect,
+            ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
+        );
+        // Bash expands a here-document or here-string given to a program it runs in a child
+        // process there, so the expansion's side effects are lost.
+        let result = if here && runs_as_process(shell, args) {
+            let mut child = Shell::clone(shell);
+            setup_redirect(&mut child, params, redirect).await
+        } else {
+            setup_redirect(shell, params, redirect).await
+        };
+        if let Err(error) = result {
+            // An expansion error that ends the shell (a bad substitution in a file name) or
+            // abandons the top-level command (failglob) still does, as in bash; in a
+            // here-document or here-string, or any other failed redirection, it fails the
+            // command.
+            if (error.is_fatal() || error.abandons_command()) && !here {
+                return Err(error);
+            }
+            let _ = shell.display_error(&mut params.stderr(shell), &error);
+            return Ok(false);
+        }
+    }
+    params.install_word_process_substitutions();
+    Ok(true)
 }
 
 /// What happens before a simple command's words are expanded: its text becomes `BASH_COMMAND`
@@ -2530,13 +2542,19 @@ fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[Comm
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the command's expanded parts and where its errors go, as the caller holds them"
+)]
 async fn execute_command<T: Into<String>>(
     mut context: PipelineExecutionContext<'_, impl extensions::ShellExtensions>,
-    params: ExecutionParameters,
+    mut params: ExecutionParameters,
     trace_params: Option<&ExecutionParameters>,
     cmd_name: T,
     assignments: &[&ast::Assignment],
     args: &[CommandArg],
+    redirects: &[&ast::IoRedirect],
+    stderr: &mut OpenFile,
 ) -> Result<ExecutionSpawnResult, error::Error> {
     // Push a new ephemeral environment scope for the duration of the command. We'll
     // set command-scoped variable assignments after doing so, and revert them before
@@ -2608,6 +2626,23 @@ async fn execute_command<T: Into<String>>(
             }
         }
     }
+
+    // The redirections come last, after the words and assignments, and without the command's
+    // own variables, as in bash.
+    let scope = guard
+        .shell()
+        .env_mut()
+        .take_scope(EnvironmentScope::Command)?;
+    let redirected = setup_command_redirects(guard.shell(), &mut params, redirects, args).await;
+    guard
+        .shell()
+        .env_mut()
+        .restore_scope(EnvironmentScope::Command, scope);
+    if !redirected? {
+        return Ok(ExecutionResult::general_error().into());
+    }
+    // An error the command fails with is reported where its standard error now goes.
+    *stderr = params.stderr(guard.shell());
 
     guard.detach();
     drop(guard);

@@ -141,6 +141,37 @@ impl ShellEnvironment {
         }
     }
 
+    /// Takes the innermost scope, which must be of the given type, out of the environment for a
+    /// while; [`Self::restore_scope`] puts it back.
+    pub(crate) fn take_scope(
+        &mut self,
+        expected_scope_type: EnvironmentScope,
+    ) -> Result<ShellVariableMap, error::Error> {
+        match self.scopes.pop() {
+            Some((actual_scope_type, variables)) if actual_scope_type == expected_scope_type => {
+                Ok(variables)
+            }
+            Some((actual_scope_type, variables)) => {
+                self.scopes.push((actual_scope_type, variables));
+                Err(error::ErrorKind::UnexpectedScopeType {
+                    expected: expected_scope_type,
+                    actual: actual_scope_type,
+                }
+                .into())
+            }
+            None => Err(error::ErrorKind::MissingScope.into()),
+        }
+    }
+
+    /// Puts back a scope taken with [`Self::take_scope`].
+    pub(crate) fn restore_scope(
+        &mut self,
+        scope_type: EnvironmentScope,
+        variables: ShellVariableMap,
+    ) {
+        self.scopes.push((scope_type, variables));
+    }
+
     //
     // Iterators/Getters
     //
