@@ -563,6 +563,26 @@ fn uncached_tokenize_string(
     uncached_tokenize_str(input, options)
 }
 
+/// How many bytes of `text` a command substitution takes whose `$(` came just before it, through
+/// its closing `)`, as the tokenizer reads one: bash parses a here-document body's command
+/// substitutions only when it expands the body, but finds where each ends the same way.
+pub(crate) fn command_substitution_len(
+    text: &str,
+    options: &TokenizerOptions,
+) -> Result<usize, TokenizerError> {
+    let mut reader = std::io::BufReader::new(text.as_bytes());
+    let mut tokenizer = Tokenizer::new(&mut reader, options);
+    let mut state = TokenParseState::new(&tokenizer.cross_state.cursor);
+    let pending = tokenizer.set_aside_pending_here_docs();
+    tokenizer.consume_nested_construct(&mut state, ')', "(", 1)?;
+    tokenizer.restore_pending_here_docs(pending);
+    let chars = tokenizer.cross_state.cursor.index;
+    Ok(text
+        .char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index))
+}
+
 /// Break the given input shell script string into tokens, returning the tokens.
 /// No caching is performed.
 ///
@@ -1001,9 +1021,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     }
                 }
             //
-            // Look for the specially specified terminating char.
+            // Look for the specially specified terminating char. An operator being read ends
+            // first, for its own reason: a newline's is what starts a pending here-document.
             //
-            } else if state.unquoted() && terminating_char == Some(c) {
+            } else if state.unquoted() && terminating_char == Some(c) && !state.in_operator() {
                 result = state.delimit_current_token(
                     TokenEndReason::SpecifiedTerminatingChar,
                     &mut self.cross_state,
@@ -1312,6 +1333,19 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 && state.unquoted()
                 && !state.in_operator()
                 && is_valid_name(state.current_token())
+            {
+                self.consume_char()?;
+                state.append_char(c);
+                self.consume_array_subscript(&mut state)?;
+            }
+            //
+            // A word of a compound array assignment that starts with `[` starts with a subscript
+            // (`a=([ 1 ]=x)`): as in bash, read through the matching `]` as part of the word,
+            // blanks included.
+            else if c == '['
+                && self.cross_state.compound_assignment
+                && self.cross_state.nested_constructs == 0
+                && !state.started_token()
             {
                 self.consume_char()?;
                 state.append_char(c);
@@ -1735,7 +1769,7 @@ fn starts_command_words(token: &str, is_operator: bool, command_position: bool) 
 }
 
 /// Whether `token` looks like an assignment: a name, an optional subscript, then `=` or `+=`.
-fn is_assignment_word(token: &str) -> bool {
+pub(crate) fn is_assignment_word(token: &str) -> bool {
     let name_len = token
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(token.len());
@@ -2100,6 +2134,19 @@ echo after
     }
 
     #[test]
+    fn tokenize_here_documents_in_command_substitutions() -> Result<()> {
+        // A `)` in the body of a here-document inside `$( )` does not close it.
+        assert_eq!(
+            tokenize_str("x=$(cat <<EOF\n)\nEOF\n); echo")?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["x=$(cat <<EOF\n)\nEOF\n)", ";", "echo"]
+        );
+        Ok(())
+    }
+
+    #[test]
     #[allow(clippy::panic)]
     fn tokenize_unterminated_here_documents() {
         let open = |input: &str| -> Vec<(String, String, usize)> {
@@ -2213,6 +2260,28 @@ echo after
             strs("if true; then e[a[1] > 0]=v; fi")?,
             ["if", "true", ";", "then", "e[a[1] > 0]=v", ";", "fi"]
         );
+        // So is a leading subscript in a compound assignment's elements, blanks and all.
+        assert_eq!(
+            strs("b=([ 1 ]=x [2]=y [ a[0] ]=z [ 1 ] =w c) m+=(\n[ k\t]=v)")?,
+            [
+                "b=",
+                "(",
+                "[ 1 ]=x",
+                "[2]=y",
+                "[ a[0] ]=z",
+                "[ 1 ]",
+                "=w",
+                "c",
+                ")",
+                "m+=",
+                "(",
+                "\n",
+                "[ k\t]=v",
+                ")"
+            ]
+        );
+        // Not elsewhere.
+        assert_eq!(strs("echo [ 1 ]")?, ["echo", "[", "1", "]"]);
         // A case pattern's `)` inside a substitution does not close it.
         assert_eq!(
             strs("x=$(case a in a) echo m;; (b|c) echo n;; esac); y=$( (echo s) )")?,

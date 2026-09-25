@@ -337,7 +337,12 @@ pub enum ErrorKind {
     #[error("{0}: bad array subscript")]
     ArrayIndexOutOfRange(String),
 
-    /// An element of an array literal whose negative key counts back past the start
+    /// An element without a subscript in a compound assignment to an associative array whose
+    /// elements have them; bash names no builtin for it.
+    #[error("{0}: {1}: must use subscript when assigning associative array")]
+    AssocSubscriptRequired(String, String),
+
+    /// An element of an array literal whose key is empty or counts back past the start
     /// (`a=([-1]=x)`): it abandons the top-level command, reported without the command's name.
     #[error("{0}: bad array subscript")]
     BadArrayElement(String),

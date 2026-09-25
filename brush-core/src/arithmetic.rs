@@ -312,6 +312,55 @@ pub fn eval_integer_literal(
     })
 }
 
+/// Resolves the subscripts of a compound assignment to an indexed array.
+///
+/// As bash's `assign_compound_array_list` does once every element is expanded, each subscript
+/// is expanded again and evaluated arithmetically, in order, and placed by
+/// [`variables::IndexedLiteralKeys`]: a negative one counts back from one past the highest index
+/// so far. An error in a subscript ends the shell, as in bash. An empty subscript, or one that
+/// counts back past the start, stops there: the elements before it are returned with the error
+/// to report once they are assigned (`[KEY]=VALUE: bad array subscript`, which abandons the
+/// command).
+///
+/// # Arguments
+///
+/// * `shell` - The shell to use for evaluation.
+/// * `params` - The execution parameters to use.
+/// * `keys` - Where the elements go: after the array's elements when appending.
+/// * `literal` - The expanded elements.
+pub async fn resolve_indexed_array_literal(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    mut keys: variables::IndexedLiteralKeys,
+    literal: variables::ArrayLiteral,
+) -> Result<(variables::ArrayLiteral, Option<crate::error::Error>), crate::error::Error> {
+    let mut placed = Vec::with_capacity(literal.0.len());
+    for (key, value) in literal.0 {
+        let key = match key {
+            Some(key) => {
+                let index = if key.is_empty() {
+                    None
+                } else {
+                    let index = expand_and_eval(shell, params, &key, false)
+                        .await
+                        .map_err(EvalError::in_subscript)?;
+                    keys.key(index)
+                };
+                let Some(index) = index else {
+                    let element =
+                        crate::error::ErrorKind::BadArrayElement(format!("[{key}]={value}"));
+                    return Ok((variables::ArrayLiteral(placed), Some(element.into())));
+                };
+                Some(index.to_string())
+            }
+            None => None,
+        };
+        placed.push((key, value));
+        keys.placed();
+    }
+    Ok((variables::ArrayLiteral(placed), None))
+}
+
 /// Trait implemented by evaluatable arithmetic expressions.
 pub trait Evaluatable {
     /// Evaluate the given arithmetic expression, returning the resulting numeric value.

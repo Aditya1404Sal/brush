@@ -146,7 +146,10 @@ impl builtins::Command for DeclareCommand {
                         result = ExecutionResult::general_error();
                     }
                 } else {
-                    match self.process_declaration(&mut context, declaration, verb) {
+                    match self
+                        .process_declaration(&mut context, declaration, verb)
+                        .await
+                    {
                         Ok(true) => (),
                         Ok(false) => result = ExecutionResult::general_error(),
                         // Bash names the readonly variable a declaration could not change;
@@ -302,7 +305,7 @@ impl DeclareCommand {
         true
     }
 
-    fn process_declaration(
+    async fn process_declaration(
         &self,
         context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         declaration: &brush_core::CommandArg,
@@ -387,10 +390,66 @@ impl DeclareCommand {
             }
         }
 
-        // A key that counts back past the start fails the declaration once the elements before
-        // it are assigned, as in bash.
-        let (initial_value, failed_element) =
-            self.evaluate_indexed_keys(context, &name, initial_value, append)?;
+        // An indexed array's subscripts, in a compound assignment or an element's
+        // (`declare 'a[i+1]=v'`), are evaluated arithmetically (an associative array's are
+        // words). In a compound assignment, one that is empty or counts back past the start
+        // fails the declaration once the elements before it are assigned, abandoning the
+        // command; an element's (`declare 'a[-5]=v'`) fails the declaration as `a[-5]=v` would,
+        // and the variable is still declared, as in bash.
+        let mut outcome = Ok(true);
+        let initial_value = match initial_value {
+            Some(ShellValueLiteral::Array(literal))
+                if !self.assigns_associative(context, &name, current_lookup) =>
+            {
+                // An element is assigned into the array as it stands.
+                let existing = self
+                    .existing_variable(context.shell, name.as_str(), current_lookup)
+                    .map(|var| var.value());
+                let keys = brush_core::variables::IndexedLiteralKeys::new(
+                    existing,
+                    append || assigned_index.is_some(),
+                );
+                let (literal, failed) = brush_core::arithmetic::resolve_indexed_array_literal(
+                    context.shell,
+                    &context.params,
+                    keys,
+                    literal,
+                )
+                .await?;
+                match (failed, &assigned_index) {
+                    (Some(_), Some(index)) => {
+                        writeln!(
+                            context.stderr(),
+                            "{}{name}[{index}]: bad array subscript",
+                            context.shell.diagnostic_prefix()
+                        )?;
+                        outcome = Ok(false);
+                        None
+                    }
+                    (failed, _) => {
+                        if let Some(failed) = failed {
+                            outcome = Err(failed);
+                        }
+                        Some(ShellValueLiteral::Array(literal))
+                    }
+                }
+            }
+            // Once an associative array's first element has a subscript, every element needs one.
+            Some(ShellValueLiteral::Array(ArrayLiteral(elements)))
+                if assigned_index.is_none()
+                    && elements.first().is_some_and(|(key, _)| key.is_some())
+                    && elements.iter().any(|(key, _)| key.is_none()) =>
+            {
+                let word = elements
+                    .iter()
+                    .find(|(key, _)| key.is_none())
+                    .map(|(_, word)| std::format!("'{}'", word.replace('\'', "'\\''")))
+                    .unwrap_or_default();
+                let kind = ErrorKind::AssocSubscriptRequired(name.clone(), word);
+                return Err(brush_core::Error::from(kind).into_fatal());
+            }
+            value => value,
+        };
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -` saves the `set` options, to restore when the function returns.
@@ -513,7 +572,7 @@ impl DeclareCommand {
                     .shell
                     .env_mut()
                     .add(name, var, EnvironmentScope::Local)?;
-                return failed_element.map_or(Ok(true), Err);
+                return outcome;
             }
         }
 
@@ -601,7 +660,7 @@ impl DeclareCommand {
             context.shell.env_mut().add(name, var, scope)?;
         }
 
-        failed_element.map_or(Ok(true), Err)
+        outcome
     }
 
     /// Whether the declaration changes what the variable holds (`-aAilu` and `-c`, or their `+`
@@ -630,50 +689,25 @@ impl DeclareCommand {
         }
     }
 
-    /// The keys of an indexed array's elements (`declare 'a[i+1]=v'`, `declare -a a=([i]=v)`)
-    /// are evaluated arithmetically, as in bash, where a key that does not evaluate ends the
-    /// shell. An associative array's keys stay as written.
-    fn evaluate_indexed_keys(
+    /// Whether this declaration assigns to an associative array: one it makes (`-A`), or one
+    /// that already is.
+    fn assigns_associative(
         &self,
         context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         name: &str,
-        value: Option<ShellValueLiteral>,
-        append: bool,
-    ) -> Result<(Option<ShellValueLiteral>, Option<brush_core::Error>), brush_core::Error> {
-        let existing = context.shell.env().get(name).map(|(_, var)| var.value());
-        let associative = match self.make_associative_array.to_bool() {
+        lookup: EnvironmentLookup,
+    ) -> bool {
+        match self.make_associative_array.to_bool() {
             Some(associative) => associative,
-            None => existing.is_some_and(brush_core::ShellValue::is_associative_array),
-        };
-        let mut keys = brush_core::variables::IndexedLiteralKeys::new(existing, append);
-        match value {
-            Some(ShellValueLiteral::Array(ArrayLiteral(elements))) if !associative => {
-                let mut evaluated = Vec::with_capacity(elements.len());
-                let mut failed = None;
-                for (key, value) in elements {
-                    let key = match key {
-                        Some(key) => {
-                            let index =
-                                brush_core::arithmetic::eval_subscript(context.shell, &key)?;
-                            let Some(index) = keys.key(index) else {
-                                failed = Some(
-                                    ErrorKind::BadArrayElement(format!("[{key}]={value}")).into(),
-                                );
-                                break;
-                            };
-                            Some(index.to_string())
-                        }
-                        None => None,
-                    };
-                    evaluated.push((key, value));
-                    keys.placed();
-                }
-                Ok((
-                    Some(ShellValueLiteral::Array(ArrayLiteral(evaluated))),
-                    failed,
-                ))
-            }
-            value => Ok((value, None)),
+            None => self
+                .existing_variable(context.shell, name, lookup)
+                .is_some_and(|var| {
+                    matches!(
+                        var.value(),
+                        ShellValue::AssociativeArray(_)
+                            | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+                    )
+                }),
         }
     }
 

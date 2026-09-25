@@ -60,10 +60,16 @@ impl builtins::Command for UnsetCommand {
         for name in &self.names {
             if unspecified || self.name_interpretation.shell_variables {
                 // Try to parse the name as a parameter. If we can't, don't bail; it may not be a
-                // valid variable name/parameter but could still be a function name.
-                if let Ok(parameter) =
-                    brush_parser::word::parse_parameter(name, &context.shell.parser_options())
-                {
+                // valid variable name/parameter but could still be a function name. A subscript
+                // nested too deeply to parse fails.
+                let parsed =
+                    brush_parser::word::parse_parameter(name, &context.shell.parser_options());
+                if let Err(error @ brush_parser::WordParseError::NestedTooDeeply) = &parsed {
+                    context.report(error)?;
+                    result = ExecutionResult::general_error();
+                    continue;
+                }
+                if let Ok(parameter) = parsed {
                     let (base, outcome) = match parameter {
                         brush_parser::word::Parameter::Positional(_)
                         | brush_parser::word::Parameter::Special(_) => continue,

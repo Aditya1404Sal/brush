@@ -2604,6 +2604,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                             // This looks like an assignment, and the command being invoked is a
                             // well-known builtin that takes arguments that need to function like
                             // assignments (but which are processed by the builtin).
+                            check_declared_assoc_elements(&context.shell, &args, assignment)?;
                             let expanded =
                                 expand_assignment(&mut context.shell, &params, assignment).await?;
                             // Bash traces a compound array assignment to a declaration as it
@@ -3461,8 +3462,48 @@ async fn apply_assignment_unchecked(
     }
     let variable_name = &resolved_name;
 
-    // An element of an array literal whose key counts back past the start fails the assignment
-    // once the elements before it are assigned, as in bash.
+    let associative = shell.env().get(variable_name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            ShellValue::AssociativeArray(_)
+                | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+        )
+    });
+    if let ast::AssignmentValue::Array(elements) = &assignment.value {
+        // Bash traces a compound assignment as written, before expanding its elements; one
+        // written before a command is a string, traced as its value is.
+        if shell.options().print_commands_and_arguments
+            && creation_scope != EnvironmentScope::Command
+        {
+            let op = if assignment.append { "+=" } else { "=" };
+            let written = elements
+                .iter()
+                .map(|(key, value)| match key {
+                    Some(key) => std::format!("[{}]={}", key.value, value.value),
+                    None => value.value.clone(),
+                })
+                .join(" ");
+            shell
+                .trace_command(
+                    trace_params,
+                    std::format!("{}{op}({written})", assignment.name),
+                )
+                .await;
+        }
+        // Once an associative array's first element has a subscript, every element needs one.
+        if associative && elements.first().is_some_and(|(key, _)| key.is_some()) {
+            if let Some((_, word)) = elements.iter().find(|(key, _)| key.is_none()) {
+                let kind = error::ErrorKind::AssocSubscriptRequired(
+                    variable_name.clone(),
+                    word.value.clone(),
+                );
+                return Err(error::Error::from(kind).into_fatal());
+            }
+        }
+    }
+
+    // An element of an array literal whose subscript is empty or counts back past the start
+    // fails the assignment once the elements before it are assigned, as in bash.
     let mut failed_element = None;
 
     // Expand the values.
@@ -3490,33 +3531,13 @@ async fn apply_assignment_unchecked(
             )
         }
         ast::AssignmentValue::Array(unexpanded_values) => {
-            // An indexed array's keys (`[i+1]=v`) are evaluated arithmetically, as in bash.
-            let existing = shell.env().get(variable_name).map(|(_, var)| var.value());
-            let associative = existing.is_some_and(ShellValue::is_associative_array);
-            let mut keys = crate::variables::IndexedLiteralKeys::new(existing, assignment.append);
             let mut elements = vec![];
             for (unexpanded_key, unexpanded_value) in unexpanded_values {
                 let key = match unexpanded_key {
-                    Some(unexpanded_key) => {
-                        let key =
-                            expansion::basic_expand_assignment_word(shell, params, unexpanded_key)
-                                .await?;
-                        if associative {
-                            Some(key)
-                        } else {
-                            let index = arithmetic::eval_subscript(shell, &key)?;
-                            let Some(index) = keys.key(index) else {
-                                failed_element = Some(error::Error::from(
-                                    error::ErrorKind::BadArrayElement(format!(
-                                        "[{}]={}",
-                                        unexpanded_key.value, unexpanded_value.value
-                                    )),
-                                ));
-                                break;
-                            };
-                            Some(index.to_string())
-                        }
-                    }
+                    Some(unexpanded_key) => Some(
+                        expansion::basic_expand_assignment_word(shell, params, unexpanded_key)
+                            .await?,
+                    ),
                     None => None,
                 };
 
@@ -3525,7 +3546,6 @@ async fn apply_assignment_unchecked(
                         expansion::basic_expand_assignment_word(shell, params, unexpanded_value)
                             .await?;
                     elements.push((key, value));
-                    keys.placed();
                 } else {
                     // Array elements are treated as regular words, not assignments
                     let values = expansion::full_expand_and_split_array_element(
@@ -3536,7 +3556,6 @@ async fn apply_assignment_unchecked(
                     .await?;
                     for value in values {
                         elements.push((None, value));
-                        keys.placed();
                     }
                 }
             }
@@ -3559,12 +3578,15 @@ async fn apply_assignment_unchecked(
         new_value
     };
 
-    if shell.options().print_commands_and_arguments {
+    if shell.options().print_commands_and_arguments
+        && let ShellValueLiteral::Scalar(value) = &new_value
+    {
         let op = if assignment.append { "+=" } else { "=" };
         // Bash prints an empty value as nothing: `a=`.
-        let traced = match &new_value {
-            ShellValueLiteral::Scalar(value) if value.is_empty() => String::new(),
-            value => value.to_string(),
+        let traced = if value.is_empty() {
+            String::new()
+        } else {
+            new_value.to_string()
         };
         shell
             .trace_command(
@@ -3573,6 +3595,20 @@ async fn apply_assignment_unchecked(
             )
             .await;
     }
+
+    // A compound assignment to an indexed array evaluates its subscripts arithmetically; an
+    // associative array's are words.
+    let new_value = match new_value {
+        ShellValueLiteral::Array(literal) if !associative => {
+            let existing = shell.env().get(variable_name).map(|(_, var)| var.value());
+            let keys = crate::variables::IndexedLiteralKeys::new(existing, assignment.append);
+            let (literal, failed) =
+                arithmetic::resolve_indexed_array_literal(shell, params, keys, literal).await?;
+            failed_element = failed;
+            ShellValueLiteral::Array(literal)
+        }
+        value => value,
+    };
 
     // See if we need to eval an array index.
     if let Some(idx) = &array_index {
@@ -4506,6 +4542,48 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
 
         Ok(reader.into())
     }
+}
+
+/// Bash checks a declaration builtin's compound assignment to an associative array (`-A`, or
+/// one that already is) before expanding it: once the first element has a subscript, every
+/// element needs one, and the error quotes the word as written.
+fn check_declared_assoc_elements(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    args: &[CommandArg],
+    assignment: &ast::Assignment,
+) -> Result<(), error::Error> {
+    let ast::AssignmentValue::Array(elements) = &assignment.value else {
+        return Ok(());
+    };
+    if !elements.first().is_some_and(|(key, _)| key.is_some()) {
+        return Ok(());
+    }
+    let Some((_, word)) = elements.iter().find(|(key, _)| key.is_none()) else {
+        return Ok(());
+    };
+    let name = assignment.name.base_name();
+    // Options come before the first name, as the builtin reads them.
+    let makes_associative = args
+        .iter()
+        .skip(1)
+        .map_while(|arg| match arg {
+            CommandArg::String(s) if s.len() > 1 && s.starts_with('-') && s != "--" => Some(s),
+            _ => None,
+        })
+        .any(|option| option.contains('A'));
+    let is_associative = shell.env().get(name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            ShellValue::AssociativeArray(_)
+                | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+        )
+    });
+    if makes_associative || is_associative {
+        let kind =
+            error::ErrorKind::AssocSubscriptRequired(name.to_owned(), single_quoted(&word.value));
+        return Err(error::Error::from(kind).into_fatal());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

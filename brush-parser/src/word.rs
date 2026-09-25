@@ -622,7 +622,75 @@ pub fn parse(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    check_nesting(word, true)?;
     cacheable_parse(word, options)
+}
+
+/// How deeply text may nest brackets and substitutions for the word parser, which recurses once
+/// per level. A word built at run time (a subscript from a variable's value, text given to brace
+/// expansion) is not checked before it is parsed, so deeper text fails instead of exhausting the
+/// stack.
+const MAX_NESTING: usize = 128;
+
+/// Fails text nested deeper than [`MAX_NESTING`] (see [`nesting`]).
+fn check_nesting(text: &str, quotes: bool) -> Result<(), error::WordParseError> {
+    if nesting(text, quotes) > MAX_NESTING {
+        Err(error::WordParseError::NestedTooDeeply)
+    } else {
+        Ok(())
+    }
+}
+
+/// The deepest nesting of brackets and substitutions in `text`, found in one pass without
+/// recursing: `$(`, `${` and `$[` count everywhere, other brackets outside double quotes. With
+/// `quotes`, single-quoted text is skipped; otherwise (a here-document body) quotes are text.
+fn nesting(text: &str, quotes: bool) -> usize {
+    let bytes = text.as_bytes();
+    // The closing bracket each open level waits for; `"` marks double quotes, which do not nest.
+    let mut open: Vec<u8> = Vec::new();
+    let (mut depth, mut deepest) = (0_usize, 0_usize);
+    let mut index = 0;
+    while index < bytes.len() {
+        let quoted = open.last() == Some(&b'"');
+        match bytes[index] {
+            b'\\' => index += 1,
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{' | b'[')) => {
+                index += 1;
+                open.push(closing_bracket(bytes[index]));
+                depth += 1;
+            }
+            b'"' if quotes && quoted => {
+                open.pop();
+            }
+            b'"' if quotes => open.push(b'"'),
+            b'\'' if quotes && !quoted => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    index += 1;
+                }
+            }
+            byte @ (b'(' | b'{' | b'[') if !quoted => {
+                open.push(closing_bracket(byte));
+                depth += 1;
+            }
+            byte if byte != b'"' && open.last() == Some(&byte) => {
+                open.pop();
+                depth -= 1;
+            }
+            _ => {}
+        }
+        deepest = deepest.max(depth);
+        index += 1;
+    }
+    deepest
+}
+
+const fn closing_bracket(open: u8) -> u8 {
+    match open {
+        b'(' => b')',
+        b'{' => b'}',
+        _ => b']',
+    }
 }
 
 #[cached::macros::cached(
@@ -674,6 +742,100 @@ fn comment_hides_close(expr: &str) -> bool {
     in_comment
 }
 
+/// The command of the command substitution at the start of `text` (just after its `$(`) and how
+/// many bytes of `text` it takes through its `)`, when it is closed and its command parses.
+fn heredoc_command<'a>(text: &'a str, options: &ParserOptions) -> Option<(&'a str, usize)> {
+    let len =
+        crate::tokenizer::command_substitution_len(text, &options.tokenizer_options()).ok()?;
+    let command = text.get(..len.checked_sub(1)?)?;
+    let mut reader = std::io::BufReader::new(command.as_bytes());
+    crate::Parser::new(&mut reader, options)
+        .parse_program()
+        .ok()
+        .map(|_| (command, len))
+}
+
+/// The length of the text starting with a here-document operator (`<<TAG`, `<<-TAG`) in a
+/// command's text, through the rest of its line and the body of every here-document on that line,
+/// each up to its delimiter line. `None` when the text does not start with one, or when the
+/// command's text ends on that line (a `)` closing it) so there is no body to take.
+fn here_documents_len(text: &str) -> Option<usize> {
+    if !text.starts_with("<<") || text.starts_with("<<<") {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut delimiters = vec![];
+    let mut index = 0;
+    let mut depth = 0_usize;
+    // The operators and tags on the line, and the rest of it up to its newline.
+    while index < bytes.len() && bytes[index] != b'\n' {
+        match bytes[index] {
+            b'<' if bytes.get(index + 1) == Some(&b'<') && bytes.get(index + 2) != Some(&b'<') => {
+                index += 2;
+                let strip = bytes.get(index) == Some(&b'-');
+                index += usize::from(strip);
+                while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+                let start = index;
+                let mut quote = None;
+                while let Some(&byte) = bytes.get(index) {
+                    match quote {
+                        Some(q) if byte == q => quote = None,
+                        Some(_) => {}
+                        None if byte == b'\'' || byte == b'"' => quote = Some(byte),
+                        None if byte == b'\\' => index += 1,
+                        None if byte.is_ascii_whitespace() || b";&|()<>".contains(&byte) => break,
+                        None => {}
+                    }
+                    index += 1;
+                }
+                let tag = text.get(start..index.min(bytes.len()))?;
+                if tag.is_empty() {
+                    return None;
+                }
+                let delimiter: String = tag
+                    .chars()
+                    .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                    .collect();
+                delimiters.push((delimiter, strip));
+                continue;
+            }
+            b'\\' => index += 1,
+            quote @ (b'\'' | b'"') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1 + usize::from(quote == b'"' && bytes[index] == b'\\');
+                }
+            }
+            b'(' => depth += 1,
+            b')' if depth == 0 => return None,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    // The bodies, in order, each through its delimiter line.
+    index += 1;
+    for (delimiter, strip) in delimiters {
+        while index < bytes.len() {
+            let end = bytes[index..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |end| index + end);
+            let mut line = text.get(index..end)?;
+            if strip {
+                line = line.trim_start_matches('\t');
+            }
+            index = end + 1;
+            if line == delimiter {
+                break;
+            }
+        }
+    }
+    Some(index.min(bytes.len()))
+}
+
 /// Parse a heredoc body, treating `"` and `'` as literal characters.
 ///
 /// # Arguments
@@ -684,6 +846,7 @@ pub fn parse_heredoc(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    check_nesting(word, false)?;
     expansion_parser::unexpanded_heredoc_word(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
@@ -702,6 +865,7 @@ pub fn parse_arithmetic_text(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    check_nesting(word, false)?;
     expansion_parser::unexpanded_arithmetic_text(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
@@ -716,6 +880,7 @@ pub fn parse_parameter(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Parameter, error::WordParseError> {
+    check_nesting(word, true)?;
     expansion_parser::parameter(word, options)
         .map_err(|err| error::WordParseError::Parameter(word.to_owned(), err.into()))
 }
@@ -730,6 +895,7 @@ pub fn parse_brace_expansions(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Option<Vec<BraceExpressionOrText>>, error::WordParseError> {
+    check_nesting(word, true)?;
     expansion_parser::brace_expansions(word, options)
         .map_err(|err| error::WordParseError::BraceExpansion(word.to_owned(), err.into()))
 }
@@ -747,6 +913,7 @@ pub fn parse_scalar_assignment(
     word: &str,
     options: &ParserOptions,
 ) -> Result<ast::Assignment, error::WordParseError> {
+    check_nesting(word, true)?;
     expansion_parser::name_equals_scalar_value(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
@@ -766,6 +933,7 @@ pub fn parse_compound_assignment_value(
     value: &str,
     options: &ParserOptions,
 ) -> Option<Vec<(Option<ast::Word>, ast::Word)>> {
+    check_nesting(value, true).ok()?;
     let elements = crate::parser::parse_compound_assignment_value(value, options)?;
     parse_array_elements(elements.iter(), options).ok()
 }
@@ -782,6 +950,7 @@ pub(crate) fn parse_array_assignment(
     elements: &[&String],
     options: &ParserOptions,
 ) -> Result<ast::Assignment, &'static str> {
+    check_nesting(word, true).map_err(|_| "nested too deeply")?;
     let (assignment_name, append) =
         expansion_parser::name_equals(word, options).map_err(|_| "not array assignment word")?;
 
@@ -851,6 +1020,7 @@ fn parse_array_elements<'a>(
     elements
         .into_iter()
         .map(|element| {
+            check_nesting(element, true).map_err(|_| "nested too deeply")?;
             let (key, value) = expansion_parser::literal_array_element(element, options)
                 .map_err(|_| "invalid array element in literal")?;
             Ok((
@@ -1159,23 +1329,46 @@ peg::parser! {
         rule heredoc_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
-            command_substitution() /
-            parameter_expansion() /
+            heredoc_command_substitution() /
+            &("$((" / "`") c:command_substitution() { c } /
+            &"${" p:parameter_expansion() {?
+                // Not the lone `$` a `${` left open would otherwise be taken as.
+                if matches!(&p, WordPiece::Text(text) if text == "$") { Err("${") } else { Ok(p) }
+            } /
+            !("$" ['(' | '{' | '[']) p:parameter_expansion() { p } /
             heredoc_escape_sequence() /
             heredoc_literal_text() /
-            // A backquote left open is an error when the body is expanded, as in bash.
-            "`" rest:$([_]*) {
+            // An expansion left open, or a command substitution that does not parse, is an error
+            // when the body is expanded, as in bash: the text from it to the end of the body.
+            text:$(("$((" / "$[" / "${" / "$(" / "`") [_]*) {
                 WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution {
-                    text: std::format!("`{rest}"),
+                    text: text.to_owned(),
                     transform: false,
                 })
             }
+
+        // A command substitution in a here-document body, which bash reads only when it expands
+        // the body: it ends where the tokenizer finds its `)`, and it must parse.
+        rule heredoc_command_substitution() -> WordPiece = #{|input, pos| {
+            match input.get(pos..).and_then(|text| text.strip_prefix("$(")) {
+                Some(rest) if !rest.starts_with('(') => {
+                    match heredoc_command(rest, parser_options) {
+                        Some((command, len)) => peg::RuleResult::Matched(
+                            pos + 2 + len,
+                            WordPiece::CommandSubstitution(command.to_owned()),
+                        ),
+                        None => peg::RuleResult::Failed,
+                    }
+                }
+                _ => peg::RuleResult::Failed,
+            }
+        }}
 
         rule heredoc_escape_sequence() -> WordPiece =
             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }
 
         rule heredoc_literal_text() -> WordPiece =
-            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() [^'`'])+) {
+            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() !("$" ['(' | '{' | '[']) [^'`'])+) {
                 WordPiece::Text(s.to_owned())
             }
 
@@ -1450,6 +1643,7 @@ peg::parser! {
         // Text runs stop at blanks and separators, so each word of the command is a piece of its
         // own and a `case` command is seen where it starts.
         pub(crate) rule command_piece() -> () =
+            here_documents() {} /
             case_command() {} /
             word_piece(<command_piece_stop()>, true /*in_command*/) {} /
             ([' ' | '\t' | '\n' | ';' | '&' | '|'])+ {} /
@@ -1463,6 +1657,7 @@ peg::parser! {
             "case" &keyword_end() (!("esac" keyword_end()) case_command_piece())* "esac" &keyword_end()
 
         rule case_command_piece() =
+            here_documents() {} /
             case_command() /
             word_piece(<case_command_stop()>, true /*in_command*/) {} /
             [_] {}
@@ -1471,9 +1666,19 @@ peg::parser! {
 
         rule keyword_end() = [' ' | '\t' | '\n' | ';' | ')' | '&' | '|'] / ![_]
 
+        // A here-document operator in a command's text, taken with the rest of its line and the
+        // body of each here-document on that line, whose parentheses and quotes are text.
+        rule here_documents() = #{|input, pos| {
+            match input.get(pos..).and_then(here_documents_len) {
+                Some(len) => peg::RuleResult::Matched(pos + len, ()),
+                None => peg::RuleResult::Failed,
+            }
+        }}
+
         // A piece of the command in `${ command; }`, which ends at a `}` that closes no brace
         // group or brace expression of its own.
         rule funsub_piece() =
+            here_documents() {} /
             case_command() /
             "{" (!"}" funsub_piece())* "}" {} /
             word_piece(<funsub_stop()>, true /*in_command*/) {} /
@@ -1685,6 +1890,101 @@ mod tests {
                 ..
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deep_nesting_fails_before_the_parser_recurses() {
+        assert_eq!(
+            super::nesting("a[(1+(2))] ${x:-$(y)} \"((\" '((('", true),
+            3
+        );
+        assert_eq!(super::nesting("'((('", false), 3);
+        assert_eq!(super::nesting(&"${a} (b) ".repeat(500), true), 1);
+        let deep = format!("a[{}1{}]", "(".repeat(10000), ")".repeat(10000));
+        assert!(matches!(
+            super::parse_parameter(&deep, &ParserOptions::default()),
+            Err(crate::error::WordParseError::NestedTooDeeply)
+        ));
+        let braces = format!("{{{}z{}}}", "a,{".repeat(3000), "}".repeat(3000));
+        assert!(matches!(
+            super::parse_brace_expansions(&braces, &ParserOptions::default()),
+            Err(crate::error::WordParseError::NestedTooDeeply)
+        ));
+        assert!(
+            super::parse(
+                &format!("${{a[{}]}}", "(".repeat(100) + &")".repeat(100)),
+                &ParserOptions::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_here_document_bodies_with_expansions_left_open() -> Result<()> {
+        let pieces = |body: &str| -> Result<Vec<WordPiece>> {
+            Ok(super::parse_heredoc(body, &ParserOptions::default())?
+                .into_iter()
+                .map(|p| p.piece)
+                .collect())
+        };
+        let bad = |text: &str| {
+            WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution {
+                text: text.to_owned(),
+                transform: false,
+            })
+        };
+        // What is left open, or a command substitution that does not parse, runs to the end.
+        assert_eq!(pieces("$(echo hi\n")?, [bad("$(echo hi\n")]);
+        assert_eq!(pieces("$(if) more\n")?, [bad("$(if) more\n")]);
+        assert_eq!(
+            pieces("a ${x\nb\n")?,
+            [WordPiece::Text("a ".into()), bad("${x\nb\n")]
+        );
+        assert_eq!(pieces("$((1+2\n")?, [bad("$((1+2\n")]);
+        assert_eq!(pieces("$[1\n")?, [bad("$[1\n")]);
+        // What is closed and parses expands, and a lone `$` is text.
+        assert_eq!(
+            pieces("$((echo a) ) $(echo \")\") ${x} $ z")?,
+            [
+                WordPiece::CommandSubstitution("(echo a) ".into()),
+                WordPiece::Text(" ".into()),
+                WordPiece::CommandSubstitution("echo \")\"".into()),
+                WordPiece::Text(" ".into()),
+                WordPiece::ParameterExpansion(ParameterExpr::Parameter {
+                    parameter: Parameter::Named("x".into()),
+                    indirect: false
+                }),
+                WordPiece::Text(" ".into()),
+                WordPiece::Text("$".into()),
+                WordPiece::Text(" z".into()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_here_documents_in_command_substitutions() -> Result<()> {
+        // A here-document's body is text: its parentheses do not open or close anything.
+        for (word, command) in [
+            ("$(cat <<'EOF'\n(\nEOF\n)", "cat <<'EOF'\n(\nEOF\n"),
+            ("$(cat <<EOF\n)\nEOF\n)", "cat <<EOF\n)\nEOF\n"),
+            ("$(cat <<-E\n\t) (\n\tE\n)", "cat <<-E\n\t) (\n\tE\n"),
+            (
+                "$(cat <<A; cat <<B\n(a\nA\nb)\nB\n)",
+                "cat <<A; cat <<B\n(a\nA\nb)\nB\n",
+            ),
+            ("$(cat <<A | tr a b\n)(\nA\n)", "cat <<A | tr a b\n)(\nA\n"),
+            ("$(cat <<<'(' )", "cat <<<'(' "),
+        ] {
+            let pieces = super::parse(word, &ParserOptions::default())?;
+            assert_matches!(
+                pieces.first().map(|p| &p.piece),
+                Some(WordPiece::CommandSubstitution(c)) if c == command,
+                "{word:?}"
+            );
+            assert_eq!(pieces.len(), 1, "{word:?}");
+        }
         Ok(())
     }
 

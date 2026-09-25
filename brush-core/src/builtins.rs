@@ -687,14 +687,22 @@ async fn exec_declaration_builtin_impl<
     let mut options = vec![];
     let mut declarations = vec![];
 
+    // As bash's `internal_getopt`: options come before the first name or assignment (or up to
+    // `--`); after that every word is a declaration, even one like `-r`.
+    let mut names_started = false;
     for (i, arg) in args.into_iter().enumerate() {
         match arg {
+            CommandArg::String(s) if i == 0 => options.push(s),
             CommandArg::String(s)
-                if i == 0 || (s.len() > 1 && (s.starts_with('-') || s.starts_with('+'))) =>
+                if !names_started && s.len() > 1 && (s.starts_with('-') || s.starts_with('+')) =>
             {
+                names_started = s == "--";
                 options.push(s);
             }
-            _ => declarations.push(arg),
+            _ => {
+                names_started = true;
+                declarations.push(arg);
+            }
         }
     }
 
@@ -747,6 +755,12 @@ async fn call_builtin(
             match inner.kind() {
                 error::ErrorKind::ReadonlyVariableNamed(name) => {
                     return error::ErrorKind::ReadonlyVariableNamed(name.clone()).into();
+                }
+                // An associative array's element without a subscript ends the shell, unnamed by
+                // the builtin, as in bash.
+                error::ErrorKind::AssocSubscriptRequired(name, word) if inner.is_fatal() => {
+                    let kind = error::ErrorKind::AssocSubscriptRequired(name.clone(), word.clone());
+                    return error::Error::from(kind).into_fatal();
                 }
                 // `command nosuch` reports the command, as bash does, not `command`.
                 error::ErrorKind::CommandNotFound(name) => {
