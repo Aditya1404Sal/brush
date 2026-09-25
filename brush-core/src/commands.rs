@@ -120,7 +120,13 @@ impl CommandArg {
         match self {
             Self::String(s) => escape::quote_if_needed(s, escape::QuoteMode::SingleQuote),
             // Bash prints the word `name=value` as it prints any word, quoted whole when it
-            // needs to be: `e=`, `'a=x y'`.
+            // needs to be: `e=`, `'a=x y'`. A compound array assignment was traced on its own as
+            // it was expanded, and the command shows only its name.
+            Self::Assignment(a)
+                if matches!(a.value, brush_parser::ast::AssignmentValue::Array(_)) =>
+            {
+                a.name.to_string().into()
+            }
             Self::Assignment(a) => {
                 let op = if a.append { "+=" } else { "=" };
                 escape::quote_if_needed(

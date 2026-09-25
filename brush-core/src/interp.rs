@@ -2240,6 +2240,29 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                             // assignments (but which are processed by the builtin).
                             let expanded =
                                 expand_assignment(&mut context.shell, &params, assignment).await?;
+                            // Bash traces a compound array assignment to a declaration as it
+                            // expands it, with every element quoted: `a=('1' '2')`.
+                            if let Some(trace_params) = &trace_params
+                                && let ast::AssignmentValue::Array(elements) = &expanded.value
+                            {
+                                let op = if expanded.append { "+=" } else { "=" };
+                                let text = format!(
+                                    "{}{op}({})",
+                                    expanded.name,
+                                    elements
+                                        .iter()
+                                        .map(|(key, value)| match key {
+                                            Some(key) => format!(
+                                                "[{}]={}",
+                                                single_quoted(&key.value),
+                                                single_quoted(&value.value)
+                                            ),
+                                            None => single_quoted(&value.value),
+                                        })
+                                        .join(" ")
+                                );
+                                context.shell.trace_command(trace_params, text).await;
+                            }
                             args.push(CommandArg::Assignment(expanded));
                         } else {
                             // This *looks* like an assignment, but it's really a string we should
@@ -2394,6 +2417,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
     }
 }
 
+/// A word in single quotes, as bash's xtrace quotes an array element: `'it'\''s'`.
+fn single_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Whether bash would run the command `args` names as a program in a child process: not a
 /// function, and not a builtin other than a utility that stands for a program.
 fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[CommandArg]) -> bool {
@@ -2444,13 +2472,48 @@ async fn execute_command<T: Into<String>>(
     }
 
     if guard.shell().options().print_commands_and_arguments {
+        let trace_params = trace_params.unwrap_or(&params);
         guard
             .shell()
             .trace_command(
-                trace_params.unwrap_or(&params),
+                trace_params,
                 args.iter().map(|arg| arg.quote_for_tracing()).join(" "),
             )
             .await;
+        // `export` and `readonly` make their scalar assignments as ordinary assignments, which
+        // bash traces as it makes them: `+ a=1`.
+        let name = match args.first() {
+            Some(CommandArg::String(name)) => name.as_str(),
+            _ => "",
+        };
+        if matches!(name, "export" | "readonly")
+            && guard.shell().funcs().get(name).is_none()
+            && guard
+                .shell()
+                .builtins()
+                .get(name)
+                .is_some_and(|builtin| !builtin.disabled)
+        {
+            for arg in args.iter().skip(1) {
+                if let CommandArg::Assignment(assignment) = arg
+                    && let ast::AssignmentValue::Scalar(value) = &assignment.value
+                {
+                    let op = if assignment.append { "+=" } else { "=" };
+                    let value = if value.value.is_empty() {
+                        Cow::Borrowed("")
+                    } else {
+                        crate::escape::quote_if_needed(
+                            &value.value,
+                            crate::escape::QuoteMode::SingleQuote,
+                        )
+                    };
+                    guard
+                        .shell()
+                        .trace_command(trace_params, format!("{}{op}{value}", assignment.name))
+                        .await;
+                }
+            }
+        }
     }
 
     guard.detach();
