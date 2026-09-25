@@ -397,6 +397,35 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
                     let _ = post_execute(&mut self.shell);
                 }
 
+                // Bash hands a command it cannot find to `command_not_found_handle`, when one is
+                // defined, run in a subshell with the command and its arguments; its status is
+                // the command's.
+                if let Some(handler) = self.shell.funcs().get(NOT_FOUND_HANDLER).cloned() {
+                    let mut subshell = self.shell.clone();
+                    // The handler does not handle the commands it cannot find itself.
+                    subshell.undefine_func(NOT_FOUND_HANDLER);
+                    let context = ExecutionContext {
+                        shell: &mut subshell,
+                        command_name: NOT_FOUND_HANDLER.to_owned(),
+                        params: self.params,
+                    };
+                    let status = match invoke_shell_function(handler, context, &self.args).await {
+                        Ok(spawned) => match spawned.wait().await? {
+                            crate::results::ExecutionWaitResult::Completed(result) => {
+                                result.exit_code
+                            }
+                            crate::results::ExecutionWaitResult::Stopped(..) => {
+                                ExecutionResult::stopped().exit_code
+                            }
+                        },
+                        Err(error) => {
+                            let _ = subshell.display_error(&mut subshell.stderr(), &error);
+                            error.into_result(&subshell).exit_code
+                        }
+                    };
+                    return Ok(ExecutionResult::from(status).into());
+                }
+
                 Err(ErrorKind::CommandNotFound(self.command_name).into())
             }
         } else {
@@ -897,6 +926,9 @@ async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
     }
     Ok(None)
 }
+
+/// The function bash runs for a command it cannot find.
+const NOT_FOUND_HANDLER: &str = "command_not_found_handle";
 
 pub(crate) async fn invoke_shell_function(
     function: functions::Registration,
