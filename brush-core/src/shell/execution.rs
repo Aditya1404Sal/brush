@@ -215,6 +215,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
         self.pending_input = Some(text.as_str().into());
+        let alias_scope = self.alias_scope.take();
 
         #[cfg(any(target_arch = "wasm32", test))]
         let result = {
@@ -241,6 +242,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         };
 
         self.pending_input = None;
+        self.alias_scope = alias_scope;
 
         // The RETURN trap runs as a sourced script returns, as in bash.
         if matches!(call_type, callstack::ScriptCallType::Source) {
@@ -268,9 +270,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let command: String = command.into();
         let parse_result = self.parse_string(command.as_str());
         self.pending_input = Some(command.as_str().into());
+        // Text read now (`eval`'s, a trap's, a sourced file's) expands the aliases in effect now,
+        // even in a function body, whose own text expands those where it was defined.
+        let alias_scope = self.alias_scope.take();
         let result = self
             .run_parsed_result(parse_result, Some(&command), source_info, params)
             .await;
+        self.alias_scope = alias_scope;
         self.pending_input = None;
         result
     }
