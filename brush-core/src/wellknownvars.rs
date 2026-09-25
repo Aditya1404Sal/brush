@@ -236,10 +236,10 @@ pub(crate) fn init_well_known_vars(
     shell.env_mut().set_global(
         "DIRSTACK",
         ShellVariable::new(ShellValue::Dynamic {
+            // The current directory is element 0, as in bash.
             getter: |shell| {
-                shell
-                    .directory_stack()
-                    .iter()
+                std::iter::once(shell.working_dir())
+                    .chain(shell.directory_stack().iter().map(PathBuf::as_path))
                     .map(|p| p.to_string_lossy().to_string())
                     .collect::<Vec<_>>()
                     .into()
