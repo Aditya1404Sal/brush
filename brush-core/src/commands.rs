@@ -860,9 +860,12 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
         {
             if process::pipe_disposition() != PipeDisposition::Default {
                 let mut stderr = params.stderr(shell);
+                let prefix = shell.diagnostic_prefix();
                 let diagnostic = stderr
                     .async_io()
-                    .write_all(format!("{command_name}: write error: Broken pipe\n").as_bytes())
+                    .write_all(
+                        format!("{prefix}{command_name}: write error: Broken pipe\n").as_bytes(),
+                    )
                     .await;
                 if let Err(error) = diagnostic {
                     if error.kind() != std::io::ErrorKind::BrokenPipe {
