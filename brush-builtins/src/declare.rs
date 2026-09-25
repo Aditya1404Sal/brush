@@ -509,6 +509,24 @@ impl DeclareCommand {
         let append;
 
         match declaration {
+            // A word that expanded to `name=value` (`declare $v`, `declare v$i=x`) assigns, as
+            // in bash.
+            brush_core::CommandArg::String(s) if let Some(word) = AssignmentText::parse(s) => {
+                name = word.name;
+                append = word.append;
+                if let Some(index) = word.index {
+                    initial_value = Some(ShellValueLiteral::Array(ArrayLiteral(vec![(
+                        Some(index.clone()),
+                        word.value,
+                    )])));
+                    assigned_index = Some(index);
+                    name_is_array = true;
+                } else {
+                    initial_value = Some(ShellValueLiteral::Scalar(word.value));
+                    assigned_index = None;
+                    name_is_array = false;
+                }
+            }
             brush_core::CommandArg::String(s) => {
                 // We need to handle the case of someone invoking `declare array[index]`.
                 // In such case, we ignore the index and treat it as a declaration of
@@ -793,6 +811,13 @@ impl DeclareCommand {
                 var.set_update_transform(ShellVariableUpdateTransform::None);
             }
         }
+        // Bash turns on no case conversion when asked for more than one (`declare -lu`).
+        let capitalize = matches!(self.capitalize_value_on_assignment.to_bool(), Some(true));
+        let lowercase = matches!(self.lowercase_value_on_assignment.to_bool(), Some(true));
+        let uppercase = matches!(self.uppercase_value_on_assignment.to_bool(), Some(true));
+        if (capitalize && (lowercase || uppercase)) || (lowercase && uppercase) {
+            var.set_update_transform(ShellVariableUpdateTransform::None);
+        }
         if let Some(value) = self.make_exported.to_bool() {
             if value {
                 var.export();
@@ -829,4 +854,35 @@ const fn is_readonly_error(error: &brush_core::Error) -> bool {
         error.kind(),
         ErrorKind::ReadonlyVariable | ErrorKind::ReadonlyVariableNamed(_)
     )
+}
+
+/// A declaration builtin's argument that expanded to `name=value`, `name+=value` or
+/// `name[index]=value`, which bash treats as an assignment.
+pub(crate) struct AssignmentText {
+    pub(crate) name: String,
+    pub(crate) index: Option<String>,
+    pub(crate) append: bool,
+    pub(crate) value: String,
+}
+
+impl AssignmentText {
+    /// The assignment `text` spells, or `None` when it is not one: no `=`, or no valid name
+    /// before it.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let (target, value) = text.split_once('=')?;
+        let (target, append) = match target.strip_suffix('+') {
+            Some(target) => (target, true),
+            None => (target, false),
+        };
+        let (name, index) = match target.strip_suffix(']').and_then(|t| t.split_once('[')) {
+            Some((name, index)) => (name, Some(index.to_owned())),
+            None => (target, None),
+        };
+        env::valid_variable_name(name).then(|| Self {
+            name: name.to_owned(),
+            index,
+            append,
+            value: value.to_owned(),
+        })
+    }
 }
