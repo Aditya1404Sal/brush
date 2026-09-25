@@ -129,6 +129,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) exit_trace_level: usize,
 
+    /// Whether the shell that started this pipeline stage already ran its simple command's DEBUG
+    /// trap, as bash does before it forks the stage.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) debug_trap_ran: bool,
+
     /// Checks the text a prompt string (`PS4`, `${x@P}`) expands before any of its expansions
     /// run (see [`Self::set_prompt_guard`]).
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -295,6 +300,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             trace_level: self.trace_level,
             exit_trace_level: self.trace_level + 1,
             pending_input: None,
+            debug_trap_ran: false,
             prompt_guard: self.prompt_guard,
             processes: self.processes.clone(),
             own_pid: self.own_pid,

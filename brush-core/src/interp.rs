@@ -900,7 +900,9 @@ async fn spawn_pipeline_processes(
         {
             if !run_in_current_shell {
                 let stage_process = shell.take_stage_process();
+                let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
                 let mut stage_shell = shell.clone();
+                stage_shell.debug_trap_ran = debug_trap_ran;
                 if stage_adds_no_subshell(command) {
                     stage_shell.subshell_level = shell.subshell_level;
                 }
@@ -918,7 +920,9 @@ async fn spawn_pipeline_processes(
                 cmd_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
             }
 
+            let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
             let mut stage_shell = shell.clone();
+            stage_shell.debug_trap_ran = debug_trap_ran;
             if stage_adds_no_subshell(command) {
                 stage_shell.subshell_level = shell.subshell_level;
             }
@@ -2144,22 +2148,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         #[cfg(target_arch = "wasm32")]
         let pending = params.own_output_substitutions();
 
-        // Before its words are expanded, the command's text becomes BASH_COMMAND (unless a trap
-        // handler is running, whose commands leave it alone) and the DEBUG trap runs, as in bash.
-        if !context.shell.running_trap_handler() {
-            context.shell.env_mut().update_or_add(
-                "BASH_COMMAND",
-                ShellValueLiteral::Scalar(self.to_string()),
-                |_| Ok(()),
-                EnvironmentLookup::Anywhere,
-                EnvironmentScope::Global,
-            )?;
-        }
-        if context.shell.traps().handles(traps::TrapSignal::Debug) {
-            let _ = context
-                .shell
-                .invoke_trap_handler(traps::TrapSignal::Debug, &params)
-                .await?;
+        // A pipeline stage's DEBUG trap already ran in the shell that started the stage.
+        if !std::mem::take(&mut context.shell.debug_trap_ran) {
+            before_simple_command(&mut context.shell, &params, self).await?;
         }
 
         let mut assignments = vec![];
@@ -2414,6 +2405,47 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // might result in a non-zero exit status stored in the shell.
             Ok(ExecutionResult::new(context.shell.last_exit_status()).into())
         }
+    }
+}
+
+/// What happens before a simple command's words are expanded: its text becomes `BASH_COMMAND`
+/// (unless a trap handler is running, whose commands leave it alone) and the DEBUG trap runs, as
+/// in bash.
+async fn before_simple_command(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: &ast::SimpleCommand,
+) -> Result<(), error::Error> {
+    if !shell.running_trap_handler() {
+        shell.env_mut().update_or_add(
+            "BASH_COMMAND",
+            ShellValueLiteral::Scalar(command.to_string()),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+    }
+    if shell.traps().handles(traps::TrapSignal::Debug) {
+        let _ = shell
+            .invoke_trap_handler(traps::TrapSignal::Debug, params)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Runs a simple command's DEBUG trap in this shell before the pipeline stage that runs it
+/// starts, as bash does before it forks the stage, and returns whether it did.
+async fn stage_debug_trap(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: &ast::Command,
+) -> Result<bool, error::Error> {
+    match command {
+        ast::Command::Simple(simple) => {
+            before_simple_command(shell, params, simple).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 

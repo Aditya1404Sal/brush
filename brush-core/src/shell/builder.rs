@@ -261,6 +261,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             trace_level: 0,
             exit_trace_level: 0,
             pending_input: None,
+            debug_trap_ran: false,
             prompt_guard: None,
             name: None,
             args: vec![],
