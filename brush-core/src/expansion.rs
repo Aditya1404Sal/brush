@@ -2013,9 +2013,23 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     .set_extended_globbing(self.shell.options().extended_globbing)
                     .set_case_insensitive(self.shell.options().case_insensitive_conditionals);
 
-                // If no replacement was provided, then we replace with an empty string.
+                // If no replacement was provided, then we replace with an empty string. With
+                // patsub_replacement (on by default, as in bash), an unquoted `&` in it stands
+                // for the text matched; a quoted or escaped one is itself.
                 let replacement = replacement.unwrap_or(String::new());
-                let expanded_replacement = self.basic_expand_to_str(&replacement).await?;
+                let template = if self.shell.options().patsub_replacement {
+                    let expansion = self.basic_expand(&replacement).await?;
+                    let joiner = if expansion.concatenate {
+                        self.shell.ifs_joiner()
+                    } else {
+                        String::from(' ')
+                    };
+                    replacement_template(expansion, &joiner)
+                } else {
+                    vec![ReplacementPiece::Text(
+                        self.basic_expand_to_str(&replacement).await?,
+                    )]
+                };
 
                 let regex = expanded_pattern.to_regex(
                     matches!(match_kind, brush_parser::word::SubstringMatchKind::Prefix),
@@ -2026,7 +2040,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     Ok(Self::replace_substring(
                         s.as_str(),
                         &regex,
-                        expanded_replacement.as_str(),
+                        &template,
                         &match_kind,
                     ))
                 })
@@ -2575,9 +2589,21 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
     fn replace_substring(
         s: &str,
         regex: &fancy_regex::Regex,
-        replacement: &str,
+        template: &[ReplacementPiece],
         match_kind: &SubstringMatchKind,
     ) -> String {
+        // The replacement is built from the template for each match; its text is never read
+        // as the regex crate's `$name` syntax.
+        let replacement = |captures: &fancy_regex::Captures<'_, str>| -> String {
+            let matched = captures.get(0).map_or("", |m| m.as_str());
+            template
+                .iter()
+                .map(|piece| match piece {
+                    ReplacementPiece::Text(text) => text.as_str(),
+                    ReplacementPiece::Match => matched,
+                })
+                .collect()
+        };
         match match_kind {
             brush_parser::word::SubstringMatchKind::Prefix
             | brush_parser::word::SubstringMatchKind::Suffix
@@ -2649,6 +2675,43 @@ fn list_element_fields(values: Vec<String>, preserve_empty_elements: bool) -> Ve
             WordField(vec![piece])
         })
         .collect()
+}
+
+/// A piece of the replacement in `${x/pattern/replacement}`.
+enum ReplacementPiece {
+    /// Text put in as it is.
+    Text(String),
+    /// The text the pattern matched (an unquoted `&`).
+    Match,
+}
+
+/// The replacement as text and matches: an `&` in unquoted text (the word's own or an
+/// unquoted expansion's) is the match; quoted text, including a backslash-escaped `&`, is
+/// taken literally.
+fn replacement_template(expansion: Expansion, joiner: &str) -> Vec<ReplacementPiece> {
+    let mut template = vec![];
+    for (i, field) in expansion.fields.into_iter().enumerate() {
+        if i > 0 {
+            template.push(ReplacementPiece::Text(joiner.to_owned()));
+        }
+        for piece in field.0 {
+            match piece {
+                ExpansionPiece::Unsplittable(text) => template.push(ReplacementPiece::Text(text)),
+                ExpansionPiece::UnquotedLiteral(text) | ExpansionPiece::Splittable(text) => {
+                    for (j, part) in text.split('&').enumerate() {
+                        if j > 0 {
+                            template.push(ReplacementPiece::Match);
+                        }
+                        if !part.is_empty() {
+                            template.push(ReplacementPiece::Text(part.to_owned()));
+                        }
+                    }
+                }
+                ExpansionPiece::EmptyListElement { .. } => (),
+            }
+        }
+    }
+    template
 }
 
 /// Whether the parameter names all of an array's elements or all positional parameters.
