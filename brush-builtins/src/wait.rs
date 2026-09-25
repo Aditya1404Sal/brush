@@ -120,20 +120,18 @@ impl builtins::Command for WaitCommand {
                         continue;
                     };
                     // `disown` takes a job out of the table, but it is still a child to wait for.
-                    match jobs.job_with_pid_mut(pid) {
-                        Some(job) => job,
-                        None => {
-                            // A job reaped earlier still has its status, as in bash.
-                            if let Some(status) = jobs.reaped_status(pid) {
-                                result = status;
-                            } else {
-                                context.report(format_args!(
-                                    "pid {pid} is not a child of this shell"
-                                ))?;
-                                result = ExecutionExitCode::from(127).into();
-                            }
-                            continue;
+                    if let Some(job) = jobs.job_with_pid_mut(pid) {
+                        job
+                    } else {
+                        // A job reaped earlier still has its status, as in bash.
+                        if let Some(status) = jobs.reaped_status(pid) {
+                            result = status;
+                        } else {
+                            context
+                                .report(format_args!("pid {pid} is not a child of this shell"))?;
+                            result = ExecutionExitCode::from(127).into();
                         }
+                        continue;
                     }
                 }
                 #[cfg(not(target_arch = "wasm32"))]

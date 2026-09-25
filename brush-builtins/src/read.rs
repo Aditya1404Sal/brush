@@ -976,7 +976,7 @@ fn split_line_by_ifs(
             } else {
                 let end = rest
                     .iter()
-                    .rposition(|unit| !ifs.is_whitespace(unit))
+                    .rposition(|unit| !ifs.is_whitespace(*unit))
                     .map_or(0, |last| last + 1);
                 fields.push_back(unit_text(rest.get(..end).unwrap_or_default()));
             }
@@ -995,19 +995,19 @@ struct IfsUnits<'a>(&'a str);
 
 impl IfsUnits<'_> {
     /// Whether the unit is an IFS character; an escaped char never is.
-    fn is_ifs(&self, (c, escaped): &(char, bool)) -> bool {
-        !escaped && self.0.contains(*c)
+    fn is_ifs(&self, (c, escaped): (char, bool)) -> bool {
+        !escaped && self.0.contains(c)
     }
 
     /// Whether the unit is IFS whitespace: a space, tab or newline, when IFS holds it.
-    fn is_whitespace(&self, unit: &(char, bool)) -> bool {
+    fn is_whitespace(&self, unit: (char, bool)) -> bool {
         matches!(unit.0, ' ' | '\t' | '\n') && self.is_ifs(unit)
     }
 
     fn trim_start_whitespace<'u>(&self, units: &'u [(char, bool)]) -> &'u [(char, bool)] {
         let start = units
             .iter()
-            .position(|unit| !self.is_whitespace(unit))
+            .position(|unit| !self.is_whitespace(*unit))
             .unwrap_or(units.len());
         units.get(start..).unwrap_or_default()
     }
@@ -1019,11 +1019,11 @@ impl IfsUnits<'_> {
         let units = self.trim_start_whitespace(units);
         let end = units
             .iter()
-            .position(|unit| self.is_ifs(unit))
+            .position(|unit| self.is_ifs(*unit))
             .unwrap_or(units.len());
         let (field, rest) = units.split_at(end);
         let mut rest = self.trim_start_whitespace(rest);
-        if rest.first().is_some_and(|unit| self.is_ifs(unit)) {
+        if rest.first().is_some_and(|unit| self.is_ifs(*unit)) {
             rest = self.trim_start_whitespace(rest.get(1..).unwrap_or_default());
         }
         (unit_text(field), rest)
