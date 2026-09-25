@@ -2,9 +2,11 @@
 
 use crate::{error, sys, traps};
 
-/// Signals as a Linux system numbers them. On WASM they are synthetic: `kill` delivers them to the
-/// shell's logical processes (see `execution::process`), and names and numbers follow bash on
-/// Linux with musl, whose C library reserves 32 to 34 (they have numbers but no names).
+/// Signals as a Linux system numbers them.
+///
+/// On WASM they are synthetic: `kill` delivers them to the shell's logical processes (see
+/// `execution::process`), and names and numbers follow bash on Linux with musl, whose C library
+/// reserves 32 to 34 (they have numbers but no names).
 #[cfg(target_arch = "wasm32")]
 #[allow(
     unnameable_types,

@@ -198,7 +198,7 @@ impl ProcessTable {
 
     /// Records a final or intermediate status. Unknown numbers are ignored.
     pub fn set_status(&self, pid: Pid, status: ProcessStatus) {
-        let mut inner = self.lock();
+        let inner = &mut *self.lock();
         let Some(entry) = inner.entries.get_mut(&pid) else {
             return;
         };
@@ -313,7 +313,9 @@ mod tests {
     fn counts_running_jobs_across_the_session_and_forgets_old_finished_processes() {
         let table = ProcessTable::new(1, 2);
         let job = table.allocate_job(1, "job".into());
-        let nested = table.clone().allocate_job(job, "nested job".into());
+        // A clone shares the table, as a subshell's copy of the shell does.
+        let clone = table.clone();
+        let nested = clone.allocate_job(job, "nested job".into());
         let stage = table.allocate(1, "stage".into());
         assert_eq!(table.running_jobs(), 2);
         table.set_status(stage, ProcessStatus::Exited(0));

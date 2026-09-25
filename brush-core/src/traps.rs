@@ -154,10 +154,14 @@ pub fn format_signals(
         .sorted_by_key(|(n, _)| *n)
         .collect();
     for (index, (number, signal)) in signals.iter().enumerate() {
-        let separator = if (index + 1) % 5 == 0 { '\n' } else { '\t' };
+        let separator = if (index + 1).is_multiple_of(5) {
+            '\n'
+        } else {
+            '\t'
+        };
         write!(f, "{number:2}) {signal}{separator}")?;
     }
-    if signals.len() % 5 != 0 {
+    if !signals.len().is_multiple_of(5) {
         writeln!(f)?;
     }
     Ok(())

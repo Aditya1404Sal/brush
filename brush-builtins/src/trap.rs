@@ -91,12 +91,11 @@ impl TrapCommand {
         let mut signals = Vec::with_capacity(names.len());
         let mut result = ExecutionResult::success();
         for name in names {
-            match name.parse() {
-                Ok(signal) => signals.push(signal),
-                Err(_) => {
-                    context.report(format_args!("{name}: invalid signal specification"))?;
-                    result = ExecutionResult::general_error();
-                }
+            if let Ok(signal) = name.parse() {
+                signals.push(signal);
+            } else {
+                context.report(format_args!("{name}: invalid signal specification"))?;
+                result = ExecutionResult::general_error();
             }
         }
         Ok((signals, result))

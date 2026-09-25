@@ -183,7 +183,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
     /// `$$` of a shell started as a new process (`bash -c`); `None` keeps the session's.
     #[cfg_attr(feature = "serde", serde(skip))]
-    shell_pid: Option<crate::process_table::Pid>,
+    started_pid: Option<crate::process_table::Pid>,
 
     /// `$!`: the number of the last background job's last process, kept by subshells.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -240,7 +240,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             depth: self.depth + 1,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
-            shell_pid: self.shell_pid,
+            started_pid: self.started_pid,
             last_background_pid: self.last_background_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
@@ -274,7 +274,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Makes `pid` this shell's `$$`, as for a new shell process (`bash -c`); its subshells keep
     /// it.
     pub const fn set_shell_pid(&mut self, pid: crate::process_table::Pid) {
-        self.shell_pid = Some(pid);
+        self.started_pid = Some(pid);
     }
 
     /// `$!`: the number of the last process started in the background, if any. Waiting for or
@@ -291,7 +291,8 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// This shell's `$$`: the session's shell number, or its own if it was started as a new
     /// shell process.
     pub fn shell_pid(&self) -> crate::process_table::Pid {
-        self.shell_pid.unwrap_or_else(|| self.processes.shell_pid())
+        self.started_pid
+            .unwrap_or_else(|| self.processes.shell_pid())
     }
 
     /// Hands this background job the registered processes of its pipeline's stages.

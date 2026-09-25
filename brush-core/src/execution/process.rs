@@ -115,10 +115,11 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// Where one session's background jobs run: apart from the processes that start them, so a job
-/// outlives the subshell, pipeline stage, command substitution or child shell that started it,
-/// as an orphaned process does. The embedder stops the jobs still running when it is done (see
-/// [`ProcessTable::running_job_entries`]) and then cancels what is left with
+/// Where one session's background jobs run: apart from the processes that start them.
+///
+/// A job outlives the subshell, pipeline stage, command substitution or child shell that started
+/// it, as an orphaned process does. The embedder stops the jobs still running when it is done
+/// (see [`ProcessTable::running_job_entries`]) and then cancels what is left with
 /// [`JobScope::cancel_and_join`]. Without a job scope, a job belongs to the process that starts
 /// it and ends with it.
 pub struct JobScope {
@@ -158,9 +159,11 @@ impl Drop for JobScope {
     }
 }
 
-/// Starts the task of a background job of `table`'s session: in the session's [`JobScope`], if
-/// the embedder made one, where it outlives the process that started it and dropping the handle
-/// leaves it running; otherwise as an ordinary task of the current process.
+/// Starts the task of a background job of `table`'s session.
+///
+/// It runs in the session's [`JobScope`], if the embedder made one, where it outlives the process
+/// that started it and dropping the handle leaves it running; otherwise it is an ordinary task of
+/// the current process.
 pub fn spawn_job<T: 'static>(
     services: &super::ExecutionServices,
     table: &ProcessTable,

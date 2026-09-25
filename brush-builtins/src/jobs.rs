@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::fmt::Write as _;
 use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins, jobs};
@@ -43,8 +44,9 @@ impl builtins::Command for JobsCommand {
         let mut result = ExecutionResult::success();
 
         // The jobs to list: those the specs name, or all of them.
-        let mut selected: Option<Vec<u64>> = None;
-        if !self.job_specs.is_empty() {
+        let selected: Option<Vec<u64>> = if self.job_specs.is_empty() {
+            None
+        } else {
             let mut serials = Vec::new();
             for spec in &self.job_specs {
                 let found = finished
@@ -59,16 +61,15 @@ impl builtins::Command for JobsCommand {
                             .ok()
                             .map(|job| job.serial)
                     });
-                match found {
-                    Some(serial) => serials.push(serial),
-                    None => {
-                        context.report(format_args!("{spec}: no such job"))?;
-                        result = ExecutionResult::general_error();
-                    }
+                if let Some(serial) = found {
+                    serials.push(serial);
+                } else {
+                    context.report(format_args!("{spec}: no such job"))?;
+                    result = ExecutionResult::general_error();
                 }
             }
-            selected = Some(serials);
-        }
+            Some(serials)
+        };
 
         let mut listed: Vec<&mut jobs::Job> = context
             .shell
@@ -104,7 +105,7 @@ impl builtins::Command for JobsCommand {
                     .copied()
                     .or_else(|| job.representative_pid())
                 {
-                    out.push_str(&format!("{pid}\n"));
+                    let _ = writeln!(out, "{pid}");
                 }
             } else if self.also_show_pids {
                 #[cfg(target_arch = "wasm32")]
@@ -115,7 +116,7 @@ impl builtins::Command for JobsCommand {
                 #[cfg(not(target_arch = "wasm32"))]
                 return brush_core::error::unimp("jobs -l");
             } else {
-                out.push_str(&format!("{job}\n"));
+                let _ = writeln!(out, "{job}");
             }
         }
         context.stdout().write_all(out.as_bytes())?;
