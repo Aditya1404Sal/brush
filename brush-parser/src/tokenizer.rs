@@ -186,6 +186,8 @@ impl TokenizerError {
 pub(crate) struct Tokens<'a> {
     /// Sequence of tokens.
     pub tokens: &'a [Token],
+    /// The text the tokens were read from, when known.
+    pub source: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +276,8 @@ pub(crate) struct Tokenizer<'a, R: ?Sized + std::io::BufRead> {
     char_reader: std::iter::Peekable<utf8_chars::Chars<'a, R>>,
     /// A character read and put back (see `peek_second_char`), to be read again first.
     put_back: Option<char>,
+    /// The text read so far.
+    text: String,
     cross_state: CrossTokenParseState,
     options: TokenizerOptions,
 }
@@ -592,6 +596,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             options: options.clone(),
             char_reader: reader.chars().peekable(),
             put_back: None,
+            text: String::new(),
             cross_state: CrossTokenParseState {
                 cursor: SourcePosition {
                     index: 0,
@@ -618,11 +623,15 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     fn next_char(&mut self) -> Result<Option<char>, TokenizerError> {
         let c = match self.put_back.take() {
             Some(c) => Some(c),
-            None => self
-                .char_reader
-                .next()
-                .transpose()
-                .map_err(TokenizerError::ReadError)?,
+            None => {
+                let c = self
+                    .char_reader
+                    .next()
+                    .transpose()
+                    .map_err(TokenizerError::ReadError)?;
+                self.text.extend(c);
+                c
+            }
         };
 
         if let Some(ch) = c {
@@ -666,6 +675,11 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         self.cross_state.cursor.column -= 1;
         self.cross_state.cursor.index -= 1;
         second
+    }
+
+    /// Takes the text read so far.
+    pub fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.text)
     }
 
     pub fn next_token(&mut self) -> Result<TokenizeResult, TokenizerError> {

@@ -689,7 +689,9 @@ impl SourceLocation for ArithmeticCommand {
 
 impl Display for ArithmeticCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "(( {} ))", self.expr)
+        // The expression is printed as written, blanks and lines and all, as bash prints it.
+        let _verbatim = Verbatim::enter();
+        write!(f, "(({}))", self.expr)
     }
 }
 
