@@ -101,12 +101,8 @@ impl builtins::Command for WaitCommand {
                     {
                         let pid: brush_core::process_table::Pid =
                             brush_core::int_utils::parse(id.as_str(), 10)?;
-                        let job = context
-                            .shell
-                            .jobs_mut()
-                            .jobs
-                            .iter_mut()
-                            .find(|job| job.pids().contains(&pid) || job.leader() == Some(pid));
+                        // `disown` takes a job out of the table, but it is still a child to wait for.
+                        let job = context.shell.jobs_mut().job_with_pid_mut(pid);
                         if let Some(job) = job {
                             match interruptible(job.wait()).await? {
                                 Ok(status) => result = status,

@@ -100,6 +100,68 @@ thread_local! {
     static CURRENT: RefCell<Option<Rc<ProcessState>>> = const { RefCell::new(None) };
     static REGISTRY: RefCell<HashMap<(u64, Pid), Weak<ProcessState>>> =
         RefCell::new(HashMap::new());
+    static JOB_SCOPES: RefCell<HashMap<u64, Rc<super::TaskScope>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Where one session's background jobs run: apart from the processes that start them, so a job
+/// outlives the subshell, pipeline stage, command substitution or child shell that started it,
+/// as an orphaned process does. The embedder stops the jobs still running when it is done (see
+/// [`ProcessTable::running_job_entries`]) and then cancels what is left with
+/// [`JobScope::cancel_and_join`]. Without a job scope, a job belongs to the process that starts
+/// it and ends with it.
+pub struct JobScope {
+    table: u64,
+    scope: Rc<super::TaskScope>,
+}
+
+impl JobScope {
+    /// Makes this the job scope of `table`'s session until it is dropped.
+    #[must_use]
+    pub fn new(table: &ProcessTable) -> Self {
+        let scope = Rc::new(super::TaskScope::default());
+        JOB_SCOPES.with_borrow_mut(|scopes| scopes.insert(table.id(), scope.clone()));
+        Self {
+            table: table.id(),
+            scope,
+        }
+    }
+
+    /// Cancels every job still running and waits until they have released their resources.
+    pub async fn cancel_and_join(&self) {
+        self.scope.cancel_and_join().await;
+    }
+}
+
+impl Drop for JobScope {
+    fn drop(&mut self) {
+        JOB_SCOPES.with_borrow_mut(|scopes| {
+            if scopes
+                .get(&self.table)
+                .is_some_and(|scope| Rc::ptr_eq(scope, &self.scope))
+            {
+                scopes.remove(&self.table);
+            }
+        });
+        self.scope.abort();
+    }
+}
+
+/// Starts the task of a background job of `table`'s session: in the session's [`JobScope`], if
+/// the embedder made one, where it outlives the process that started it and dropping the handle
+/// leaves it running; otherwise as an ordinary task of the current process.
+pub fn spawn_job<T: 'static>(
+    services: &super::ExecutionServices,
+    table: &ProcessTable,
+    future: impl Future<Output = T> + 'static,
+) -> super::LocalTaskHandle<T> {
+    let Some(scope) = JOB_SCOPES.with_borrow(|scopes| scopes.get(&table.id()).cloned()) else {
+        return services.spawn(future);
+    };
+    let _restore = super::RestoreScope(super::CURRENT_SCOPE.replace(Some(scope)));
+    let mut handle = services.spawn(future);
+    handle.adopted = true;
+    handle
 }
 
 pub(super) struct ProcessState {
@@ -653,6 +715,34 @@ mod tests {
             .unwrap();
             assert_eq!(u8::from(result.exit_code), 141);
             assert!(released.get());
+        });
+    }
+
+    #[test]
+    fn a_job_outlives_its_process_in_a_job_scope_and_ends_with_it_otherwise() {
+        run(async {
+            let services = ExecutionServices::default();
+            let table = ProcessTable::new(10, 11);
+            for adopted in [true, false] {
+                let jobs = adopted.then(|| JobScope::new(&table));
+                let released = Rc::new(Cell::new(false));
+                let guard = Released(released.clone());
+                run_process(PipeDisposition::Default, async {
+                    // Dropping the handle, as a subshell's job table is dropped, keeps it running.
+                    drop(spawn_job(&services, &table, async move {
+                        let _guard = guard;
+                        futures::future::pending::<()>().await;
+                    }));
+                    Ok(ExecutionResult::success())
+                })
+                .await
+                .unwrap();
+                assert_eq!(released.get(), !adopted);
+                if let Some(jobs) = jobs {
+                    jobs.cancel_and_join().await;
+                    assert!(released.get());
+                }
+            }
         });
     }
 

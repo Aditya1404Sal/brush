@@ -351,7 +351,8 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
 
     // Bash forks once for `( list ) &`: the subshell is the job itself, so its traps are the job's.
     let subshell_body = sole_subshell_body(ao_list).cloned();
-    let join_handle = spawn_command_task(shell.execution_services(), async move {
+    // The job outlives the subshell, stage or child shell that starts it, as an orphan does.
+    let join_handle = process::spawn_job(&shell.execution_services(), &table, async move {
         leader_process
             .run(async move {
                 let result = match subshell_body {
@@ -381,6 +382,9 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     } else {
         stage_pids
     };
+    if let Some(last) = pids.last() {
+        table.set_shown_pid(leader, *last);
+    }
     shell.jobs_mut().add_as_current(jobs::Job::new_numbered(
         [jobs::JobTask::Internal(join_handle)],
         command_line,

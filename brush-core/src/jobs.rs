@@ -186,6 +186,19 @@ impl JobManager {
         true
     }
 
+    /// Jobs `disown` took out of the table, still running or not yet reaped.
+    pub fn disowned(&self) -> &[Job] {
+        &self.disowned
+    }
+
+    /// The job, listed or disowned, one of whose process numbers is `pid`.
+    pub fn job_with_pid_mut(&mut self, pid: crate::process_table::Pid) -> Option<&mut Job> {
+        self.jobs
+            .iter_mut()
+            .chain(self.disowned.iter_mut())
+            .find(|job| job.pids.contains(&pid) || job.leader == Some(pid))
+    }
+
     /// Tries to resolve the given job specification to a job.
     ///
     /// # Arguments

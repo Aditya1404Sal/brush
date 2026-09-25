@@ -42,6 +42,8 @@ pub struct ProcessEntry {
     pub job: bool,
     /// Allocation order within the table, for reporting processes in the order they started.
     pub order: u64,
+    /// The number the process is known by: for a background pipeline, its last stage (`$!`).
+    pub shown: Pid,
 }
 
 /// How many finished processes keep their entry, so a late status lookup still finds them.
@@ -174,6 +176,7 @@ impl ProcessTable {
                 status: ProcessStatus::Running,
                 job,
                 order,
+                shown: candidate,
             },
         );
         candidate
@@ -203,6 +206,13 @@ impl ProcessTable {
                     inner.entries.remove(&oldest);
                 }
             }
+        }
+    }
+
+    /// Records the number process `pid` is known by, such as a background pipeline's last stage.
+    pub fn set_shown_pid(&self, pid: Pid, shown: Pid) {
+        if let Some(entry) = self.lock().entries.get_mut(&pid) {
+            entry.shown = shown;
         }
     }
 
