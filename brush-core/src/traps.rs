@@ -264,11 +264,18 @@ impl TrapHandlerConfig {
         }
     }
 
-    /// Iterates over the registered handlers for trap signals.
+    /// Iterates over the registered handlers for trap signals, in the order bash lists them:
+    /// EXIT, the signals by number, then DEBUG, ERR and RETURN.
     pub fn iter_handlers(&self) -> impl Iterator<Item = (TrapSignal, &TrapHandler)> {
         self.handlers
             .iter()
             .map(|(signal, handler)| (*signal, handler))
+            .sorted_by_key(|(signal, _)| match signal {
+                TrapSignal::Debug => (1, 0),
+                TrapSignal::Err => (1, 1),
+                TrapSignal::Return => (1, 2),
+                signal => (0, i32::try_from(*signal).unwrap_or(0)),
+            })
     }
 
     /// Tries to find the handler associated with the given signal.
