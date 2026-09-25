@@ -54,6 +54,13 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         (enabled && self.programs.contains_key(name)).then(|| Path::new(PROGRAM_DIRS[0]).join(name))
     }
 
+    /// Whether `name` is registered only to stand for a program bash has no builtin for
+    /// ([`builtins::ProgramKind::File`]): `builtin` and `enable` do not treat it as a shell
+    /// builtin, as bash does not.
+    pub fn is_file_program(&self, name: &str) -> bool {
+        self.programs.get(name) == Some(&builtins::ProgramKind::File)
+    }
+
     /// The file the builtin `name` is reported as (`/bin/cat` for `cat`), if it stands for a
     /// [`builtins::ProgramKind::File`] program.
     pub fn program_file(&self, name: &str) -> Option<PathBuf> {
@@ -157,6 +164,9 @@ mod tests {
         assert_eq!(shell.program_path("echo"), Some(PathBuf::from("/bin/echo")));
         assert_eq!(shell.program_file("echo"), None);
         assert_eq!(shell.program_file("cat"), Some(PathBuf::from("/bin/cat")));
+        assert!(shell.is_file_program("cat"));
+        assert!(!shell.is_file_program("echo"));
+        assert!(!shell.is_file_program("cd"));
         assert_eq!(shell.program_builtin("/bin/cat"), Some("cat"));
         assert_eq!(shell.program_builtin("/usr/bin/cat"), Some("cat"));
         assert_eq!(

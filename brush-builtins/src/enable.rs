@@ -55,7 +55,12 @@ impl builtins::Command for EnableCommand {
 
         if !self.names.is_empty() {
             for name in &self.names {
-                if let Some(builtin) = context.shell.builtin_mut(name) {
+                // A builtin that stands for a program bash has no builtin for (`cat`) is not a
+                // shell builtin to enable or disable.
+                if context.shell.is_file_program(name) {
+                    context.report(format_args!("{name}: not a shell builtin"))?;
+                    result = ExecutionResult::general_error();
+                } else if let Some(builtin) = context.shell.builtin_mut(name) {
                     builtin.disabled = self.disable;
                 } else {
                     context.report(format_args!("{name}: not a shell builtin"))?;
@@ -67,6 +72,7 @@ impl builtins::Command for EnableCommand {
                 .shell
                 .builtins()
                 .iter()
+                .filter(|(name, _reg)| !context.shell.is_file_program(name))
                 .sorted_by_key(|(name, _reg)| *name)
                 .collect();
 
