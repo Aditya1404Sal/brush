@@ -320,14 +320,28 @@ impl JobManager {
     ///
     /// * `job_spec` - The job specification to resolve.
     pub fn find_job_spec(&mut self, job_spec: &str) -> Result<&mut Job, JobSpecError> {
+        let index = self.job_spec_index(job_spec, false)?;
+        Ok(&mut self.jobs[index])
+    }
+
+    /// Whether `job_spec` names a job this shell lists, its parent's copies included, as `jobs`
+    /// and `jobs -x` resolve it.
+    pub fn lists_job_spec(&self, job_spec: &str) -> bool {
+        self.job_spec_index(job_spec, true).is_ok()
+    }
+
+    fn job_spec_index(&self, job_spec: &str, copies: bool) -> Result<usize, JobSpecError> {
         let remainder = job_spec.strip_prefix('%').ok_or(JobSpecError::NoSuchJob)?;
-        let own = |job: &&mut Job| !job.listing_only;
+        let eligible = |job: &Job| copies || !job.listing_only;
+        let position = |found: &dyn Fn(&Job) -> bool| {
+            self.jobs.iter().position(|job| eligible(job) && found(job))
+        };
         match remainder {
-            "" | "%" | "+" => self.current_job_mut().filter(|job| !job.listing_only),
-            "-" => self.prev_job_mut().filter(|job| !job.listing_only),
+            "" | "%" | "+" => position(&|job| matches!(job.annotation, JobAnnotation::Current)),
+            "-" => position(&|job| matches!(job.annotation, JobAnnotation::Previous)),
             s if s.chars().all(char::is_numeric) => {
                 let id = s.parse::<usize>().map_err(|_| JobSpecError::NoSuchJob)?;
-                self.jobs.iter_mut().filter(own).find(|j| j.id == id)
+                position(&|job| job.id == id)
             }
             s => {
                 let matches = |job: &Job| match s.strip_prefix('?') {
@@ -337,12 +351,12 @@ impl JobManager {
                 let count = self
                     .jobs
                     .iter()
-                    .filter(|job| !job.listing_only && matches(job))
+                    .filter(|job| eligible(job) && matches(job))
                     .count();
                 if count > 1 {
                     return Err(JobSpecError::Ambiguous);
                 }
-                self.jobs.iter_mut().filter(own).find(|job| matches(job))
+                position(&matches)
             }
         }
         .ok_or(JobSpecError::NoSuchJob)
