@@ -161,6 +161,7 @@ impl builtins::Command for ReadCommand {
             context.shell,
             input_line.as_deref(),
             &ifs,
+            !self.raw_mode,
             skip_ifs_splitting,
             self.array_variable.as_deref(),
             &self.variable_names,
@@ -180,12 +181,13 @@ fn assign_input_to_variables(
     shell: &mut brush_core::Shell<impl brush_core::ShellExtensions>,
     input_line: Option<&str>,
     ifs: &str,
+    escapes: bool,
     skip_ifs_splitting: bool,
     array_variable: Option<&str>,
     variable_names: &[String],
 ) -> Result<(), brush_core::Error> {
     if let Some(array_variable) = array_variable {
-        let literal_fields = build_array_fields(input_line, ifs, skip_ifs_splitting);
+        let literal_fields = build_array_fields(input_line, ifs, escapes, skip_ifs_splitting);
         shell.env_mut().update_or_add(
             array_variable,
             variables::ShellValueLiteral::Array(variables::ArrayLiteral(literal_fields)),
@@ -194,11 +196,21 @@ fn assign_input_to_variables(
             env::EnvironmentScope::Global,
         )?;
     } else if !variable_names.is_empty() {
-        assign_to_named_variables(shell, input_line, ifs, skip_ifs_splitting, variable_names)?;
+        assign_to_named_variables(
+            shell,
+            input_line,
+            ifs,
+            escapes,
+            skip_ifs_splitting,
+            variable_names,
+        )?;
     } else {
         shell.env_mut().update_or_add(
             "REPLY",
-            variables::ShellValueLiteral::Scalar(input_line.unwrap_or_default().to_owned()),
+            variables::ShellValueLiteral::Scalar(unescape_input(
+                input_line.unwrap_or_default(),
+                escapes,
+            )),
             |_| Ok(()),
             env::EnvironmentLookup::Anywhere,
             env::EnvironmentScope::Global,
@@ -216,11 +228,17 @@ fn assign_to_named_variables(
     shell: &mut brush_core::Shell<impl brush_core::ShellExtensions>,
     input_line: Option<&str>,
     ifs: &str,
+    escapes: bool,
     skip_ifs_splitting: bool,
     variable_names: &[String],
 ) -> Result<(), brush_core::Error> {
-    let mut fields =
-        build_variable_fields(input_line, ifs, skip_ifs_splitting, variable_names.len());
+    let mut fields = build_variable_fields(
+        input_line,
+        ifs,
+        escapes,
+        skip_ifs_splitting,
+        variable_names.len(),
+    );
 
     for (i, name) in variable_names.iter().enumerate() {
         let is_last = i == variable_names.len() - 1;
@@ -253,15 +271,17 @@ fn assign_to_named_variables(
 fn build_array_fields(
     input_line: Option<&str>,
     ifs: &str,
+    escapes: bool,
     skip_ifs_splitting: bool,
 ) -> Vec<(Option<String>, String)> {
     match input_line {
         Some(line) if skip_ifs_splitting => {
             // With -N, don't split - put entire input as single element.
-            vec![(None, line.to_string())]
+            vec![(None, unescape_input(line, escapes))]
         }
         Some(line) => {
-            let fields: VecDeque<_> = split_line_by_ifs(ifs, line, None /* max_fields */);
+            let fields: VecDeque<_> =
+                split_line_by_ifs(ifs, line, None /* max_fields */, escapes);
             fields.into_iter().map(|f| (None, f)).collect()
         }
         None => vec![],
@@ -272,15 +292,16 @@ fn build_array_fields(
 fn build_variable_fields(
     input_line: Option<&str>,
     ifs: &str,
+    escapes: bool,
     skip_ifs_splitting: bool,
     num_variables: usize,
 ) -> VecDeque<String> {
     match input_line {
         Some(line) if skip_ifs_splitting => {
             // With -N, don't split - put entire input in first variable.
-            VecDeque::from([line.to_string()])
+            VecDeque::from([unescape_input(line, escapes)])
         }
-        Some(line) => split_line_by_ifs(ifs, line, Some(num_variables)),
+        Some(line) => split_line_by_ifs(ifs, line, Some(num_variables), escapes),
         None => VecDeque::new(),
     }
 }
@@ -652,7 +673,10 @@ async fn read_line_with_reader(
                             continue; // Line continuation.
                         }
 
-                        // For other chars, add char literally (backslash consumed).
+                        // For other chars, keep the escape: the char is literal, so field
+                        // splitting must not split on it; the backslash is removed when the
+                        // line is split or assigned (see `input_units`).
+                        line.push(BACKSLASH);
                         line.push(ch);
                         output_chars += 1;
 
@@ -844,15 +868,32 @@ impl ReadCommand {
 /// * `ifs` - The IFS string (typically " \t\n")
 /// * `line` - The input line to split
 /// * `max_fields` - Optional limit on number of fields (for `read var1 var2`)
-fn split_line_by_ifs(ifs: &str, line: &str, max_fields: Option<usize>) -> VecDeque<String> {
+/// * `escapes` - Whether the line holds backslash escapes (see `input_units`)
+fn split_line_by_ifs(
+    ifs: &str,
+    line: &str,
+    max_fields: Option<usize>,
+    escapes: bool,
+) -> VecDeque<String> {
     let ifs_chars: Vec<char> = ifs.chars().collect();
 
-    // Helper to check if a char is IFS whitespace (space, tab, or newline AND in IFS).
-    let is_ifs_whitespace =
-        |c: char| -> bool { (c == ' ' || c == '\t' || c == '\n') && ifs_chars.contains(&c) };
+    // Helper to check if a char is IFS whitespace (space, tab, or newline AND in IFS). An
+    // escaped char is never a delimiter.
+    let is_ifs_whitespace = |(c, escaped): &(char, bool)| -> bool {
+        !escaped && (*c == ' ' || *c == '\t' || *c == '\n') && ifs_chars.contains(c)
+    };
 
     // Trim leading/trailing IFS whitespace from the input.
-    let trimmed_line = line.trim_matches(&is_ifs_whitespace);
+    let units = input_units(line, escapes);
+    let start = units
+        .iter()
+        .position(|unit| !is_ifs_whitespace(unit))
+        .unwrap_or(units.len());
+    let end = units
+        .iter()
+        .rposition(|unit| !is_ifs_whitespace(unit))
+        .map_or(start, |last| last + 1);
+    let trimmed_line = units.get(start..end).unwrap_or_default();
     if trimmed_line.is_empty() {
         return VecDeque::new();
     }
@@ -869,25 +910,25 @@ fn split_line_by_ifs(ifs: &str, line: &str, max_fields: Option<usize>) -> VecDeq
     let mut prev_was_non_ws_delim = false;
     let mut collecting_remainder = false;
 
-    for c in trimmed_line.chars() {
+    for &(c, escaped) in trimmed_line {
         // Skip consecutive IFS whitespace (they act as single delimiter).
-        if consuming_whitespace_run && is_ifs_whitespace(c) {
+        if consuming_whitespace_run && is_ifs_whitespace(&(c, escaped)) {
             continue;
         }
         consuming_whitespace_run = false;
 
-        let is_delimiter = ifs_chars.contains(&c);
+        let is_delimiter = !escaped && ifs_chars.contains(&c);
         let at_field_limit = fields.len() + 1 >= max_fields;
 
         if !at_field_limit && is_delimiter {
             // Normal case: delimiter ends current field, start new one.
             fields.push_back(std::mem::take(&mut current_field));
-            consuming_whitespace_run = is_ifs_whitespace(c);
+            consuming_whitespace_run = is_ifs_whitespace(&(c, escaped));
             prev_was_non_ws_delim = !consuming_whitespace_run;
         } else if at_field_limit && !collecting_remainder && is_delimiter {
             // At field limit but haven't started last field content yet.
             // Skip leading IFS whitespace for the final field.
-            if is_ifs_whitespace(c) {
+            if is_ifs_whitespace(&(c, escaped)) {
                 consuming_whitespace_run = true;
             } else {
                 // Non-whitespace delimiters at boundary: include in remainder.
@@ -910,6 +951,32 @@ fn split_line_by_ifs(ifs: &str, line: &str, max_fields: Option<usize>) -> VecDeq
     }
 
     fields
+}
+
+/// The characters of a line read without `-r`, where a backslash escape (kept by
+/// `read_line_with_reader`) marks the char after it as literal, each with whether it was
+/// escaped; with `escapes` false, every char stands for itself.
+fn input_units(line: &str, escapes: bool) -> Vec<(char, bool)> {
+    let mut units = Vec::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if escapes && c == BACKSLASH {
+            if let Some(escaped) = chars.next() {
+                units.push((escaped, true));
+                continue;
+            }
+        }
+        units.push((c, false));
+    }
+    units
+}
+
+/// A line read without `-r` with its backslash escapes removed.
+fn unescape_input(line: &str, escapes: bool) -> String {
+    input_units(line, escapes)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect()
 }
 
 #[cfg(test)]
@@ -958,47 +1025,59 @@ mod tests {
     // ==================== split_line_by_ifs tests ====================
 
     #[test]
+    fn test_split_line_by_ifs_keeps_escaped_delimiters() {
+        // Without -r, an escaped IFS character is literal, and the escapes are removed.
+        let result = split_line_by_ifs(":", "a\\:b:c", Some(2), true);
+        assert_equal(result, VecDeque::from(vec!["a:b", "c"]));
+        let result = split_line_by_ifs(" ", "\\ a\\  b\\ ", None, true);
+        assert_equal(result, VecDeque::from(vec![" a ", "b "]));
+        // With -r, a backslash is an ordinary character.
+        let result = split_line_by_ifs(":", "a\\:b", None, false);
+        assert_equal(result, VecDeque::from(vec!["a\\", "b"]));
+    }
+
+    #[test]
     fn test_split_line_by_ifs_basic() {
-        let result = split_line_by_ifs(",", "a,b,c", None);
+        let result = split_line_by_ifs(",", "a,b,c", None, false);
         assert_equal(result, VecDeque::from(vec!["a", "b", "c"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_leading_or_trailing_space() {
-        let result = split_line_by_ifs(" ", "  a b c ", None);
+        let result = split_line_by_ifs(" ", "  a b c ", None, false);
         assert_equal(result, VecDeque::from(vec!["a", "b", "c"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_extra_interior_space() {
-        let result = split_line_by_ifs(" ", "a  b c", None);
+        let result = split_line_by_ifs(" ", "a  b c", None, false);
         assert_equal(result, VecDeque::from(vec!["a", "b", "c"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_leading_non_space_delimiter() {
-        let result = split_line_by_ifs(",", ",a,b,c", None);
+        let result = split_line_by_ifs(",", ",a,b,c", None, false);
         assert_equal(result, VecDeque::from(vec!["", "a", "b", "c"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_trailing_non_space_delimiter() {
         // Bash does NOT include empty trailing field when input ends with non-ws delimiter.
-        let result = split_line_by_ifs(",", "a,b,c,", None);
+        let result = split_line_by_ifs(",", "a,b,c,", None, false);
         assert_equal(result, VecDeque::from(vec!["a", "b", "c"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_max_fields() {
         // With max_fields=2, remainder goes into second field.
-        let result = split_line_by_ifs(" ", "a b c d", Some(2));
+        let result = split_line_by_ifs(" ", "a b c d", Some(2), false);
         assert_equal(result, VecDeque::from(vec!["a", "b c d"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_max_fields_with_non_ws_delimiter() {
         // With max_fields and non-whitespace delimiter.
-        let result = split_line_by_ifs(",", "a,b,c,d", Some(2));
+        let result = split_line_by_ifs(",", "a,b,c,d", Some(2), false);
         assert_equal(result, VecDeque::from(vec!["a", "b,c,d"]));
     }
 
@@ -1006,41 +1085,41 @@ mod tests {
     fn test_split_line_by_ifs_consecutive_delimiters_at_boundary() {
         // Consecutive non-whitespace delimiters at field boundary should be preserved.
         // e.g., "x::y" with IFS=":" and 2 vars gives ["x", ":y"]
-        let result = split_line_by_ifs(":", "x::y", Some(2));
+        let result = split_line_by_ifs(":", "x::y", Some(2), false);
         assert_equal(result, VecDeque::from(vec!["x", ":y"]));
 
         // Triple delimiter at boundary.
-        let result = split_line_by_ifs(":", "x:::y", Some(2));
+        let result = split_line_by_ifs(":", "x:::y", Some(2), false);
         assert_equal(result, VecDeque::from(vec!["x", "::y"]));
 
         // Delimiter in middle of remainder is also preserved.
-        let result = split_line_by_ifs(":", "x:y:z:w", Some(2));
+        let result = split_line_by_ifs(":", "x:y:z:w", Some(2), false);
         assert_equal(result, VecDeque::from(vec!["x", "y:z:w"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_mixed_delimiters() {
         // Mixed whitespace and non-whitespace in IFS.
-        let result = split_line_by_ifs(": ", "a:b  c:d", None);
+        let result = split_line_by_ifs(": ", "a:b  c:d", None, false);
         assert_equal(result, VecDeque::from(vec!["a", "b", "c", "d"]));
     }
 
     #[test]
     fn test_split_line_by_ifs_empty_input() {
-        let result = split_line_by_ifs(" ", "", None);
+        let result = split_line_by_ifs(" ", "", None, false);
         assert_equal(result, VecDeque::<String>::new());
     }
 
     #[test]
     fn test_split_line_by_ifs_whitespace_only() {
-        let result = split_line_by_ifs(" ", "   ", None);
+        let result = split_line_by_ifs(" ", "   ", None, false);
         assert_equal(result, VecDeque::<String>::new());
     }
 
     #[test]
     fn test_split_line_by_ifs_consecutive_non_ws_delimiters() {
         // Consecutive non-whitespace delimiters create empty fields.
-        let result = split_line_by_ifs(",", "a,,b", None);
+        let result = split_line_by_ifs(",", "a,,b", None, false);
         assert_equal(result, VecDeque::from(vec!["a", "", "b"]));
     }
 
@@ -1048,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_build_array_fields_basic() {
-        let result = build_array_fields(Some("a b c"), " ", false);
+        let result = build_array_fields(Some("a b c"), " ", false, false);
         assert_eq!(
             result,
             vec![
@@ -1062,13 +1141,13 @@ mod tests {
     #[test]
     fn test_build_array_fields_skip_splitting() {
         // With -N option, entire input goes as single element.
-        let result = build_array_fields(Some("a b c"), " ", true);
+        let result = build_array_fields(Some("a b c"), " ", false, true);
         assert_eq!(result, vec![(None, "a b c".to_string())]);
     }
 
     #[test]
     fn test_build_array_fields_none_input() {
-        let result = build_array_fields(None, " ", false);
+        let result = build_array_fields(None, " ", false, false);
         assert!(result.is_empty());
     }
 
@@ -1076,27 +1155,27 @@ mod tests {
 
     #[test]
     fn test_build_variable_fields_basic() {
-        let result = build_variable_fields(Some("a b c"), " ", false, 3);
+        let result = build_variable_fields(Some("a b c"), " ", false, false, 3);
         assert_equal(result, VecDeque::from(vec!["a", "b", "c"]));
     }
 
     #[test]
     fn test_build_variable_fields_fewer_vars_than_fields() {
         // Last variable gets remainder.
-        let result = build_variable_fields(Some("a b c d"), " ", false, 2);
+        let result = build_variable_fields(Some("a b c d"), " ", false, false, 2);
         assert_equal(result, VecDeque::from(vec!["a", "b c d"]));
     }
 
     #[test]
     fn test_build_variable_fields_skip_splitting() {
         // With -N option, entire input goes to first variable.
-        let result = build_variable_fields(Some("a b c"), " ", true, 3);
+        let result = build_variable_fields(Some("a b c"), " ", false, true, 3);
         assert_equal(result, VecDeque::from(vec!["a b c"]));
     }
 
     #[test]
     fn test_build_variable_fields_none_input() {
-        let result = build_variable_fields(None, " ", false, 3);
+        let result = build_variable_fields(None, " ", false, false, 3);
         assert!(result.is_empty());
     }
 }

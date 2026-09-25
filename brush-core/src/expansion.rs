@@ -206,10 +206,13 @@ impl From<ExpansionPiece> for Expansion {
 
 impl Expansion {
     fn classify(&self) -> ParameterState {
-        let non_empty = self
-            .fields
-            .iter()
-            .any(|field| field.0.iter().any(|piece| !piece.as_str().is_empty()));
+        // Bash tests the elements joined by spaces, so two or more elements are never null,
+        // even if each is empty.
+        let non_empty = self.fields.len() > 1
+            || self
+                .fields
+                .iter()
+                .any(|field| field.0.iter().any(|piece| !piece.as_str().is_empty()));
 
         if self.undefined {
             ParameterState::Undefined
@@ -1034,7 +1037,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
                 result?
             } else {
-                // Not double-quoted - wrap in double-quotes to get double-quote parsing semantics
+                // Not double-quoted - wrap in double-quotes to get double-quote parsing semantics.
+                // Bash (with extquote, its default) still expands a `$'...'` in such a word.
+                let word = self.expand_ansi_c_quotes_for_double_quotes(word);
                 let wrapped = std::format!("\"{word}\"");
                 self.basic_expand(&wrapped).await?
             }
@@ -1054,6 +1059,39 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
 
         Ok(expansion)
+    }
+
+    /// Replaces each `$'...'` in a word that is about to be expanded inside double quotes with
+    /// its value, escaped for double quotes.
+    fn expand_ansi_c_quotes_for_double_quotes<'w>(&self, word: &'w str) -> Cow<'w, str> {
+        if !word.contains("$'") {
+            return Cow::Borrowed(word);
+        }
+        let Ok(pieces) = brush_parser::word::parse(word, &self.parser_options) else {
+            return Cow::Borrowed(word);
+        };
+        let mut replaced = String::with_capacity(word.len());
+        for piece in pieces {
+            if let brush_parser::word::WordPiece::AnsiCQuotedText(text) = &piece.piece {
+                let Ok((bytes, _)) = escape::expand_backslash_escapes(
+                    text.as_str(),
+                    escape::EscapeExpansionMode::AnsiCQuotes,
+                ) else {
+                    return Cow::Borrowed(word);
+                };
+                for c in crate::rawbytes::decode_vec(bytes).chars() {
+                    if matches!(c, '\\' | '$' | '`' | '"') {
+                        replaced.push('\\');
+                    }
+                    replaced.push(c);
+                }
+            } else if let Some(text) = word.get(piece.start_index..piece.end_index) {
+                replaced.push_str(text);
+            } else {
+                return Cow::Borrowed(word);
+            }
+        }
+        Cow::Owned(replaced)
     }
 
     /// Performs brace expansion on the word, yielding the resulting words, or `None` if
@@ -1542,6 +1580,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         brush_parser::word::ParameterTestType::Unset,
                         ParameterState::DefinedEmptyString,
                     ) => Ok(self.expand_parameter_word(alternative_value).await?),
+                    // Otherwise the parameter's own (null) expansion stands, as in bash: for
+                    // "${a[@]:+w}" with no elements that is no word at all.
+                    _ if expanded_parameter.fields.is_empty() => Ok(expanded_parameter),
                     _ => Ok(Expansion::from(String::new())),
                 }
             }
@@ -1715,13 +1756,26 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 indirect,
                 op: ParameterTransformOp::ToAttributeFlags,
             } => {
-                if let (_, _, Some(var)) = self
+                let flags = if let (_, _, Some(var)) = self
                     .try_resolve_parameter_to_variable(&parameter, indirect)
                     .await?
                 {
-                    Ok(var.attribute_flags(self.shell).into())
+                    var.attribute_flags(self.shell)
                 } else {
-                    Ok(String::new().into())
+                    String::new()
+                };
+                if names_all_elements(&parameter) {
+                    // Bash gives the flags once for each element (or positional parameter).
+                    let expanded = self
+                        .expand_parameter_allowing_unset(&parameter, indirect)
+                        .await?;
+                    let count = expanded.fields.len();
+                    Ok(element_list(
+                        std::iter::repeat_n(flags, count),
+                        expanded.concatenate,
+                    ))
+                } else {
+                    Ok(flags.into())
                 }
             }
             brush_parser::word::ParameterExpr::Transform {
@@ -1729,20 +1783,43 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 indirect,
                 op: ParameterTransformOp::ToAssignmentLogic,
             } => {
+                if let brush_parser::word::Parameter::Special(
+                    brush_parser::word::SpecialParameter::AllPositionalParameters { concatenate },
+                ) = &parameter
+                {
+                    // The positional parameters as the `set` command that assigns them.
+                    let args = self.shell.current_shell_args();
+                    let words: Vec<String> = if args.is_empty() {
+                        vec![]
+                    } else {
+                        ["set".to_owned(), "--".to_owned()]
+                            .into_iter()
+                            .chain(args.iter().map(|arg| {
+                                escape::force_quote(arg, escape::QuoteMode::SingleQuote)
+                            }))
+                            .collect()
+                    };
+                    return Ok(element_list(words, *concatenate));
+                }
+
                 if let (Some(name), index, Some(var)) = self
                     .try_resolve_parameter_to_variable(&parameter, indirect)
                     .await?
                 {
+                    // A nameref is shown as the variable it names.
+                    let name = self.shell.env().resolve_nameref(&name).into_owned();
                     let assignable_value_str = var
                         .value()
                         .to_assignable_str(index.as_deref(), self.shell)?;
 
-                    let mut attr_str = var.attribute_flags(self.shell);
-                    if attr_str.is_empty() {
-                        attr_str.push('-');
-                    }
+                    let attr_str = var.attribute_flags(self.shell);
+                    let attr_or_dash = if attr_str.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        attr_str.clone()
+                    };
 
-                    match var.value() {
+                    let text = match var.value() {
                         ShellValue::IndexedArray(_)
                         | ShellValue::AssociativeArray(_)
                         // TODO(dynamic): confirm this
@@ -1752,21 +1829,89 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                             } else {
                                 "="
                             };
-
-                            Ok(std::format!(
-                            "declare -{attr_str} {name}{equals_or_nothing}{assignable_value_str}"
-                        )
-                            .into())
+                            std::format!(
+                                "declare -{attr_or_dash} {name}{equals_or_nothing}{assignable_value_str}"
+                            )
+                        }
+                        ShellValue::String(_) if attr_str.is_empty() => {
+                            std::format!("{name}={assignable_value_str}")
                         }
                         ShellValue::String(_) => {
-                            Ok(std::format!("{name}={assignable_value_str}").into())
+                            std::format!("declare -{attr_str} {name}={assignable_value_str}")
                         }
-                        ShellValue::Unset(_) => {
-                            Ok(std::format!("declare -{attr_str} {name}").into())
-                        }
+                        ShellValue::Unset(_) => std::format!("declare -{attr_or_dash} {name}"),
+                    };
+
+                    if let brush_parser::word::Parameter::NamedWithAllIndices {
+                        concatenate: false,
+                        ..
+                    } = &parameter
+                    {
+                        // "${a[@]@A}" is the declaration's words, as bash gives them.
+                        Ok(element_list(
+                            text.splitn(3, ' ').map(ToOwned::to_owned),
+                            false,
+                        ))
+                    } else {
+                        Ok(text.into())
                     }
+                } else if names_all_elements(&parameter) {
+                    Ok(element_list(std::iter::empty(), false))
                 } else {
                     Ok(String::new().into())
+                }
+            }
+            brush_parser::word::ParameterExpr::Transform {
+                parameter: brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate },
+                indirect: false,
+                op: ParameterTransformOp::PossiblyQuoteWithArraysExpanded { separate_words },
+            } if self.shell.env().get(&name).is_some_and(|(_, var)| {
+                matches!(
+                    var.value(),
+                    ShellValue::IndexedArray(_) | ShellValue::AssociativeArray(_)
+                )
+            }) =>
+            {
+                // An array's keys and values: @K as one string of pairs, each value
+                // double-quoted; @k as separate words, as bash gives them.
+                let (keys, values, associative) = self
+                    .shell
+                    .env()
+                    .get(&name)
+                    .map(|(_, var)| {
+                        (
+                            var.value().element_keys(self.shell),
+                            var.value().element_values(self.shell),
+                            matches!(var.value(), ShellValue::AssociativeArray(_)),
+                        )
+                    })
+                    .unwrap_or_default();
+                if keys.is_empty() {
+                    // No elements expand to no words.
+                    Ok(element_list(std::iter::empty(), concatenate))
+                } else if separate_words {
+                    Ok(element_list(
+                        keys.into_iter().zip(values).flat_map(<[String; 2]>::from),
+                        concatenate,
+                    ))
+                } else {
+                    let mut pairs = keys
+                        .iter()
+                        .zip(&values)
+                        .map(|(key, value)| {
+                            let key = if associative {
+                                escape::quote_if_needed(key, escape::QuoteMode::DoubleQuote)
+                            } else {
+                                Cow::Borrowed(key.as_str())
+                            };
+                            let value = escape::force_quote(value, escape::QuoteMode::DoubleQuote);
+                            std::format!("{key} {value}")
+                        })
+                        .join(" ");
+                    if associative && !pairs.is_empty() {
+                        pairs.push(' ');
+                    }
+                    Ok(pairs.into())
                 }
             }
             brush_parser::word::ParameterExpr::Transform {
@@ -1898,8 +2043,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         .shell
                         .env()
                         .iter()
-                        .filter_map(|(name, _)| {
-                            if name.starts_with(prefix.as_str()) {
+                        // A variable declared but never given a value is not listed, as in bash.
+                        .filter_map(|(name, var)| {
+                            if name.starts_with(prefix.as_str())
+                                && !matches!(var.value(), ShellValue::Unset(_))
+                            {
                                 Some(name.to_owned())
                             } else {
                                 None
@@ -2501,6 +2649,30 @@ fn list_element_fields(values: Vec<String>, preserve_empty_elements: bool) -> Ve
             WordField(vec![piece])
         })
         .collect()
+}
+
+/// Whether the parameter names all of an array's elements or all positional parameters.
+const fn names_all_elements(parameter: &brush_parser::word::Parameter) -> bool {
+    matches!(
+        parameter,
+        brush_parser::word::Parameter::NamedWithAllIndices { .. }
+            | brush_parser::word::Parameter::Special(
+                brush_parser::word::SpecialParameter::AllPositionalParameters { .. }
+            )
+    )
+}
+
+/// An expansion of the given values as separate elements, as a list-valued parameter expands.
+fn element_list(values: impl IntoIterator<Item = String>, concatenate: bool) -> Expansion {
+    Expansion {
+        fields: values
+            .into_iter()
+            .map(|value| WordField(vec![ExpansionPiece::Splittable(value)]))
+            .collect(),
+        concatenate,
+        kind: ExpansionKind::ElementList,
+        undefined: false,
+    }
 }
 
 /// The character with its case toggled (`${v~}`, `${v~~}`).

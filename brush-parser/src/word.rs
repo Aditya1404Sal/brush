@@ -1204,6 +1204,10 @@ peg::parser! {
              [^'{' | '}' | '\\' | '\'' | '"'])*
 
         rule parameter_expression() -> ParameterExpr =
+            // `${#?}`, `${#-}`, `${##}` and `${#@}` are the lengths of those special parameters.
+            "#" parameter:special_length_parameter() &"}" {
+                ParameterExpr::ParameterLength { parameter, indirect: false }
+            } /
             indirect:parameter_indirection() parameter:parameter() test_type:parameter_test_type() "-" default_value:parameter_expression_word()? {
                 ParameterExpr::UseDefaultValues { parameter, indirect, test_type, default_value }
             } /
@@ -1337,6 +1341,12 @@ peg::parser! {
             n:$(['1'..='9'](['0'..='9']*)) {? n.parse().or(Err("u32")) }
         rule unbraced_positional_parameter() -> u32 =
             n:$(['1'..='9']) {? n.parse().or(Err("u32")) }
+
+        rule special_length_parameter() -> Parameter =
+            "?" { Parameter::Special(SpecialParameter::LastExitStatus) } /
+            "-" { Parameter::Special(SpecialParameter::CurrentOptionFlags) } /
+            "#" { Parameter::Special(SpecialParameter::PositionalParameterCount) } /
+            "@" { Parameter::Special(SpecialParameter::AllPositionalParameters { concatenate: false }) }
 
         rule special_parameter() -> SpecialParameter =
             "@" { SpecialParameter::AllPositionalParameters { concatenate: false } } /
