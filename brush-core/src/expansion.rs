@@ -994,10 +994,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 _ => None,
             };
             if let Some(open) = quoted {
-                self.current_text = word
-                    .get(piece.start_index + open..piece.end_index.saturating_sub(1))
+                word.get(piece.start_index + open..piece.end_index.saturating_sub(1))
                     .unwrap_or_default()
-                    .to_owned();
+                    .clone_into(&mut self.current_text);
             }
             let expansion = self.expand_word_piece(piece.piece).await;
             if quoted.is_some() {
