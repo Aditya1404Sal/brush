@@ -306,7 +306,10 @@ pub enum ErrorKind {
     FunctionNestingTooDeep(String, usize),
 
     /// A command substitution's output exceeded what the shell holds in memory.
-    #[error("command substitution: output over 16 MiB is unsupported in bash-tool")]
+    #[error(
+        "command substitution: output over {} MiB is unsupported in bash-tool",
+        crate::openfiles::MAX_SUBSTITUTION_BYTES >> 20
+    )]
     SubstitutionTooLarge,
 
     /// Execution would nest deeper than the stack can hold.
