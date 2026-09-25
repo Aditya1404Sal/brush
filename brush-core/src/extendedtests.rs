@@ -128,6 +128,31 @@ pub(crate) fn apply_unary_predicate_to_str(
         {
             Ok(false)
         }
+        // `/dev/fd/N` exists only while the descriptor is open, as on Linux; WASI has no such
+        // files, so the platform answers for every number.
+        #[cfg(target_arch = "wasm32")]
+        ast::UnaryPredicate::FileExists
+        | ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsCharSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsDir
+        | ast::UnaryPredicate::FileExistsAndIsRegularFile
+        | ast::UnaryPredicate::FileExistsAndIsSetgid
+        | ast::UnaryPredicate::FileExistsAndIsSymlink
+        | ast::UnaryPredicate::FileExistsAndHasStickyBit
+        | ast::UnaryPredicate::FileExistsAndIsFifo
+        | ast::UnaryPredicate::FileExistsAndIsReadable
+        | ast::UnaryPredicate::FileExistsAndIsNotZeroLength
+        | ast::UnaryPredicate::FileExistsAndIsSetuid
+        | ast::UnaryPredicate::FileExistsAndIsWritable
+        | ast::UnaryPredicate::FileExistsAndIsExecutable
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId
+        | ast::UnaryPredicate::FileExistsAndModifiedSinceLastRead
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveUserId
+        | ast::UnaryPredicate::FileExistsAndIsSocket
+            if shell.names_closed_fd(params, operand) =>
+        {
+            Ok(false)
+        }
         ast::UnaryPredicate::FileExists => {
             let path = shell.absolute_path(Path::new(operand));
             Ok(path.exists())

@@ -246,6 +246,14 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         Ok(options.open(path_to_open)?.into())
     }
 
+    /// Whether `path` names one of the shell's descriptors (`/dev/fd/N`, `/dev/stdin`) that is not
+    /// open for the command these parameters are for.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn names_closed_fd(&self, params: &ExecutionParameters, path: &str) -> bool {
+        shell_fd_path_to_fd(&self.absolute_path(Path::new(path)))
+            .is_some_and(|fd| params.try_fd(self, fd).is_none())
+    }
+
     /// Replaces the shell's currently configured open files with the given set.
     /// Typically only used by exec-like builtins.
     ///
