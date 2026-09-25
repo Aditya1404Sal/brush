@@ -699,7 +699,7 @@ pub fn command_substitution_diagnostic(
     first_line: usize,
     options: &crate::ParserOptions,
 ) -> Vec<String> {
-    let lines = match tokenizer::command_substitution_len(text, &options.tokenizer_options()) {
+    let mut lines = match tokenizer::command_substitution_len(text, &options.tokenizer_options()) {
         Err(inner) => bash_diagnostic(
             &ParseError::Tokenizing {
                 inner,
@@ -725,21 +725,17 @@ pub fn command_substitution_diagnostic(
             };
             match error {
                 None => vec![],
-                Some(error) => {
-                    let mut lines = bash_diagnostic(&error, text, options);
-                    // Bash names what it was looking for when the token is not the `)`.
-                    if let Some(first) = lines.first_mut() {
-                        if first.contains("syntax error near unexpected token `")
-                            && !first.ends_with("`)'")
-                        {
-                            first.push_str(" while looking for matching `)'");
-                        }
-                    }
-                    lines
-                }
+                Some(error) => bash_diagnostic(&error, text, options),
             }
         }
     };
+    // Bash names what it was looking for when the token is not the `)`, also when it met the token
+    // before text it could not read (`$(fi) $(echo`, `$(echo (a)`).
+    if let Some(first) = lines.first_mut() {
+        if first.contains("syntax error near unexpected token `") && !first.ends_with("`)'") {
+            first.push_str(" while looking for matching `)'");
+        }
+    }
     // The lines are numbered from the substitution's first line.
     lines
         .into_iter()

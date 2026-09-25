@@ -214,12 +214,18 @@ async fn run_broken_substitution(
     params: &ExecutionParameters,
     rest: String,
 ) -> Result<String, error::Error> {
+    // Bash reads the prompt's substitution from the line after the current command's, as it
+    // reads one in a here-document.
     let options = shell.parser_options();
-    let error = error::Error::from(error::ErrorKind::SyntaxError {
-        origin: "command substitution".to_owned(),
-        lines: unclosed_substitution_lines(&rest, &options, shell.line_number()),
-    });
-    let _ = shell.display_error(&mut params.stderr(shell), &error);
+    let lines =
+        brush_parser::command_substitution_diagnostic(&rest, shell.line_number() + 1, &options);
+    if !lines.is_empty() {
+        let error = error::Error::from(error::ErrorKind::SyntaxError {
+            origin: "command substitution".to_owned(),
+            lines,
+        });
+        let _ = shell.display_error(&mut params.stderr(shell), &error);
+    }
 
     let mut command = rest;
     command.pop();
@@ -246,40 +252,6 @@ async fn run_broken_substitution(
         }
     }
     expansion::command_substitution_output(shell, params, command, false).await
-}
-
-/// What bash reports as it looks for the `)` of a substitution in a prompt read on `line`, the
-/// prompt's text after the `$(` being `rest`: the syntax error in it, numbered on from `line`
-/// and, when the error is at a token other than the `)`, saying so; or, when it ends first, the
-/// `)` it did not find.
-fn unclosed_substitution_lines(
-    rest: &str,
-    options: &brush_parser::ParserOptions,
-    line: usize,
-) -> Vec<String> {
-    let lines = brush_parser::Parser::new(rest.as_bytes(), options)
-        .parse_program()
-        .err()
-        .map(|error| brush_parser::bash_diagnostic(&error, rest, options))
-        .filter(|lines| {
-            lines
-                .first()
-                .is_some_and(|first| !first.contains("syntax error: unexpected end of file"))
-        });
-    let Some(lines) = lines else {
-        let end = line + rest.matches('\n').count() + 2;
-        return vec![format!(
-            "line {end}: unexpected EOF while looking for matching `)'"
-        )];
-    };
-    let mut lines = error::shift_diagnostic_lines(lines, line);
-    if let Some(first) = lines.first_mut()
-        && first.contains("syntax error near unexpected token")
-        && !first.ends_with("token `)'")
-    {
-        first.push_str(" while looking for matching `)'");
-    }
-    lines
 }
 
 #[cached::macros::cached(max_size = 64, key = "String", convert = r#"{ spec.to_owned() }"#)]
