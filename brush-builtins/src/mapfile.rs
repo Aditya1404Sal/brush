@@ -120,6 +120,8 @@ impl MapFileCommand {
         mut input_file: brush_core::openfiles::OpenFile,
     ) -> Result<variables::ArrayLiteral, brush_core::Error> {
         let _term_mode = setup_terminal_settings(&input_file)?;
+        // Only a terminal sends Ctrl+C and Ctrl+D as keys; elsewhere they are data.
+        let terminal = input_file.is_terminal();
 
         let mut entries = vec![];
         let mut read_count = 0;
@@ -142,9 +144,9 @@ impl MapFileCommand {
                 #[cfg(not(target_arch = "wasm32"))]
                 let read = input_file.read(&mut buf);
                 match read {
-                    Ok(0) => break,                                         // End of input
-                    Ok(1) if buf[0] == b'\x03' => break,                    // Ctrl+C
-                    Ok(1) if buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
+                    Ok(0) => break,                                                     // End of input
+                    Ok(1) if terminal && buf[0] == b'\x03' => break,                    // Ctrl+C
+                    Ok(1) if terminal && buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
                     Ok(1) => {
                         let byte = buf[0];
                         line.push(byte);
@@ -169,6 +171,11 @@ impl MapFileCommand {
 
             if self.remove_delimiter && line.ends_with(&[delimiter]) {
                 line.pop();
+            }
+
+            // A bash string ends at a NUL byte.
+            if let Some(nul) = line.iter().position(|byte| *byte == 0) {
+                line.truncate(nul);
             }
 
             let line_str = String::from_utf8_lossy(&line).to_string();
