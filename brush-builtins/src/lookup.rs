@@ -103,9 +103,11 @@ fn resolve_in_filesystem<SE: ShellExtensions>(
 
     // A name with a separator in it is used as-is; it's never searched for.
     if sys::fs::contains_path_separator(name) {
-        // A directory is never a command, even though it carries the execute bit.
+        // A directory is never a command, even though it carries the execute bit. A program a
+        // builtin stands for (`/bin/cat`) is one.
         let candidate = shell.absolute_path(Path::new(name));
-        if !candidate.is_dir() && candidate.executable() {
+        if (!candidate.is_dir() && candidate.executable()) || shell.program_builtin(name).is_some()
+        {
             resolved.push(to_file(PathBuf::from(name)));
         }
         return;
@@ -130,6 +132,15 @@ fn resolve_in_filesystem<SE: ShellExtensions>(
         }
         (None, true) => resolved.extend(shell.find_executables_in_path(name).map(to_file)),
         (None, false) => resolved.extend(shell.resolve_command_in_path(name).map(to_file)),
+    }
+
+    // A builtin that stands for a program is also that program's file (`/bin/cat`).
+    if let Some(path) = shell.program_path(name)
+        && !resolved
+            .iter()
+            .any(|found| matches!(found, Resolved::File { path: file, .. } if *file == path))
+    {
+        resolved.push(to_file(path));
     }
 }
 

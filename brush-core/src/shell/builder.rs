@@ -275,6 +275,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             last_stopwatch_offset: 0,
             loop_depth: 0,
             nesting: 0,
+            program_names: std::sync::Arc::default(),
             command_unit: None,
             alias_units: HashMap::new(),
             programs_started: 0,

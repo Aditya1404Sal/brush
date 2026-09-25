@@ -342,6 +342,13 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         reason = "these unwrap calls should not panic"
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
+        // A program's path (`/bin/cat`) runs the builtin that stands for it, under its own name.
+        if sys::fs::contains_path_separator(&self.command_name)
+            && let Some(name) = self.shell.program_builtin(&self.command_name)
+        {
+            self.command_name = name.to_owned();
+        }
+
         // First see if it's the name of a builtin.
         let builtin = self.shell.builtins().get(&self.command_name).cloned();
 

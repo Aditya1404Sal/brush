@@ -216,10 +216,11 @@ macro_rules! substitution_limit_mib {
     };
 }
 
-/// The most any one in-memory buffer holds: a substitution (`$( )`, `<( )`, `>( )`) or a
-/// synchronous builtin's output into a pipe; bash-tool uses the same limit for everything it
-/// buffers. Writers past it are refused as a closed pipe refuses them, and whoever reads the
-/// cut-off output learns it was cut.
+/// The most any one in-memory buffer holds.
+///
+/// That is a substitution (`$( )`, `<( )`, `>( )`) or a synchronous builtin's output into a
+/// pipe; bash-tool uses the same limit for everything it buffers. Writers past it are refused as
+/// a closed pipe refuses them, and whoever reads the cut-off output learns it was cut.
 pub const MAX_SUBSTITUTION_BYTES: usize = substitution_limit_mib!() * 1024 * 1024;
 
 /// The error a reader gets at the end of a process substitution's output that was cut off at
