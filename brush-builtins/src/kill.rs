@@ -21,16 +21,18 @@ const USAGE: &str =
 /// A signal operand as bash decodes it: a name (any case, with or without `SIG`) or a number;
 /// `0` is the null signal that only checks the target exists.
 fn decode_signal(spec: &str) -> Option<i32> {
-    if spec == "0" {
-        return Some(0);
+    // A number in any form (`0000`, `015`) is taken as that number.
+    if let Ok(number) = spec.parse::<i32>() {
+        if number == 0 {
+            return Some(0);
+        }
+        return TrapSignal::try_from(number)
+            .ok()
+            .and_then(|signal| i32::try_from(signal).ok())
+            .filter(|n| *n > 0);
     }
     TrapSignal::try_from(spec)
         .ok()
-        .or_else(|| {
-            spec.parse::<i32>()
-                .ok()
-                .and_then(|n| TrapSignal::try_from(n).ok())
-        })
         .and_then(|signal| i32::try_from(signal).ok())
         .filter(|n| *n > 0)
 }
@@ -84,9 +86,12 @@ impl builtins::Command for KillCommand {
                     args.next();
                     break;
                 }
-                word if word.starts_with('-') && word.len() > 1 && !saw_signal => {
+                word if word.len() > 1
+                    && !saw_signal
+                    && let Some(sigspec) = word.strip_prefix('-') =>
+                {
                     // `-SIG`, `-NUM`: only the first; later ones may be process groups.
-                    spec = word[1..].to_owned();
+                    sigspec.clone_into(&mut spec);
                     signal = decode_signal(&spec);
                     saw_signal = true;
                 }
