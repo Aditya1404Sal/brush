@@ -446,6 +446,14 @@ pub enum ParameterExpr {
         /// Optionally provides a pattern to match.
         pattern: Option<String>,
     },
+    /// A command run in the current shell (bash 5.3): `${ command; }`, whose value is its
+    /// output, or `${| command; }`, whose value is what it leaves in `REPLY`.
+    FunctionSubstitution {
+        /// The command.
+        command: String,
+        /// Whether the value is `REPLY` (`${| ...; }`) rather than the output.
+        reply: bool,
+    },
     /// A `${...}` that is not a valid expansion, which is an error when the word is expanded.
     BadSubstitution {
         /// The text, from `${` through `}`.
@@ -1177,6 +1185,12 @@ peg::parser! {
         // TODO(parser): Deal with fact that there may be a quoted word or escaped closing brace chars.
         // TODO(parser): Improve on how we handle a '$' not followed by a valid variable name or parameter.
         rule parameter_expansion() -> WordPiece =
+            "${|" c:$(funsub_piece()*) "}" {
+                WordPiece::ParameterExpansion(ParameterExpr::FunctionSubstitution { command: c.to_owned(), reply: true })
+            } /
+            "${" &[' ' | '\t' | '\n'] c:$(funsub_piece()*) "}" {
+                WordPiece::ParameterExpansion(ParameterExpr::FunctionSubstitution { command: c.to_owned(), reply: false })
+            } /
             "${" e:parameter_expression() "}" {
                 WordPiece::ParameterExpansion(e)
             } /
@@ -1396,6 +1410,16 @@ peg::parser! {
         rule case_command_stop() -> () = [')' | '(' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
 
         rule keyword_end() = [' ' | '\t' | '\n' | ';' | ')' | '&' | '|'] / ![_]
+
+        // A piece of the command in `${ command; }`, which ends at a `}` that closes no brace
+        // group or brace expression of its own.
+        rule funsub_piece() =
+            case_command() /
+            "{" (!"}" funsub_piece())* "}" {} /
+            word_piece(<funsub_stop()>, true /*in_command*/) {} /
+            [' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')'] {}
+
+        rule funsub_stop() -> () = ['{' | '}' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
 
         // As in bash, a backslash in backquotes escapes only `$`, a backquote and a backslash
         // (and, inside double quotes, a double quote); the command is the text left.

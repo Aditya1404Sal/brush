@@ -2145,6 +2145,39 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 })
                 .await
             }
+            brush_parser::word::ParameterExpr::FunctionSubstitution { command, reply } => {
+                if self.disable_command_substitutions {
+                    return Ok(Expansion::from(String::new()));
+                }
+                let value = if reply {
+                    commands::invoke_command_in_current_shell_for_reply(
+                        self.shell,
+                        self.params,
+                        command,
+                    )
+                    .await?
+                } else {
+                    let mut output = commands::invoke_command_in_current_shell_and_get_output(
+                        self.shell,
+                        self.params,
+                        command,
+                    )
+                    .await?;
+                    // As with `$(...)`: null bytes are dropped and trailing newlines trimmed.
+                    if output.contains('\0') {
+                        writeln!(
+                            self.params.stderr(self.shell),
+                            "{}warning: command substitution: ignored null byte in input",
+                            self.shell.diagnostic_prefix(),
+                        )?;
+                        output.retain(|c| c != '\0');
+                    }
+                    let trimmed_len = output.trim_end_matches('\n').len();
+                    output.truncate(trimmed_len);
+                    output
+                };
+                Ok(Expansion::from(ExpansionPiece::Splittable(value)))
+            }
             brush_parser::word::ParameterExpr::BadSubstitution { text, transform } => {
                 // As in bash, this ends a non-interactive shell; a transformation that does not
                 // exist ends `bash -c` with 127, as an unset variable does. The diagnostic

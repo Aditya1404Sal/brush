@@ -717,9 +717,14 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     // `[` is not an operator, so a subscript's opening bracket is inside a word
                     // (`$[a[0] < 9]`); each one left open needs its own closing bracket. A word
                     // can also hold both (`+(a[1])`, read whole as a pattern).
-                    Token::Word(w, _) if nesting_open == "[" => {
-                        let open = w.matches('[').count();
-                        let closed = w.matches(']').count();
+                    Token::Word(w, _) if nesting_open == "[" || nesting_open == "{" => {
+                        let (open, close) = if nesting_open == "[" {
+                            ('[', ']')
+                        } else {
+                            ('{', '}')
+                        };
+                        let open = w.matches(open).count();
+                        let closed = w.matches(close).count();
                         nesting_count +=
                             u32::try_from(open.saturating_sub(closed)).unwrap_or(u32::MAX);
                     }
@@ -1073,6 +1078,15 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
 
                             // Consume the '{' and add it to the token.
                             state.append_char(self.next_char()?.unwrap());
+
+                            // `${ command; }` and `${| command; }` (bash 5.3) hold a command,
+                            // read like the one in `$(...)`.
+                            if matches!(self.peek_char()?, Some(' ' | '\t' | '\n' | '|')) {
+                                let pending = self.set_aside_pending_here_docs();
+                                self.consume_nested_construct(&mut state, '}', "{", 1)?;
+                                self.restore_pending_here_docs(pending);
+                                continue;
+                            }
 
                             let pending = self.set_aside_pending_here_docs();
                             let mut pending_here_doc_tokens = vec![];
