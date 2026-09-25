@@ -634,6 +634,34 @@ impl Error {
     }
 }
 
+/// A syntax error's diagnostic lines (see [`brush_parser::bash_diagnostic`]) for code whose first
+/// line is `shift` lines further on: the line each names, and the line an unfinished command
+/// started on.
+pub(crate) fn shift_diagnostic_lines(lines: Vec<String>, shift: usize) -> Vec<String> {
+    let shifted = |line: &str| line.parse::<usize>().map(|line| line + shift);
+    lines
+        .into_iter()
+        .map(|diagnostic| {
+            let Some((line, message)) = diagnostic
+                .strip_prefix("line ")
+                .and_then(|rest| rest.split_once(": "))
+            else {
+                return diagnostic;
+            };
+            let Ok(line) = shifted(line) else {
+                return diagnostic;
+            };
+            let message = match message.rsplit_once(" command on line ") {
+                Some((head, start)) if let Ok(start) = shifted(start) => {
+                    format!("{head} command on line {start}")
+                }
+                _ => message.to_owned(),
+            };
+            format!("line {line}: {message}")
+        })
+        .collect()
+}
+
 /// An I/O error's message as bash words it: the system's description, without the
 /// ` (os error N)` Rust appends.
 pub fn io_message(error: &std::io::Error) -> String {
@@ -661,4 +689,45 @@ pub fn unimp<T>(msg: &'static str) -> Result<T, Error> {
 /// * `project_issue_id` - The GitHub issue ID where the implementation is tracked.
 pub fn unimp_with_issue<T>(msg: &'static str, project_issue_id: u32) -> Result<T, Error> {
     Err(ErrorKind::UnimplementedAndTracked(msg, project_issue_id).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shift_diagnostic_lines;
+
+    #[test]
+    fn shifts_the_lines_a_syntax_error_names() {
+        let lines = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|&line| line.to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shift_diagnostic_lines(
+                lines(&[
+                    "line 1: syntax error near unexpected token `fi'",
+                    "line 1: `fi'",
+                ]),
+                5,
+            ),
+            lines(&[
+                "line 6: syntax error near unexpected token `fi'",
+                "line 6: `fi'"
+            ])
+        );
+        assert_eq!(
+            shift_diagnostic_lines(
+                lines(&[
+                    "line 2: syntax error: unexpected end of file from `if' command on line 1"
+                ]),
+                3,
+            ),
+            lines(&["line 5: syntax error: unexpected end of file from `if' command on line 4"])
+        );
+        assert_eq!(
+            shift_diagnostic_lines(lines(&["line 1: `echo on line 2'"]), 1),
+            lines(&["line 2: `echo on line 2'"])
+        );
+    }
 }

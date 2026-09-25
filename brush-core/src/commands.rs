@@ -1395,6 +1395,19 @@ async fn run_substitution_command_in(
     };
     let parse_result = shell.parse_string(command.as_str());
 
+    // A command that does not parse (a prompt's, or one in backquotes, read only as it runs) is
+    // reported as bash reports a substitution's: from `command substitution`, its lines numbered
+    // on from the command it is part of.
+    if let Err(error) = &parse_result {
+        let lines = brush_parser::bash_diagnostic(error, &command, &shell.parser_options());
+        let error = error::Error::from(error::ErrorKind::SyntaxError {
+            origin: "command substitution".to_owned(),
+            lines: error::shift_diagnostic_lines(lines, shell.line_number().saturating_sub(1)),
+        });
+        let _ = shell.display_error(&mut params.stderr(shell), &error);
+        return Ok(ExecutionResult::new(2));
+    }
+
     // Check for a command that is only an input redirection ("< file").
     // If detected, emulate `cat file` to stdout and return immediately.
     // If we failed to parse, then we'll fall below and handle it there.

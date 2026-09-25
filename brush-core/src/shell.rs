@@ -850,12 +850,15 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         if self.options.interactive {
             return format!("{name}: ");
         }
-        let line = self
-            .call_stack
+        format!("{name}: line {}: ", self.line_number())
+    }
+
+    /// The line the current command is on (`$LINENO`).
+    pub(crate) fn line_number(&self) -> usize {
+        self.call_stack
             .current_frame()
             .and_then(|frame| frame.current_line())
-            .unwrap_or(1);
-        format!("{name}: line {line}: ")
+            .unwrap_or(1)
     }
 }
 
