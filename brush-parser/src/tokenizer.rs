@@ -783,7 +783,13 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 // TODO(tokenizer): Verify we're not waiting on some terminating character?
                 // Verify we're out of all quotes.
                 if state.in_escape {
-                    return Err(TokenizerError::UnterminatedEscapeSequence);
+                    if matches!(state.quote_mode, QuoteMode::None) {
+                        // A backslash that ends the input is an ordinary character, as in
+                        // bash (`echo \` prints it); it is already in the token.
+                        state.in_escape = false;
+                    } else {
+                        return Err(TokenizerError::UnterminatedEscapeSequence);
+                    }
                 }
                 match state.quote_mode {
                     QuoteMode::None => (),
@@ -1806,6 +1812,8 @@ echo after
             strs("if true; then e[a[1] > 0]=v; fi")?,
             ["if", "true", ";", "then", "e[a[1] > 0]=v", ";", "fi"]
         );
+        // A backslash that ends the input is an ordinary character.
+        assert_eq!(strs("echo a \\")?, ["echo", "a", "\\"]);
         // Legacy arithmetic ends at the bracket matching its own.
         assert_eq!(strs("echo $[a[0] < 9]")?, ["echo", "$[a[0] < 9]"]);
         assert_eq!(

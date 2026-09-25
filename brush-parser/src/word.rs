@@ -1003,7 +1003,7 @@ peg::parser! {
         rule double_quoted_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
-            command_substitution() /
+            double_quoted_command_substitution() /
             parameter_expansion() /
             double_quoted_escape_sequence() /
             double_quoted_text()
@@ -1353,7 +1353,12 @@ peg::parser! {
 
         pub(crate) rule command_substitution() -> WordPiece =
             "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
-            "`" c:backquoted_command() "`" { WordPiece::BackquotedCommandSubstitution(c) }
+            "`" c:backquoted_command(false) "`" { WordPiece::BackquotedCommandSubstitution(c) }
+
+        // Inside double quotes, a backslash in backquotes also escapes a double quote.
+        rule double_quoted_command_substitution() -> WordPiece =
+            "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
+            "`" c:backquoted_command(true) "`" { WordPiece::BackquotedCommandSubstitution(c) }
 
         pub(crate) rule command() -> &'input str =
             $(command_piece()*)
@@ -1363,12 +1368,16 @@ peg::parser! {
             ([' ' | '\t'])+ {} /
             ['\'' | '`'] {}
 
-        rule backquoted_command() -> String =
-            chars:(backquoted_char()*) { chars.into_iter().collect() }
+        // As in bash, a backslash in backquotes escapes only `$`, a backquote and a backslash
+        // (and, inside double quotes, a double quote); the command is the text left.
+        rule backquoted_command(in_double_quotes: bool) -> String =
+            chars:(backquoted_char(in_double_quotes)*) { chars.into_iter().collect() }
 
-        rule backquoted_char() -> &'input str =
+        rule backquoted_char(in_double_quotes: bool) -> &'input str =
             "\\`" { "`" } /
-            "\\\\" { "\\\\" } /
+            "\\\\" { "\\" } /
+            "\\$" { "$" } /
+            is_true(in_double_quotes) "\\\"" { "\"" } /
             s:$([^'`']) { s }
 
         rule arithmetic_expansion() -> WordPiece =
