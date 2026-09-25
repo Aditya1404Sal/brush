@@ -374,6 +374,8 @@ async fn execute_list(
 
                 result = ExecutionResult::success();
             } else {
+                #[cfg(target_arch = "wasm32")]
+                give_other_tasks_a_turn(shell).await;
                 result = match ao_list.execute(shell, params).await {
                     Ok(result) => result,
                     // An error that ends the shell is reported where it happened, while LINENO
@@ -395,6 +397,32 @@ async fn execute_list(
         }
 
         Ok(result)
+    }
+}
+
+/// Commands a script runs between turns for the other tasks of the call.
+#[cfg(target_arch = "wasm32")]
+const COMMANDS_PER_TURN: u32 = 64;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Commands run since the running script last gave the other tasks a turn.
+    static COMMANDS_SINCE_TURN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Every [`COMMANDS_PER_TURN`] commands, lets the other tasks of the call run. On wasm32 every
+/// task shares one thread, so a loop of commands that never wait (`while :; do x=1; done`)
+/// would otherwise keep a timer from firing and a signal from being sent, and the signal from
+/// ending it: a signal ends a process only when its body next waits.
+#[cfg(target_arch = "wasm32")]
+async fn give_other_tasks_a_turn(shell: &Shell<impl extensions::ShellExtensions>) {
+    let due = COMMANDS_SINCE_TURN.with(|count| {
+        let next = count.get() + 1;
+        count.set(if next >= COMMANDS_PER_TURN { 0 } else { next });
+        next >= COMMANDS_PER_TURN
+    });
+    if due {
+        (shell.execution_services().yield_now)().await;
     }
 }
 
