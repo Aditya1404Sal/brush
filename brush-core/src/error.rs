@@ -537,7 +537,7 @@ impl Error {
         // An unset variable (`set -u`, `${x?}`) ends `bash -c` with 127, as in bash; a script
         // read from a file or standard input, `set -e`, or a subshell ended by it gives 1.
         let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
-            && shell.depth() == 0
+            && shell.depth() == shell.process_depth
             && shell.options().command_string_mode
             && !shell.options().exit_on_nonzero_command_exit
             && matches!(

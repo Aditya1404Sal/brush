@@ -119,15 +119,16 @@ impl CommandArg {
     pub(crate) fn quote_for_tracing(&self) -> Cow<'_, str> {
         match self {
             Self::String(s) => escape::quote_if_needed(s, escape::QuoteMode::SingleQuote),
+            // Bash prints the word `name=value` as it prints any word, quoted whole when it
+            // needs to be: `e=`, `'a=x y'`.
             Self::Assignment(a) => {
-                let mut s = a.name.to_string();
                 let op = if a.append { "+=" } else { "=" };
-                s.push_str(op);
-                s.push_str(&escape::quote_if_needed(
-                    a.value.to_string().as_str(),
+                escape::quote_if_needed(
+                    format!("{}{op}{}", a.name, a.value).as_str(),
                     escape::QuoteMode::SingleQuote,
-                ));
-                s.into()
+                )
+                .into_owned()
+                .into()
             }
         }
     }

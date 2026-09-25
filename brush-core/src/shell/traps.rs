@@ -92,9 +92,18 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         // clobber the status that triggered it.
         let orig_last_exit_status = self.last_exit_status;
 
+        // Bash reads the handler with a parser of its own, one xtrace level deeper; the EXIT
+        // trap runs one level below where its subshell started (at PS4's own for the shell).
+        let trace_level = self.trace_level;
+        self.trace_level = if signal == TrapSignal::Exit {
+            self.exit_trace_level
+        } else {
+            trace_level + 1
+        };
+
         self.enter_trap_handler(signal, Some(&handler));
         #[cfg(any(target_arch = "wasm32", test))]
-        {
+        let result = {
             let mut frame = super::callstack::FrameGuard::new(
                 self,
                 |shell| {
@@ -107,16 +116,18 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
                 .shell()
                 .run_string(&handler.command, &handler.source_info, &params)
                 .await
-        }
+        };
         #[cfg(not(any(target_arch = "wasm32", test)))]
-        {
+        let result = {
             let result = self
                 .run_string(&handler.command, &handler.source_info, &params)
                 .await;
             self.leave_trap_handler();
             self.last_exit_status = orig_last_exit_status;
             result
-        }
+        };
+        self.trace_level = trace_level;
+        result
     }
 
     /// Returns whether the given trap signal is inherited in the current

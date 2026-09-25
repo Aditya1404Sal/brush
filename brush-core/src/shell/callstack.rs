@@ -90,8 +90,16 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
     /// Updates the shell's internal tracking state to reflect that command
     /// string mode is being started.
+    ///
+    /// A shell running a command string is a shell process of its own, as `bash -c` is: it is
+    /// in no subshell (`BASH_SUBSHELL` is 0), xtrace starts at PS4's own level, and an error
+    /// that ends it exits with `bash -c`'s status.
     pub fn start_command_string_mode(&mut self) {
         self.call_stack.push_command_string();
+        self.process_depth = self.depth;
+        self.subshell_level = 0;
+        self.trace_level = 0;
+        self.exit_trace_level = 0;
     }
 
     /// Updates the shell's internal tracking state to reflect that command

@@ -400,6 +400,15 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     ))
 }
 
+/// Whether a pipeline stage adds no subshell level (`BASH_SUBSHELL`) of its own, as in bash: a
+/// simple command runs in the stage's process as it is, and a `( list )` is the stage's subshell.
+const fn stage_adds_no_subshell(command: &ast::Command) -> bool {
+    matches!(
+        command,
+        ast::Command::Simple(_) | ast::Command::Compound(ast::CompoundCommand::Subshell(_), _)
+    )
+}
+
 /// The body of a background list that is exactly one plain `( list )`.
 #[cfg(target_arch = "wasm32")]
 const fn sole_subshell_body(ao_list: &ast::AndOrList) -> Option<&ast::CompoundList> {
@@ -702,6 +711,9 @@ async fn spawn_pipeline_processes(
             if !run_in_current_shell {
                 let stage_process = shell.take_stage_process();
                 let mut stage_shell = shell.clone();
+                if stage_adds_no_subshell(command) {
+                    stage_shell.subshell_level = shell.subshell_level;
+                }
                 if let Some(stage_process) = &stage_process {
                     stage_shell.set_own_pid(stage_process.pid());
                 }
@@ -719,9 +731,13 @@ async fn spawn_pipeline_processes(
                 cmd_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
             }
 
+            let mut stage_shell = shell.clone();
+            if stage_adds_no_subshell(command) {
+                stage_shell.subshell_level = shell.subshell_level;
+            }
             PipelineExecutionContext {
                 shell: commands::ShellForCommand::OwnedShell {
-                    target: Box::new(shell.clone()),
+                    target: Box::new(stage_shell),
                     parent: shell,
                 },
                 process_group_id,
@@ -2436,10 +2452,15 @@ async fn apply_assignment_unchecked(
 
     if shell.options().print_commands_and_arguments {
         let op = if assignment.append { "+=" } else { "=" };
+        // Bash prints an empty value as nothing: `a=`.
+        let traced = match &new_value {
+            ShellValueLiteral::Scalar(value) if value.is_empty() => String::new(),
+            value => value.to_string(),
+        };
         shell
             .trace_command(
                 trace_params,
-                std::format!("{}{op}{new_value}", assignment.name),
+                std::format!("{}{op}{traced}", assignment.name),
             )
             .await;
     }
@@ -2914,8 +2935,9 @@ async fn setup_process_substitution(
     subshell_cmd: &ast::SubshellCommand,
 ) -> Result<(ShellFd, OpenFile), error::Error> {
     // TODO(execute): Don't execute synchronously!
-    // Execute in a subshell.
+    // Execute in a subshell, read one xtrace level deeper, as bash does.
     let mut subshell = shell.clone();
+    subshell.trace_level += 1;
 
     // Set up execution parameters for the child execution.
     let mut child_params = params.clone();
@@ -3087,6 +3109,8 @@ async fn run_substitution_list(
     subshell.traps_mut().reset_pipe_for_subshell();
     subshell.traps_mut().reset_exit_for_subshell();
     subshell.loop_depth = 0;
+    // Bash reads the list one xtrace level deeper.
+    subshell.trace_level += 1;
     let disposition = subshell.traps().pipe_disposition();
     let body = async {
         let result = list.execute(&mut subshell, params).await;

@@ -44,7 +44,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             .unwrap_or_default();
 
         // Add additional depth-based prefixes using the first character of PS4.
-        let additional_depth = self.call_stack.script_source_depth() + self.depth;
+        let additional_depth = self.call_stack.script_source_depth() + self.trace_level;
         if let Some(c) = prefix.chars().next() {
             for _ in 0..additional_depth {
                 prefix.insert(0, c);

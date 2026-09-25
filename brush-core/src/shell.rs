@@ -106,6 +106,27 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Clone depth from the original ancestor shell.
     depth: usize,
 
+    /// `BASH_SUBSHELL`: how many subshells this one is nested in. A simple command run as a
+    /// pipeline stage does not count, and a new shell process (`bash -c`) starts at 0, as in bash.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) subshell_level: usize,
+
+    /// The clone depth of the shell process this one belongs to (see
+    /// [`Self::start_command_string_mode`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) process_depth: usize,
+
+    /// How many more times xtrace repeats PS4's first character: one for each `eval`, command or
+    /// process substitution and trap handler the command runs in, as bash counts its nested
+    /// parsers. Subshells and pipeline stages do not add one.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) trace_level: usize,
+
+    /// The trace level the EXIT trap runs at: one more than where this subshell started, or none
+    /// for the shell process itself.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) exit_trace_level: usize,
+
     /// Shell name
     name: Option<String>,
 
@@ -247,6 +268,10 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
             depth: self.depth + 1,
+            subshell_level: self.subshell_level + 1,
+            process_depth: self.process_depth,
+            trace_level: self.trace_level,
+            exit_trace_level: self.trace_level + 1,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             #[cfg(target_arch = "wasm32")]
@@ -405,12 +430,15 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             .and_then(|frame| frame.current.as_ref())
             .map_or(0, |position| position.line.saturating_sub(1));
         self.call_stack.increment_current_line_offset(shift);
+        // Bash reads the code with a parser of its own, one xtrace level deeper.
+        self.trace_level += 1;
         shift
     }
 
     /// Undoes [`Self::begin_nested_code`].
     pub fn end_nested_code(&mut self, shift: usize) {
         self.call_stack.decrement_current_line_offset(shift);
+        self.trace_level = self.trace_level.saturating_sub(1);
     }
 
     /// Updates the currently executing command in the shell.
@@ -813,6 +841,11 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns the current subshell depth; 0 is returned if this shell is not a subshell.
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Returns `BASH_SUBSHELL`: how many subshells this one is nested in, as bash counts them.
+    pub fn subshell_level(&self) -> usize {
+        self.subshell_level
     }
 
     /// Returns the call stack for the shell.

@@ -91,6 +91,9 @@ pub trait ShellState {
     /// Returns the current subshell depth; 0 is returned if this shell is not a subshell.
     fn depth(&self) -> usize;
 
+    /// Returns `BASH_SUBSHELL`: how many subshells this one is nested in, as bash counts them.
+    fn subshell_level(&self) -> usize;
+
     /// Returns the call stack for the shell.
     fn call_stack(&self) -> &crate::callstack::CallStack;
 

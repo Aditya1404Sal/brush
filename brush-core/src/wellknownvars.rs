@@ -190,7 +190,7 @@ pub(crate) fn init_well_known_vars(
     shell.env_mut().set_global(
         "BASH_SUBSHELL",
         ShellVariable::new(ShellValue::Dynamic {
-            getter: |shell| shell.depth().to_string().into(),
+            getter: |shell| shell.subshell_level().to_string().into(),
             setter: |_| (),
         }),
     )?;

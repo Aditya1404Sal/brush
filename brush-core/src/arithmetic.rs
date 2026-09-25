@@ -117,10 +117,10 @@ pub(crate) async fn expand_and_eval(
     // Now parse.
     let expr = parse(&expanded_self)?;
 
-    // Trace if applicable.
+    // Trace if applicable: bash prints the expanded expression as written.
     if trace_if_needed && shell.options().print_commands_and_arguments {
         shell
-            .trace_command(params, std::format!("(( {expr} ))"))
+            .trace_command(params, std::format!("(( {expanded_self} ))"))
             .await;
     }
 
