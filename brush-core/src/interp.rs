@@ -2268,6 +2268,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                             // This looks like an assignment, and the command being invoked is a
                             // well-known builtin that takes arguments that need to function like
                             // assignments (but which are processed by the builtin).
+                            check_declared_assoc_elements(&context.shell, &args, assignment)?;
                             let expanded =
                                 expand_assignment(&mut context.shell, &params, assignment).await?;
                             args.push(CommandArg::Assignment(expanded));
@@ -3804,6 +3805,48 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
 
 /// The elements of a compound array assignment, each with its subscript, if any.
 type ArrayElements = [(Option<ast::Word>, ast::Word)];
+
+/// Bash checks a declaration builtin's compound assignment to an associative array (`-A`, or
+/// one that already is) before expanding it: once the first element has a subscript, every
+/// element needs one, and the error quotes the word as written.
+fn check_declared_assoc_elements(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    args: &[CommandArg],
+    assignment: &ast::Assignment,
+) -> Result<(), error::Error> {
+    let ast::AssignmentValue::Array(elements) = &assignment.value else {
+        return Ok(());
+    };
+    if !elements.first().is_some_and(|(key, _)| key.is_some()) {
+        return Ok(());
+    }
+    let Some((_, word)) = elements.iter().find(|(key, _)| key.is_none()) else {
+        return Ok(());
+    };
+    let name = assignment.name.base_name();
+    // Options come before the first name, as the builtin reads them.
+    let makes_associative = args
+        .iter()
+        .skip(1)
+        .map_while(|arg| match arg {
+            CommandArg::String(s) if s.len() > 1 && s.starts_with('-') && s != "--" => Some(s),
+            _ => None,
+        })
+        .any(|option| option.contains('A'));
+    let is_associative = shell.env().get(name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            ShellValue::AssociativeArray(_)
+                | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+        )
+    });
+    if makes_associative || is_associative {
+        let kind =
+            error::ErrorKind::AssocSubscriptRequired(name.to_owned(), sh_single_quote(&word.value));
+        return Err(error::Error::from(kind).into_fatal());
+    }
+    Ok(())
+}
 
 /// Bash's `sh_single_quote`: the text in single quotes, each `'` as `'\''`.
 fn sh_single_quote(text: &str) -> String {

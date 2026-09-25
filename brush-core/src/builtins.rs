@@ -676,14 +676,22 @@ async fn exec_declaration_builtin_impl<
     let mut options = vec![];
     let mut declarations = vec![];
 
+    // As bash's `internal_getopt`: options come before the first name or assignment (or up to
+    // `--`); after that every word is a declaration, even one like `-r`.
+    let mut names_started = false;
     for (i, arg) in args.into_iter().enumerate() {
         match arg {
+            CommandArg::String(s) if i == 0 => options.push(s),
             CommandArg::String(s)
-                if i == 0 || (s.len() > 1 && (s.starts_with('-') || s.starts_with('+'))) =>
+                if !names_started && s.len() > 1 && (s.starts_with('-') || s.starts_with('+')) =>
             {
+                names_started = s == "--";
                 options.push(s);
             }
-            _ => declarations.push(arg),
+            _ => {
+                names_started = true;
+                declarations.push(arg);
+            }
         }
     }
 
