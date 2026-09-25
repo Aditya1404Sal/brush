@@ -2359,8 +2359,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         came_from_undefined: bool,
     ) -> Result<String, error::Error> {
         match op {
+            // The prompt's command substitutions leave `$?` alone, as in bash.
             brush_parser::word::ParameterTransformOp::PromptExpand => {
-                prompt::expand_prompt(self.shell, self.params, s).await
+                let saved_status = self.shell.save_command_status();
+                let result = prompt::expand_prompt(self.shell, self.params, s).await;
+                self.shell.restore_command_status(saved_status);
+                result
             }
             brush_parser::word::ParameterTransformOp::CapitalizeInitial => Ok(capitalize_first(s)),
             brush_parser::word::ParameterTransformOp::ExpandEscapeSequences => {

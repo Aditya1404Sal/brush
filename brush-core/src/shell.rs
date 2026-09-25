@@ -127,6 +127,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) exit_trace_level: usize,
 
+    /// Checks the text a prompt string (`PS4`, `${x@P}`) expands before any of its expansions
+    /// run (see [`Self::set_prompt_guard`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    prompt_guard: Option<PromptGuard>,
+
     /// The text of the program about to run as read input (a command string, `eval`'d text or a
     /// sourced file), which `set -v` echoes line by line as the program reaches it. The program
     /// takes it when it starts, so command substitutions inside it echo nothing of their own.
@@ -279,6 +284,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             trace_level: self.trace_level,
             exit_trace_level: self.trace_level + 1,
             pending_input: None,
+            prompt_guard: self.prompt_guard,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             #[cfg(target_arch = "wasm32")]
@@ -564,6 +570,20 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         self.call_stack = crate::callstack::CallStack::new();
     }
 
+    /// Sets the check an embedder that validates code before the shell runs it applies to a
+    /// prompt string's text (`PS4`, `${x@P}`), whose command substitutions the shell would run.
+    /// The check sees the text before any of it is expanded; an `Err` holds the complete
+    /// diagnostic to print, and the prompt is then refused: `${x@P}` fails with status 2, and
+    /// `PS4` is used as written.
+    pub const fn set_prompt_guard(&mut self, guard: Option<PromptGuard>) {
+        self.prompt_guard = guard;
+    }
+
+    /// The prompt check an embedder set (see [`Self::set_prompt_guard`]).
+    pub(crate) const fn prompt_guard(&self) -> Option<PromptGuard> {
+        self.prompt_guard
+    }
+
     /// How many loops enclose the command running now (see the field's documentation).
     pub const fn loop_depth(&self) -> usize {
         self.loop_depth
@@ -696,6 +716,10 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         format!("{name}: line {line}: ")
     }
 }
+
+/// A check of a prompt string's text before the shell expands it (see
+/// [`Shell::set_prompt_guard`]): `Err` holds the complete diagnostic to print.
+pub type PromptGuard = fn(&str) -> Result<(), String>;
 
 /// Snapshot of the state the last command left behind: `$?`, `PIPESTATUS`, and `$_`.
 ///

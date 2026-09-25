@@ -304,6 +304,11 @@ pub enum ErrorKind {
     #[error("{1}: {0}")]
     BuiltinError(Box<dyn BuiltinError>, String),
 
+    /// The embedder refused to run a prompt string's expansions (see
+    /// [`crate::Shell::set_prompt_guard`]); the diagnostic is its own.
+    #[error("{0}")]
+    PromptRefused(String),
+
     /// Operation not supported on this platform.
     #[error("operation not supported on this platform: {0}")]
     NotSupportedOnThisPlatform(&'static str),
@@ -399,6 +404,7 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
+            ErrorKind::PromptRefused(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
