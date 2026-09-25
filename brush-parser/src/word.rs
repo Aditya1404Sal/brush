@@ -723,6 +723,13 @@ fn parse_sequence_bound(text: &str) -> Option<i64> {
     text.parse().ok()
 }
 
+/// Whether bash expands a numeric brace sequence with these bounds: `mkseq` in bash's `brace.c`
+/// leaves the brace as text when `end - start` falls outside `INTMAX_MIN + 3 ..= INTMAX_MAX - 2`.
+fn sequence_span_fits(start: i64, end: i64) -> bool {
+    let span = i128::from(end) - i128::from(start);
+    (i128::from(i64::MIN) + 3..=i128::from(i64::MAX) - 2).contains(&span)
+}
+
 /// Returns the width the members of a numeric brace sequence should be zero
 /// padded out to, or `None` if they should be written as plain numbers.
 ///
@@ -837,13 +844,16 @@ peg::parser! {
             }
 
         pub(crate) rule brace_sequence_expr() -> BraceExpressionMember =
-            start:sequence_bound() ".." end:sequence_bound() increment:(".." n:number() { n })? {
-                BraceExpressionMember::NumberSequence {
+            start:sequence_bound() ".." end:sequence_bound() increment:(".." n:number() { n })? {?
+                if !sequence_span_fits(start.0, end.0) {
+                    return Err("sequence span out of range");
+                }
+                Ok(BraceExpressionMember::NumberSequence {
                     start: start.0,
                     end: end.0,
                     increment: increment.unwrap_or(1),
                     zero_padded_width: zero_padded_width(start.1, end.1),
-                }
+                })
             } /
             start:character() ".." end:character() increment:(".." n:number() { n })? {
                 BraceExpressionMember::CharSequence { start, end, increment: increment.unwrap_or(1) }
@@ -856,10 +866,10 @@ peg::parser! {
             parse_sequence_bound(text).map(|n| (n, text)).ok_or("number out of range")
         }
 
-        rule number() -> i64 = sign:number_sign()? n:$(['0'..='9']+) {
-            let sign = sign.unwrap_or(1);
-            let num: i64 = n.parse().unwrap();
-            num * sign
+        // A sequence's increment. Like a bound it must fit an i64; bash leaves a brace whose
+        // increment does not unexpanded.
+        rule number() -> i64 = text:$(number_sign()? ['0'..='9']+) {?
+            parse_sequence_bound(text).ok_or("number out of range")
         }
 
         rule number_sign() -> i64 =
@@ -1619,6 +1629,32 @@ mod tests {
             )?);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn brace_sequence_with_an_out_of_range_increment_stays_literal() -> Result<()> {
+        // Regression: the increment was unwrapped, so one too large for an i64 panicked the
+        // parser. Bash leaves such a brace unexpanded.
+        let options = ParserOptions::default();
+        let sequence = |input: &str| -> Result<bool> {
+            let parsed = super::parse_brace_expansions(input, &options)?;
+            Ok(format!("{parsed:?}").contains("Sequence"))
+        };
+        for input in [
+            "{1..3..99999999999999999999}",
+            "{a..e..-99999999999999999999}",
+        ] {
+            assert!(!sequence(input)?, "{input}");
+        }
+        // Bash also leaves a sequence whose `end - start` overflows unexpanded.
+        for input in [
+            "{-9223372036854775808..9223372036854775807..9223372036854775807}",
+            "{9223372036854775805..-9223372036854775805}",
+        ] {
+            assert!(!sequence(input)?, "{input}");
+        }
+        assert!(sequence("{-9223372036854775807..-9223372036854775808}")?);
         Ok(())
     }
 
