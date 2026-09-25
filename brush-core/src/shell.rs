@@ -145,6 +145,32 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) pending_input: Option<std::sync::Arc<str>>,
 
+    /// Bash's `SUBSHELL_PAREN`: this shell is a `( list )` subshell, and not a pipeline stage or
+    /// background command started inside one. `exec` there leaves `SHLVL` as it is.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) paren_subshell: bool,
+
+    /// Bash's `SUBSHELL_PIPE`: this shell is a pipeline stage, and not a `( list )` subshell or
+    /// background command started inside one. A command substitution there runs its last command
+    /// in a process of its own, so `SHLVL` stays as it is.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) stage_subshell: bool,
+
+    /// The simple command bash would run without forking, as `exec` does (see
+    /// [`crate::interp::NoFork`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) no_fork: crate::interp::NoFork,
+
+    /// Whether the next program is a command string whose last command bash runs without
+    /// forking (see [`Self::exec_last_command`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) exec_last: Option<crate::interp::CommandString>,
+
+    /// Whether the function about to be called runs its last command without forking, as the
+    /// call itself would have been (see [`crate::interp::NoFork`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) no_fork_call: bool,
+
     /// Shell name
     name: Option<String>,
 
@@ -302,6 +328,11 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             pending_input: None,
             debug_trap_ran: false,
             prompt_guard: self.prompt_guard,
+            paren_subshell: self.paren_subshell,
+            stage_subshell: self.stage_subshell,
+            no_fork: self.no_fork,
+            exec_last: None,
+            no_fork_call: false,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             started_pid: self.started_pid,

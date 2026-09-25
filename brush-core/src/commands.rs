@@ -1004,6 +1004,8 @@ pub(crate) async fn invoke_shell_function(
     args: &[CommandArg],
 ) -> Result<ExecutionSpawnResult, error::Error> {
     let ast::FunctionBody(body, redirects) = &function.definition().body;
+    // A call bash would have run without forking runs the body's last command that way.
+    let no_fork_call = std::mem::take(&mut context.shell.no_fork_call);
 
     // Apply any redirects specified at function definition-time.
     if let Some(redirects) = redirects {
@@ -1041,6 +1043,10 @@ pub(crate) async fn invoke_shell_function(
     let option_saves = context.shell.local_option_saves.len();
     // The body expands the aliases in effect where the function was defined.
     let caller_aliases = context.shell.alias_scope.replace(function.aliases());
+    let outer_no_fork = context.shell.no_fork;
+    if no_fork_call {
+        context.shell.no_fork = interp::NoFork::for_function(body);
+    }
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
@@ -1054,6 +1060,7 @@ pub(crate) async fn invoke_shell_function(
         context.shell.leave_function()?;
         result
     };
+    context.shell.no_fork = outer_no_fork;
     context.shell.alias_scope = caller_aliases;
     context.shell.loop_depth = caller_loop_depth;
     context.shell.restore_local_options(option_saves);
@@ -1354,10 +1361,15 @@ async fn run_substitution_command_in(
     // The substitution's lines are numbered on from the command it is part of.
     shell.begin_nested_code();
 
+    // Its last command may run in place of the substitution's process, as bash's does.
+    shell.exec_last = Some(interp::CommandString::Substitution);
+
     // Handle the parse result using default shell behavior.
-    shell
+    let result = shell
         .run_parsed_result(parse_result, Some(&command), &source_info, params)
-        .await
+        .await;
+    shell.exec_last = None;
+    result
 }
 
 // Detects a subshell command that consists solely of a single input redirection

@@ -21,6 +21,197 @@ use crate::{
     traps,
 };
 
+/// A simple command bash would run without forking, as `exec` does, so that a program it names
+/// replaces the shell and sees `SHLVL` one lower: the last command of a command string
+/// (`bash -c`, a substitution), the body of a `( list )` subshell, or a background command, and
+/// in a substitution or a background command the last command of a function they call.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NoFork {
+    /// The command's address in the program that holds it, or 0 for none. The program outlives
+    /// any shell that names one of its commands here.
+    command: usize,
+    /// Whether it also needs no trap to be set or running, as bash's `should_suppress_fork` and
+    /// `should_optimize_fork` do.
+    checked: bool,
+    /// Whether a function it calls runs its own last command this way, as bash's
+    /// `optimize_shell_function` does in a substitution or a background command.
+    into_function: bool,
+}
+
+/// How a command string ends the shell that runs it (see [`Shell::exec_last_command`]).
+#[derive(Clone, Copy)]
+pub(crate) enum CommandString {
+    /// A `-c` string: its last command is the end of the input only when nothing but blanks, a
+    /// comment and one newline follow it.
+    Script,
+    /// A command or process substitution, which bash reads back from its parsed text, so it
+    /// always ends with its last command.
+    Substitution,
+}
+
+impl NoFork {
+    /// The last command of a command string, `program`, whose text is `input` when known.
+    fn for_command_string(
+        program: &ast::Program,
+        kind: CommandString,
+        input: Option<&str>,
+    ) -> Self {
+        let Some(list) = program.complete_commands.last() else {
+            return Self::default();
+        };
+        if let (CommandString::Script, Some(input)) = (kind, input) {
+            let end = ast::SourceLocation::location(list).map(|span| span.end.index);
+            if !end.is_some_and(|end| ends_input(input, end)) {
+                return Self::default();
+            }
+        }
+        Self::for_last_command(list, matches!(kind, CommandString::Substitution))
+    }
+
+    /// The last command of `list`, a command string's or a function body's, as bash's
+    /// `should_suppress_fork` finds it: it has no redirections of its own and needs no trap.
+    fn for_last_command(list: &ast::CompoundList, into_function: bool) -> Self {
+        match last_simple_command(list) {
+            Some((command, _)) if !has_redirects(command) => Self {
+                command: std::ptr::from_ref(command) as usize,
+                checked: true,
+                into_function,
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// The last command of a `( list )` subshell's body: its only command, whatever its
+    /// redirections and the traps, or the last of a `;`, `&&` or `||` connection as a command
+    /// string's.
+    fn for_subshell(list: &ast::CompoundList) -> Self {
+        match last_simple_command(list) {
+            Some((command, false)) => Self {
+                command: std::ptr::from_ref(command) as usize,
+                checked: false,
+                into_function: false,
+            },
+            Some((_, true)) => Self::for_last_command(list, false),
+            None => Self::default(),
+        }
+    }
+
+    /// A background command that is a single simple command, forked as it starts.
+    fn for_background(ao_list: &ast::AndOrList) -> Self {
+        match (ao_list.additional.is_empty(), &ao_list.first) {
+            (
+                true,
+                ast::Pipeline {
+                    timed: None, seq, ..
+                },
+            ) => match seq.as_slice() {
+                [ast::Command::Simple(command)] => Self {
+                    command: std::ptr::from_ref(command) as usize,
+                    checked: false,
+                    into_function: true,
+                },
+                _ => Self::default(),
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// The last command of a function body, when the call runs without forking.
+    pub(crate) fn for_function(body: &ast::CompoundCommand) -> Self {
+        match body {
+            ast::CompoundCommand::BraceGroup(ast::BraceGroupCommand { list, .. }) => {
+                Self::for_last_command(list, true)
+            }
+            _ => Self::default(),
+        }
+    }
+
+    /// Whether `command` is the command this names.
+    fn names(&self, command: &ast::SimpleCommand) -> bool {
+        self.command != 0 && self.command == std::ptr::from_ref(command) as usize
+    }
+}
+
+/// The simple command bash runs last in `list` when that is a whole command of its own: the
+/// list's only pipeline, or the second of its last `;`, `&&` or `||` (`a; b && c` ends with an
+/// `&&`, and `a & b` with a `&`), and whether it is such a second.
+fn last_simple_command(list: &ast::CompoundList) -> Option<(&ast::SimpleCommand, bool)> {
+    let (ast::CompoundListItem(and_or, separator), before) = list.0.split_last()?;
+    if matches!(separator, ast::SeparatorOperator::Async) {
+        return None;
+    }
+    let (pipeline, connection) = match before.last() {
+        Some(ast::CompoundListItem(_, ast::SeparatorOperator::Async)) => return None,
+        Some(_) if !and_or.additional.is_empty() => return None,
+        Some(_) => (&and_or.first, true),
+        None => match and_or.additional.last() {
+            Some(ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline)) => (pipeline, true),
+            None => (&and_or.first, false),
+        },
+    };
+    if pipeline.bang || pipeline.timed.is_some() {
+        return None;
+    }
+    match pipeline.seq.as_slice() {
+        [ast::Command::Simple(command)] => Some((command, connection)),
+        _ => None,
+    }
+}
+
+/// Whether a simple command has redirections of its own.
+fn has_redirects(command: &ast::SimpleCommand) -> bool {
+    command
+        .prefix
+        .iter()
+        .flat_map(|prefix| &prefix.0)
+        .chain(command.suffix.iter().flat_map(|suffix| &suffix.0))
+        .any(|item| matches!(item, CommandPrefixOrSuffixItem::IoRedirect(_)))
+}
+
+/// Whether only blanks, a `;`, a comment and one newline follow character `end` of a command
+/// string's `input`: bash, which reads the string a line at a time, is then at its end.
+fn ends_input(input: &str, end: usize) -> bool {
+    fn skip_blanks(mut text: &str) -> &str {
+        loop {
+            text = text.trim_start_matches([' ', '\t']);
+            match text.strip_prefix("\\\n") {
+                Some(after) => text = after,
+                None => return text,
+            }
+        }
+    }
+    let rest: String = input.chars().skip(end).collect();
+    let mut rest = skip_blanks(rest.as_str());
+    if let Some(after) = rest.strip_prefix(';') {
+        rest = skip_blanks(after);
+    }
+    if rest.starts_with('#') {
+        return rest
+            .split_once('\n')
+            .is_none_or(|(_, after)| after.is_empty());
+    }
+    rest.is_empty() || rest == "\n"
+}
+
+/// Whether the traps allow bash to run a command without forking: none of `EXIT`, `ERR` or a
+/// caught signal is set, and no trap handler is running.
+fn traps_allow_exec(shell: &Shell<impl extensions::ShellExtensions>) -> bool {
+    let traps = shell.traps();
+    traps
+        .get_effective_handler(traps::TrapSignal::Exit)
+        .is_none()
+        && traps
+            .get_effective_handler(traps::TrapSignal::Err)
+            .is_none()
+        && traps
+            .signal_dispositions()
+            .all(|(_, disposition)| disposition != traps::PipeDisposition::Caught)
+        && !shell
+            .call_stack()
+            .iter()
+            .any(|frame| frame.frame_type.is_trap_handler())
+}
+
 /// Encapsulates the context of execution in a command pipeline.
 struct PipelineExecutionContext<'a, SE: extensions::ShellExtensions> {
     /// The shell in which the command should be executed.
@@ -252,6 +443,11 @@ async fn execute_program(
         let mut result = ExecutionResult::success();
         let (program, interrupted) = shell.begin_program();
         let input = shell.pending_input.take();
+        // A command string's last command may run in place of the shell, as bash's does.
+        let outer_no_fork = shell.no_fork;
+        if let Some(kind) = shell.exec_last.take() {
+            shell.no_fork = NoFork::for_command_string(program_ast, kind, input.as_deref());
+        }
         let mut next_input_line = 1;
         let mut quiet_lines: Option<std::collections::HashSet<usize>> = None;
 
@@ -301,6 +497,7 @@ async fn execute_program(
         }
 
         shell.end_program(interrupted);
+        shell.no_fork = outer_no_fork;
         Ok(result)
     }
 }
@@ -473,6 +670,14 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         let completed = std::cell::Cell::new(false);
         let result = leader_process
             .run(async {
+                // A background command is forked as it starts, so a program it names runs in
+                // place of that process; `( list ) &` is a subshell whose body runs as one.
+                cloned_shell.stage_subshell = false;
+                cloned_shell.paren_subshell = subshell_body.is_some();
+                cloned_shell.no_fork = match &subshell_body {
+                    Some((list, _)) => NoFork::for_subshell(list),
+                    None => NoFork::for_background(&cloned_ao_list),
+                };
                 let result = match subshell_body {
                     Some((list, redirects)) => {
                         // `( list ) >log &` is the same one process, its output redirected. Its
@@ -637,6 +842,9 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     }
 
     let join_handle = spawn_command_task(shell.execution_services(), async move {
+        cloned_shell.stage_subshell = false;
+        cloned_shell.paren_subshell = false;
+        cloned_shell.no_fork = NoFork::for_background(&cloned_ao_list);
         cloned_ao_list
             .execute(&mut cloned_shell, &cloned_params)
             .await
@@ -914,6 +1122,8 @@ async fn spawn_pipeline_processes(
                 let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
                 let mut stage_shell = shell.clone();
                 stage_shell.debug_trap_ran = debug_trap_ran;
+                stage_shell.stage_subshell = true;
+                stage_shell.paren_subshell = false;
                 if stage_adds_no_subshell(command) {
                     stage_shell.subshell_level = shell.subshell_level;
                 }
@@ -934,6 +1144,8 @@ async fn spawn_pipeline_processes(
             let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
             let mut stage_shell = shell.clone();
             stage_shell.debug_trap_ran = debug_trap_ran;
+            stage_shell.stage_subshell = true;
+            stage_shell.paren_subshell = false;
             if stage_adds_no_subshell(command) {
                 stage_shell.subshell_level = shell.subshell_level;
             }
@@ -1353,6 +1565,10 @@ impl Execute for ast::CompoundCommand {
                 subshell.loop_depth = 0;
                 // Nor does it list the jobs around it, as a pipeline stage does.
                 subshell.jobs_mut().jobs.clear();
+                // Its last command may run in place of the subshell's process.
+                subshell.paren_subshell = true;
+                subshell.stage_subshell = false;
+                subshell.no_fork = NoFork::for_subshell(list);
                 // It is a process of its own, with its own `$BASHPID`.
                 #[cfg(target_arch = "wasm32")]
                 let numbered_subshell = subshell_process(&mut subshell);
@@ -2371,6 +2587,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 process_group_id: context.process_group_id,
             };
 
+            let no_fork = context.shell.no_fork;
             let result = execute_command(
                 context,
                 params,
@@ -2380,6 +2597,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 &args,
                 &redirects,
                 &mut stderr,
+                no_fork.names(self).then_some(no_fork),
             )
             .await;
             #[cfg(target_arch = "wasm32")]
@@ -2609,6 +2827,47 @@ fn runs_special_builtin(
             .is_some_and(|builtin| !builtin.disabled && builtin.special_builtin)
 }
 
+/// Runs the command `args` names as bash runs a command without forking: a program replaces the
+/// shell, as `exec` does, and sees `SHLVL` one lower; a function called from a substitution or a
+/// background command runs its own last command this way. Not in a pipeline stage (bash's
+/// substitution there is a process of its own), nor while a trap needs the shell afterwards.
+fn exec_in_place(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    no_fork: NoFork,
+    args: &[CommandArg],
+    params: &ExecutionParameters,
+) {
+    if shell.stage_subshell || (no_fork.checked && !traps_allow_exec(shell)) {
+        return;
+    }
+    let mut words = args.iter().map_while(|arg| match arg {
+        CommandArg::String(word) => Some(word.as_str()),
+        CommandArg::Assignment(_) => None,
+    });
+    let Some(mut name) = words.next() else {
+        return;
+    };
+    // `command NAME` runs the program in place too; it skips functions.
+    let mut function_allowed = true;
+    if name == "command" && shell.funcs().get(name).is_none() {
+        function_allowed = false;
+        match words.find(|word| !matches!(*word, "-p" | "--")) {
+            Some(word) if !word.starts_with('-') => name = word,
+            _ => return,
+        }
+    }
+    if function_allowed && shell.funcs().get(name).is_some() {
+        shell.no_fork_call = no_fork.into_function;
+    } else if shell.builtins().get(name).is_some_and(|builtin| {
+        !builtin.disabled
+            && builtin.execution_boundary == crate::builtins::ExecutionBoundary::Command
+    }) {
+        // Bash sees the command's own `SHLVL=` assignment only in a subshell.
+        let in_subshell = shell.depth() > shell.process_depth;
+        shell.adjust_shell_level(-1, params, in_subshell);
+    }
+}
+
 /// Whether bash would run the command `args` names as a program in a child process: not a
 /// function, and not a builtin other than a utility that stands for a program.
 fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[CommandArg]) -> bool {
@@ -2639,6 +2898,7 @@ async fn execute_command<T: Into<String>>(
     args: &[CommandArg],
     redirects: &[&ast::IoRedirect],
     stderr: &mut OpenFile,
+    no_fork: Option<NoFork>,
 ) -> Result<ExecutionSpawnResult, error::Error> {
     // Push a new ephemeral environment scope for the duration of the command. We'll
     // set command-scoped variable assignments after doing so, and revert them before
@@ -2740,6 +3000,10 @@ async fn execute_command<T: Into<String>>(
 
     guard.detach();
     drop(guard);
+
+    if let Some(no_fork) = no_fork {
+        exec_in_place(&mut context.shell, no_fork, args, &params);
+    }
 
     // Construct the command struct.
     let mut cmd =
@@ -3621,6 +3885,7 @@ async fn setup_process_substitution(
     // completion.
     let subshell_cmd = subshell_cmd.to_owned();
     tokio::spawn(async move {
+        subshell.no_fork = NoFork::for_last_command(&subshell_cmd.list, true);
         // Intentionally ignore the result of the subshell command.
         let _ = subshell_cmd
             .list
@@ -3904,6 +4169,7 @@ fn start_persistent_output_substitutions(
             async move {
                 numbered
                     .run(async {
+                        subshell.no_fork = NoFork::for_last_command(&list, true);
                         let result = list.execute(&mut subshell, &params).await;
                         subshell.exit_with_trap_in(result, &params).await
                     })
@@ -3946,8 +4212,10 @@ async fn run_substitution_list(
     subshell.traps_mut().reset_pipe_for_subshell();
     subshell.traps_mut().reset_exit_for_subshell();
     subshell.loop_depth = 0;
-    // Bash reads the list one xtrace level deeper.
+    // Bash reads the list one xtrace level deeper, as a command string whose last command may
+    // run in place of the substitution's process.
     subshell.trace_level += 1;
+    subshell.no_fork = NoFork::for_last_command(list, true);
     let disposition = subshell.traps().pipe_disposition();
     let body = async {
         let result = list.execute(&mut subshell, params).await;
@@ -4035,5 +4303,26 @@ mod execution_context_tests {
         assert_eq!(&*second.context::<String>().unwrap(), "second");
         assert!(child.context::<usize>().is_none());
         assert!(ExecutionParameters::default().context::<String>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod no_fork_tests {
+    use super::ends_input;
+
+    #[test]
+    fn a_command_string_ends_where_bash_reads_its_end() {
+        assert!(ends_input("env", 3));
+        assert!(ends_input("env\n", 3));
+        assert!(ends_input("env ;\n", 3));
+        assert!(ends_input("env # comment", 3));
+        assert!(ends_input("env # comment\n", 3));
+        assert!(ends_input("env \\\n", 3));
+        assert!(ends_input("é; env", 6));
+        assert!(!ends_input("env\n\n", 3));
+        assert!(!ends_input("env\n ", 3));
+        assert!(!ends_input("env\n# comment", 3));
+        assert!(!ends_input("env # comment\ntrue", 3));
+        assert!(!ends_input("env; true", 3));
     }
 }

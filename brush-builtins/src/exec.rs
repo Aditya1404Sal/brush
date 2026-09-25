@@ -86,6 +86,8 @@ impl builtins::Command for ExecCommand {
             let diagnostic_prefix = context.shell.diagnostic_prefix();
             let mut stderr = context.params.stderr(context.shell);
             let shell = context.shell;
+            // The program replaces the shell, which leaves its level as bash does.
+            shell.exec_shell_level(&context.params, &self.args[0]);
             let inner = brush_core::ExecutionContext {
                 shell: &mut *shell,
                 command_name: context.command_name,

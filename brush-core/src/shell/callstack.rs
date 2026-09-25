@@ -117,6 +117,17 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.subshell_level = 0;
         self.trace_level = 0;
         self.exit_trace_level = 0;
+        self.paren_subshell = false;
+        self.stage_subshell = false;
+        self.no_fork = crate::interp::NoFork::default();
+    }
+
+    /// Marks the next program the shell runs as a command string that ends the shell, as
+    /// `bash -c` runs one. When its last command is a simple command naming a program, and
+    /// nothing (a trap, a redirection) needs the shell after it, bash runs the program in place
+    /// of the shell, as `exec` does: the program sees `SHLVL` one lower.
+    pub const fn exec_last_command(&mut self) {
+        self.exec_last = Some(crate::interp::CommandString::Script);
     }
 
     /// Updates the shell's internal tracking state to reflect that command
