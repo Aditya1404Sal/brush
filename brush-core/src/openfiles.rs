@@ -66,6 +66,13 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+
+    /// Identifies where the stream writes, shared by its clones (as `2>&1` makes), so
+    /// [`OpenFile::same_target`] can tell two descriptors write to one place. `None` when the
+    /// stream cannot say.
+    fn target_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Represents a file open in a shell context.
@@ -208,6 +215,9 @@ impl Stream for MemorySink {
     fn clone_box(&self) -> Box<dyn Stream> {
         Box::new(Self(self.0.clone()))
     }
+    fn target_id(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0).addr())
+    }
     #[cfg(unix)]
     fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
         Err(error::ErrorKind::CannotConvertToNativeFd.into())
@@ -238,6 +248,22 @@ pub(crate) fn is_memory_sink_of(file: &OpenFile, buffer: &Arc<std::sync::Mutex<V
         .as_any()
         .and_then(|any| any.downcast_ref::<MemorySink>())
         .is_some_and(|sink| Arc::ptr_eq(&sink.0, buffer)))
+}
+
+impl OpenFile {
+    /// Whether `self` and `other` write to the same place: clones of one open file, pipe end or
+    /// stream, as `2>&1` makes them.
+    pub fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Stdout(_), Self::Stdout(_)) | (Self::Stderr(_), Self::Stderr(_)) => true,
+            (Self::File(a), Self::File(b)) => Arc::ptr_eq(a, b),
+            (Self::PipeWriter(a), Self::PipeWriter(b)) => Arc::ptr_eq(a, b),
+            (Self::Stream(a), Self::Stream(b)) => {
+                a.target_id().is_some_and(|id| Some(id) == b.target_id())
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Clone for OpenFile {
@@ -737,6 +763,10 @@ mod mem_pipe {
             Some(self)
         }
 
+        fn target_id(&self) -> Option<usize> {
+            Some(Arc::as_ptr(&self.0).addr())
+        }
+
         fn clone_box(&self) -> Box<dyn super::Stream> {
             Box::new(self.clone())
         }
@@ -1065,6 +1095,21 @@ mod mem_pipe_tests {
 
     /// Bytes written are read back in order. With the writer still open, an empty read is an
     /// error, not end-of-stream; once the writer drops it is a clean EOF.
+    #[test]
+    fn descriptors_that_share_a_target_are_recognised() {
+        let (_, writer) = super::test_pipe(8);
+        let (_, other) = super::test_pipe(8);
+        assert!(writer.same_target(&writer.clone()));
+        assert!(!writer.same_target(&other));
+        let (sink, _) = super::memory_sink();
+        assert!(sink.same_target(&sink.clone()));
+        assert!(!sink.same_target(&writer));
+        let file = super::OpenFile::File(std::sync::Arc::new(tempfile::tempfile().unwrap()));
+        let second = super::OpenFile::File(std::sync::Arc::new(tempfile::tempfile().unwrap()));
+        assert!(file.same_target(&file.clone()));
+        assert!(!file.same_target(&second));
+    }
+
     #[test]
     fn round_trips_bytes_then_reports_eof_on_writer_drop() {
         let (mut reader, mut writer) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
