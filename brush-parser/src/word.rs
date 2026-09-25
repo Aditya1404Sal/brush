@@ -674,6 +674,87 @@ fn comment_hides_close(expr: &str) -> bool {
     in_comment
 }
 
+/// The length of the text starting with a here-document operator (`<<TAG`, `<<-TAG`) in a
+/// command's text, through the rest of its line and the body of every here-document on that line,
+/// each up to its delimiter line. `None` when the text does not start with one, or when the
+/// command's text ends on that line (a `)` closing it) so there is no body to take.
+fn here_documents_len(text: &str) -> Option<usize> {
+    if !text.starts_with("<<") || text.starts_with("<<<") {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut delimiters = vec![];
+    let mut index = 0;
+    let mut depth = 0_usize;
+    // The operators and tags on the line, and the rest of it up to its newline.
+    while index < bytes.len() && bytes[index] != b'\n' {
+        match bytes[index] {
+            b'<' if bytes.get(index + 1) == Some(&b'<') && bytes.get(index + 2) != Some(&b'<') => {
+                index += 2;
+                let strip = bytes.get(index) == Some(&b'-');
+                index += usize::from(strip);
+                while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+                let start = index;
+                let mut quote = None;
+                while let Some(&byte) = bytes.get(index) {
+                    match quote {
+                        Some(q) if byte == q => quote = None,
+                        Some(_) => {}
+                        None if byte == b'\'' || byte == b'"' => quote = Some(byte),
+                        None if byte == b'\\' => index += 1,
+                        None if byte.is_ascii_whitespace() || b";&|()<>".contains(&byte) => break,
+                        None => {}
+                    }
+                    index += 1;
+                }
+                let tag = text.get(start..index.min(bytes.len()))?;
+                if tag.is_empty() {
+                    return None;
+                }
+                let delimiter: String = tag
+                    .chars()
+                    .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                    .collect();
+                delimiters.push((delimiter, strip));
+                continue;
+            }
+            b'\\' => index += 1,
+            quote @ (b'\'' | b'"') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1 + usize::from(quote == b'"' && bytes[index] == b'\\');
+                }
+            }
+            b'(' => depth += 1,
+            b')' if depth == 0 => return None,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    // The bodies, in order, each through its delimiter line.
+    index += 1;
+    for (delimiter, strip) in delimiters {
+        while index < bytes.len() {
+            let end = bytes[index..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |end| index + end);
+            let mut line = text.get(index..end)?;
+            if strip {
+                line = line.trim_start_matches('\t');
+            }
+            index = end + 1;
+            if line == delimiter {
+                break;
+            }
+        }
+    }
+    Some(index.min(bytes.len()))
+}
+
 /// Parse a heredoc body, treating `"` and `'` as literal characters.
 ///
 /// # Arguments
@@ -1450,6 +1531,7 @@ peg::parser! {
         // Text runs stop at blanks and separators, so each word of the command is a piece of its
         // own and a `case` command is seen where it starts.
         pub(crate) rule command_piece() -> () =
+            here_documents() {} /
             case_command() {} /
             word_piece(<command_piece_stop()>, true /*in_command*/) {} /
             ([' ' | '\t' | '\n' | ';' | '&' | '|'])+ {} /
@@ -1463,6 +1545,7 @@ peg::parser! {
             "case" &keyword_end() (!("esac" keyword_end()) case_command_piece())* "esac" &keyword_end()
 
         rule case_command_piece() =
+            here_documents() {} /
             case_command() /
             word_piece(<case_command_stop()>, true /*in_command*/) {} /
             [_] {}
@@ -1471,9 +1554,19 @@ peg::parser! {
 
         rule keyword_end() = [' ' | '\t' | '\n' | ';' | ')' | '&' | '|'] / ![_]
 
+        // A here-document operator in a command's text, taken with the rest of its line and the
+        // body of each here-document on that line, whose parentheses and quotes are text.
+        rule here_documents() = #{|input, pos| {
+            match input.get(pos..).and_then(here_documents_len) {
+                Some(len) => peg::RuleResult::Matched(pos + len, ()),
+                None => peg::RuleResult::Failed,
+            }
+        }}
+
         // A piece of the command in `${ command; }`, which ends at a `}` that closes no brace
         // group or brace expression of its own.
         rule funsub_piece() =
+            here_documents() {} /
             case_command() /
             "{" (!"}" funsub_piece())* "}" {} /
             word_piece(<funsub_stop()>, true /*in_command*/) {} /
@@ -1685,6 +1778,31 @@ mod tests {
                 ..
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_here_documents_in_command_substitutions() -> Result<()> {
+        // A here-document's body is text: its parentheses do not open or close anything.
+        for (word, command) in [
+            ("$(cat <<'EOF'\n(\nEOF\n)", "cat <<'EOF'\n(\nEOF\n"),
+            ("$(cat <<EOF\n)\nEOF\n)", "cat <<EOF\n)\nEOF\n"),
+            ("$(cat <<-E\n\t) (\n\tE\n)", "cat <<-E\n\t) (\n\tE\n"),
+            (
+                "$(cat <<A; cat <<B\n(a\nA\nb)\nB\n)",
+                "cat <<A; cat <<B\n(a\nA\nb)\nB\n",
+            ),
+            ("$(cat <<A | tr a b\n)(\nA\n)", "cat <<A | tr a b\n)(\nA\n"),
+            ("$(cat <<<'(' )", "cat <<<'(' "),
+        ] {
+            let pieces = super::parse(word, &ParserOptions::default())?;
+            assert_matches!(
+                pieces.first().map(|p| &p.piece),
+                Some(WordPiece::CommandSubstitution(c)) if c == command,
+                "{word:?}"
+            );
+            assert_eq!(pieces.len(), 1, "{word:?}");
+        }
         Ok(())
     }
 

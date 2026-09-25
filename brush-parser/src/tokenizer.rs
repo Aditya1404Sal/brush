@@ -1001,9 +1001,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     }
                 }
             //
-            // Look for the specially specified terminating char.
+            // Look for the specially specified terminating char. An operator being read ends
+            // first, for its own reason: a newline's is what starts a pending here-document.
             //
-            } else if state.unquoted() && terminating_char == Some(c) {
+            } else if state.unquoted() && terminating_char == Some(c) && !state.in_operator() {
                 result = state.delimit_current_token(
                     TokenEndReason::SpecifiedTerminatingChar,
                     &mut self.cross_state,
@@ -2095,6 +2096,19 @@ echo after
         assert_eq!(
             strs("cat <<${x}\nbody\n${x}\n")?,
             ["cat", "<<", "${x}", "body\n", "${x}", "\n"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_here_documents_in_command_substitutions() -> Result<()> {
+        // A `)` in the body of a here-document inside `$( )` does not close it.
+        assert_eq!(
+            tokenize_str("x=$(cat <<EOF\n)\nEOF\n); echo")?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["x=$(cat <<EOF\n)\nEOF\n)", ";", "echo"]
         );
         Ok(())
     }
