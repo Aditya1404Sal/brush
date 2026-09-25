@@ -237,6 +237,7 @@ impl Pattern {
             sys::fs::pattern_path_root(&flattened)
         });
 
+        let absolute = absolute_root.is_some();
         let prefix_to_remove;
         let mut paths_so_far = if let Some(root) = absolute_root {
             prefix_to_remove = None;
@@ -262,24 +263,40 @@ impl Pattern {
         };
 
         let component_count = components.len();
+        // Whether the paths so far came from matching a pattern, rather than being written.
+        let mut matched_so_far = false;
         for (index, component) in components.into_iter().enumerate() {
             if options.globstar
                 && matches!(component.as_slice(), [PatternPiece::Pattern(star)] if star == "**")
             {
                 // Last, `**` names the directory and everything below it; before another
-                // component, the directory and every directory below it.
+                // component, the directory and every directory below it. As in bash, the
+                // directory itself is left out when it is the working directory the pattern
+                // is relative to, and named without a trailing slash when a pattern matched
+                // it (`*/**`); only directories have anything below them.
                 let last = index + 1 == component_count;
                 let allow_dot_files = !options.require_dot_in_pattern_to_match_dot_files;
                 for current_path in std::mem::take(&mut paths_so_far) {
-                    let mut found = vec![if last {
-                        PathBuf::from(std::format!("{}/", current_path.display()))
-                    } else {
-                        current_path.clone()
-                    }];
+                    if !current_path.is_dir() {
+                        continue;
+                    }
+                    let mut found = vec![];
+                    if !last {
+                        found.push(current_path.clone());
+                    } else if matched_so_far {
+                        found.push(current_path.clone());
+                    } else if index > 0 || absolute {
+                        let written = current_path.display().to_string();
+                        found.push(PathBuf::from(if written.ends_with('/') {
+                            written
+                        } else {
+                            std::format!("{written}/")
+                        }));
+                    }
                     walk_for_globstar(&current_path, !last, allow_dot_files, &mut found);
-                    found.sort();
                     paths_so_far.append(&mut found);
                 }
+                matched_so_far = true;
                 continue;
             }
 
@@ -291,6 +308,7 @@ impl Pattern {
                     .iter()
                     .map(|piece| piece.as_str())
                     .collect::<String>();
+                matched_so_far = false;
                 paths_so_far.retain_mut(|p| {
                     sys::fs::push_path_for_pattern(p, &flattened);
 
@@ -306,6 +324,7 @@ impl Pattern {
                 continue;
             }
 
+            matched_so_far = true;
             let current_paths = std::mem::take(&mut paths_so_far);
             for current_path in current_paths {
                 let subpattern = Self::from(&component)
@@ -347,15 +366,9 @@ impl Pattern {
             }
         }
 
-        let results: Vec<_> = paths_so_far
+        let mut results: Vec<_> = paths_so_far
             .into_iter()
             .filter_map(|path| {
-                if let Some(filter) = path_filter
-                    && !filter(path.as_path())
-                {
-                    return None;
-                }
-
                 // Normalize separators *before* stripping the working-dir
                 // prefix so that `prefix_to_remove` (already normalized to
                 // use `/`) matches paths that may contain a mix of `\` and
@@ -370,9 +383,25 @@ impl Pattern {
                     path_ref = stripped;
                 }
 
+                // The working directory itself (`**/` reaching it) is not a result.
+                if path_ref.is_empty() {
+                    return None;
+                }
+
+                // The filter sees each result as it will be returned (GLOBIGNORE's patterns
+                // match `a.txt` for `*`, not the absolute path).
+                if let Some(filter) = path_filter
+                    && !filter(Path::new(path_ref))
+                {
+                    return None;
+                }
+
                 Some(path_ref.to_string())
             })
             .collect();
+
+        // Bash sorts all the results together, not directory by directory.
+        results.sort();
 
         tracing::debug!(target: trace_categories::PATTERN, "  => results: {results:?}");
 
