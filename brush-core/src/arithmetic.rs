@@ -19,7 +19,7 @@ const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
 const MAX_VARIABLE_DEREF_DEPTH: u32 = 200;
 
 /// Represents an error that occurs during evaluation of an arithmetic expression.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum EvalError {
     /// Division by zero.
     #[error("division by 0")]
@@ -68,6 +68,11 @@ pub enum EvalError {
     /// An assignment to a readonly variable.
     #[error("{0}: readonly variable")]
     ReadonlyVariable(String),
+
+    /// An error in an indexed array's subscript, which ends the shell as bash's does, reported
+    /// without the command's name.
+    #[error("{0}")]
+    InSubscript(Box<Self>),
 
     /// An expression that nests deeper than the stack can hold.
     #[error(
@@ -629,10 +634,33 @@ fn element_key(
     if associative {
         return Ok(index.to_owned());
     }
-    let index_expr = parse(index)?;
+    // An error in the subscript ends the shell, as bash's does.
+    let index_expr = parse(index).map_err(EvalError::in_subscript)?;
     Ok(eval_expr_impl(&index_expr, shell, depth)
-        .map_err(|error| EvalError::in_expression(index, error))?
+        .map_err(|error| EvalError::in_expression(index, error).in_subscript())?
         .to_string())
+}
+
+/// Evaluates an indexed array's subscript, already expanded, as bash does: arithmetically, with
+/// an error ending the shell.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to evaluate in.
+/// * `index` - The subscript's text.
+///
+/// # Errors
+///
+/// Returns an error, which ends the shell, if the subscript does not evaluate.
+pub fn eval_subscript(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    index: &str,
+) -> Result<i64, crate::error::Error> {
+    let evaluated = parse(index).and_then(|expr| {
+        expr.eval(shell)
+            .map_err(|error| EvalError::in_expression(index, error))
+    });
+    evaluated.map_err(|error| crate::error::Error::from(error.in_subscript()))
 }
 
 /// The error for an assignment the environment refused: bash names a readonly variable.
@@ -653,7 +681,10 @@ impl EvalError {
     pub fn in_expression(expression: &str, error: Self) -> Self {
         match error {
             // Too deep an expression is not named: it would be as long.
-            Self::Syntax(_) | Self::InExpression(..) | Self::NestedTooDeeply(_) => error,
+            Self::Syntax(_)
+            | Self::InExpression(..)
+            | Self::NestedTooDeeply(_)
+            | Self::InSubscript(_) => error,
             error => Self::InExpression(
                 syntax::without_leading_blanks(expression).to_owned(),
                 Box::new(error),
@@ -661,12 +692,28 @@ impl EvalError {
         }
     }
 
+    /// The error as one in an indexed array's subscript (see [`Self::InSubscript`]). An unset
+    /// variable under `set -u` stays what it is: it ends the shell anyway.
+    #[must_use]
+    pub fn in_subscript(self) -> Self {
+        match self {
+            error if error.unset_variable().is_some() => error,
+            error @ Self::InSubscript(_) => error,
+            error => Self::InSubscript(Box::new(error)),
+        }
+    }
+
+    /// Whether the error is one in an indexed array's subscript, which ends the shell.
+    pub const fn is_in_subscript(&self) -> bool {
+        matches!(self, Self::InSubscript(_))
+    }
+
     /// The variable, if the error is an unset variable under `set -u`, which ends the shell
     /// rather than failing only the command.
     pub fn unset_variable(&self) -> Option<&str> {
         match self {
             Self::ExpandingUnsetVariable(name) => Some(name),
-            Self::InExpression(_, inner) => inner.unset_variable(),
+            Self::InExpression(_, inner) | Self::InSubscript(inner) => inner.unset_variable(),
             _ => None,
         }
     }

@@ -155,7 +155,12 @@ pub enum ErrorKind {
 
     /// An error occurred evaluating an arithmetic expression.
     #[error("{0}")]
-    EvalError(#[from] crate::arithmetic::EvalError),
+    EvalError(crate::arithmetic::EvalError),
+
+    /// An error in an indexed array's subscript: bash reports it without the command's name and
+    /// ends the shell.
+    #[error("{0}")]
+    ArithmeticSubscript(crate::arithmetic::EvalError),
 
     /// The given string could not be parsed as an integer.
     #[error("failed to parse '{s}' as a {int_type_name}, base-{radix} integer: {inner}")]
@@ -325,6 +330,11 @@ pub enum ErrorKind {
     #[error("{0}: bad array subscript")]
     ArrayIndexOutOfRange(String),
 
+    /// An element of an array literal whose negative key counts back past the start
+    /// (`a=([-1]=x)`): it abandons the top-level command, reported without the command's name.
+    #[error("{0}: bad array subscript")]
+    BadArrayElement(String),
+
     /// Unhandled key code.
     #[error("unhandled key code: {0:?}")]
     UnhandledKeyCode(Vec<u8>),
@@ -466,6 +476,15 @@ impl From<&Error> for results::ExecutionExitCode {
     }
 }
 
+impl From<crate::arithmetic::EvalError> for ErrorKind {
+    fn from(error: crate::arithmetic::EvalError) -> Self {
+        match error {
+            crate::arithmetic::EvalError::InSubscript(inner) => Self::ArithmeticSubscript(*inner),
+            error => Self::EvalError(error),
+        }
+    }
+}
+
 impl<T> From<T> for Error
 where
     ErrorKind: From<T>,
@@ -509,7 +528,9 @@ impl Error {
         (matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported)
             || matches!(
                 self.kind,
-                ErrorKind::NoMatch(_) | ErrorKind::InvalidVariableName(_)
+                ErrorKind::NoMatch(_)
+                    | ErrorKind::InvalidVariableName(_)
+                    | ErrorKind::BadArrayElement(_)
             )
     }
 
@@ -538,7 +559,7 @@ impl Error {
 
     /// Returns whether or not this error is fatal.
     pub const fn is_fatal(&self) -> bool {
-        self.fatal
+        self.fatal || matches!(self.kind, ErrorKind::ArithmeticSubscript(_))
     }
 
     /// Returns a reference to the error kind.

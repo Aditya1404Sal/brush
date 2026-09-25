@@ -65,6 +65,10 @@ fn report(
             .into_fatal(),
         );
     }
+    // An error in an array subscript ends the shell, reported without `let`.
+    if error.is_in_subscript() {
+        return Err(brush_core::Error::from(error));
+    }
     if error.is_readonly_variable() {
         writeln!(
             context.stderr(),

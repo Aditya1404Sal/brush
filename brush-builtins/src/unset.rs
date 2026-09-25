@@ -170,11 +170,11 @@ async fn unset_array_index(
     let index_to_use: Cow<'_, str> = if is_assoc_array {
         shell.basic_expand_string(params, index).await?.into()
     } else {
-        // First evaluate the index expression.
-        let index_as_expr =
-            brush_core::arithmetic::parse(index).map_err(brush_core::Error::from)?;
-        let evaluated_index = shell.eval_arithmetic(&index_as_expr)?;
-        evaluated_index.to_string().into()
+        // Expanded, then evaluated; an error ends the shell, as in bash.
+        let index = shell.basic_expand_string(params, index).await?;
+        brush_core::arithmetic::eval_subscript(shell, &index)?
+            .to_string()
+            .into()
     };
 
     // A scalar is element 0 of itself.

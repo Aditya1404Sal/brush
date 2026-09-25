@@ -91,7 +91,9 @@ async fn evaluate_subscript(
     if !indexed || index == "@" || index == "*" || index.parse::<i64>().is_ok() {
         return Ok(operand);
     }
-    let index = arithmetic::expand_and_eval(shell, params, index, false).await?;
+    let index = arithmetic::expand_and_eval(shell, params, index, false)
+        .await
+        .map_err(arithmetic::EvalError::in_subscript)?;
     Ok(format!("{name}[{index}]"))
 }
 

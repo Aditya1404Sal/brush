@@ -747,6 +747,15 @@ async fn call_builtin(
                     ))
                     .into_fatal();
                 }
+                // An array literal's element with a key before the start abandons the command,
+                // reported without the builtin.
+                error::ErrorKind::BadArrayElement(element) => {
+                    return error::ErrorKind::BadArrayElement(element.clone()).into();
+                }
+                // An error in an array subscript ends the shell, reported without the builtin.
+                error::ErrorKind::ArithmeticSubscript(error) => {
+                    return error::ErrorKind::ArithmeticSubscript(error.clone()).into();
+                }
                 // A value an integer variable cannot take ends the shell, named by the builtin.
                 error::ErrorKind::EvalError(_) if inner.is_fatal() => {
                     return error::Error::from(error::ErrorKind::BuiltinError(

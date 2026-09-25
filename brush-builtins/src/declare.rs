@@ -351,6 +351,7 @@ impl DeclareCommand {
             }
         }
 
+        let initial_value = self.evaluate_indexed_keys(context, &name, initial_value, append)?;
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -` saves the `set` options, to restore when the function returns.
@@ -538,6 +539,46 @@ impl DeclareCommand {
             shell.env_mut().get_mut_using_policy_raw(name, lookup)
         } else {
             shell.env_mut().get_mut_using_policy(name, lookup)
+        }
+    }
+
+    /// The keys of an indexed array's elements (`declare 'a[i+1]=v'`, `declare -a a=([i]=v)`)
+    /// are evaluated arithmetically, as in bash, where a key that does not evaluate ends the
+    /// shell. An associative array's keys stay as written.
+    fn evaluate_indexed_keys(
+        &self,
+        context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+        name: &str,
+        value: Option<ShellValueLiteral>,
+        append: bool,
+    ) -> Result<Option<ShellValueLiteral>, brush_core::Error> {
+        let existing = context.shell.env().get(name).map(|(_, var)| var.value());
+        let associative = match self.make_associative_array.to_bool() {
+            Some(associative) => associative,
+            None => existing.is_some_and(brush_core::ShellValue::is_associative_array),
+        };
+        let mut keys = brush_core::variables::IndexedLiteralKeys::new(existing, append);
+        match value {
+            Some(ShellValueLiteral::Array(ArrayLiteral(elements))) if !associative => {
+                let mut evaluated = Vec::with_capacity(elements.len());
+                for (key, value) in elements {
+                    let key = match key {
+                        Some(key) => {
+                            let index =
+                                brush_core::arithmetic::eval_subscript(context.shell, &key)?;
+                            let index = keys.key(index).ok_or_else(|| {
+                                ErrorKind::BadArrayElement(format!("[{key}]={value}"))
+                            })?;
+                            Some(index.to_string())
+                        }
+                        None => None,
+                    };
+                    evaluated.push((key, value));
+                    keys.placed();
+                }
+                Ok(Some(ShellValueLiteral::Array(ArrayLiteral(evaluated))))
+            }
+            value => Ok(value),
         }
     }
 

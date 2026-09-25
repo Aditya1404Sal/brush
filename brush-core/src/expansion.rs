@@ -2578,7 +2578,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             self.basic_expand_to_str(index).await?
         } else {
             arithmetic::expand_and_eval(self.shell, self.params, index, false)
-                .await?
+                .await
+                .map_err(arithmetic::EvalError::in_subscript)?
                 .to_string()
         };
 

@@ -2092,6 +2092,10 @@ fn arithmetic_command_error(
                 .into_fatal(),
         );
     }
+    // An error in an array subscript ends the shell, reported without the command.
+    if error.is_in_subscript() {
+        return Err(error::Error::from(error.clone()));
+    }
     // A readonly variable is named on its own, without the command.
     let message = if error.is_readonly_variable() {
         error.to_string()
@@ -2896,6 +2900,10 @@ async fn apply_assignment_unchecked(
     }
     let variable_name = &resolved_name;
 
+    // An element of an array literal whose key counts back past the start fails the assignment
+    // once the elements before it are assigned, as in bash.
+    let mut failed_element = None;
+
     // Expand the values.
     let new_value = match &assignment.value {
         ast::AssignmentValue::Scalar(unexpanded_value) => {
@@ -2921,13 +2929,33 @@ async fn apply_assignment_unchecked(
             )
         }
         ast::AssignmentValue::Array(unexpanded_values) => {
+            // An indexed array's keys (`[i+1]=v`) are evaluated arithmetically, as in bash.
+            let existing = shell.env().get(variable_name).map(|(_, var)| var.value());
+            let associative = existing.is_some_and(ShellValue::is_associative_array);
+            let mut keys = crate::variables::IndexedLiteralKeys::new(existing, assignment.append);
             let mut elements = vec![];
             for (unexpanded_key, unexpanded_value) in unexpanded_values {
                 let key = match unexpanded_key {
-                    Some(unexpanded_key) => Some(
-                        expansion::basic_expand_assignment_word(shell, params, unexpanded_key)
-                            .await?,
-                    ),
+                    Some(unexpanded_key) => {
+                        let key =
+                            expansion::basic_expand_assignment_word(shell, params, unexpanded_key)
+                                .await?;
+                        if associative {
+                            Some(key)
+                        } else {
+                            let index = arithmetic::eval_subscript(shell, &key)?;
+                            let Some(index) = keys.key(index) else {
+                                failed_element = Some(error::Error::from(
+                                    error::ErrorKind::BadArrayElement(format!(
+                                        "[{}]={}",
+                                        unexpanded_key.value, unexpanded_value.value
+                                    )),
+                                ));
+                                break;
+                            };
+                            Some(index.to_string())
+                        }
+                    }
                     None => None,
                 };
 
@@ -2936,6 +2964,7 @@ async fn apply_assignment_unchecked(
                         expansion::basic_expand_assignment_word(shell, params, unexpanded_value)
                             .await?;
                     elements.push((key, value));
+                    keys.placed();
                 } else {
                     // Array elements are treated as regular words, not assignments
                     let values = expansion::full_expand_and_split_array_element(
@@ -2946,6 +2975,7 @@ async fn apply_assignment_unchecked(
                     .await?;
                     for value in values {
                         elements.push((None, value));
+                        keys.placed();
                     }
                 }
             }
@@ -3010,7 +3040,8 @@ async fn apply_assignment_unchecked(
         if will_be_indexed_array {
             array_index = Some(
                 arithmetic::expand_and_eval(shell, params, idx.as_str(), false)
-                    .await?
+                    .await
+                    .map_err(arithmetic::EvalError::in_subscript)?
                     .to_string(),
             );
         }
@@ -3049,7 +3080,7 @@ async fn apply_assignment_unchecked(
             }
 
             // That's it!
-            return Ok(());
+            return failed_element.map_or(Ok(()), Err);
         }
 
         // A command's own assignment cannot shadow a readonly variable either.
@@ -3084,7 +3115,10 @@ async fn apply_assignment_unchecked(
         new_var.export();
     }
 
-    shell.env_mut().add(variable_name, new_var, creation_scope)
+    shell
+        .env_mut()
+        .add(variable_name, new_var, creation_scope)?;
+    failed_element.map_or(Ok(()), Err)
 }
 
 #[expect(clippy::too_many_lines)]

@@ -991,6 +991,60 @@ impl From<Vec<&str>> for ShellValueLiteral {
 #[derive(Clone, Debug)]
 pub struct ArrayLiteral(pub Vec<(Option<String>, String)>);
 
+/// Where the elements of an indexed array literal go: a key places an element (and those after
+/// it), and a negative key counts back from one past the array's highest index, as in bash.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedLiteralKeys {
+    next: i64,
+    end: i64,
+}
+
+impl IndexedLiteralKeys {
+    /// For a literal replacing `existing`'s value, or appended to it.
+    ///
+    /// # Arguments
+    ///
+    /// * `existing` - The variable's current value, if it has one.
+    /// * `append` - Whether the literal is appended (`+=`).
+    pub fn new(existing: Option<&ShellValue>, append: bool) -> Self {
+        let end = match existing {
+            Some(ShellValue::IndexedArray(values)) if append => {
+                values.keys().next_back().map_or(0, |last| {
+                    i64::try_from(*last).unwrap_or(i64::MAX).saturating_add(1)
+                })
+            }
+            Some(ShellValue::String(_)) if append => 1,
+            _ => 0,
+        };
+        Self { next: end, end }
+    }
+
+    /// Places the next element at the evaluated `key`, returning the index it resolves to, or
+    /// `None` when a negative key counts back past the start.
+    pub const fn key(&mut self, key: i64) -> Option<i64> {
+        let key = if key < 0 {
+            key.saturating_add(self.end)
+        } else {
+            key
+        };
+        if key < 0 {
+            return None;
+        }
+        self.next = key;
+        Some(key)
+    }
+
+    /// Records an element placed where the next one goes.
+    pub const fn placed(&mut self) {
+        self.end = if self.end > self.next.saturating_add(1) {
+            self.end
+        } else {
+            self.next.saturating_add(1)
+        };
+        self.next = self.next.saturating_add(1);
+    }
+}
+
 /// Style for formatting a shell variable's value.
 #[derive(Copy, Clone, Debug)]
 pub enum FormatStyle {
