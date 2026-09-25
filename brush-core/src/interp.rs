@@ -1844,8 +1844,19 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
             match item {
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
-                    if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
+                    // Bash expands a here-document or here-string given to a program it runs in
+                    // a child process there, so the expansion's side effects are lost.
+                    let result = if matches!(
+                        redirect,
+                        ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
+                    ) && runs_as_process(&context.shell, &args)
                     {
+                        let mut child = Shell::clone(&context.shell);
+                        setup_redirect(&mut child, &mut params, redirect).await
+                    } else {
+                        setup_redirect(&mut context.shell, &mut params, redirect).await
+                    };
+                    if let Err(e) = result {
                         let _ = context
                             .shell
                             .display_error(&mut params.stderr(&context.shell), &e);
@@ -2032,6 +2043,23 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // might result in a non-zero exit status stored in the shell.
             Ok(ExecutionResult::new(context.shell.last_exit_status()).into())
         }
+    }
+}
+
+/// Whether bash would run the command `args` names as a program in a child process: not a
+/// function, and not a builtin other than a utility that stands for a program.
+fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[CommandArg]) -> bool {
+    let Some(CommandArg::String(name)) = args.first() else {
+        return false;
+    };
+    if shell.funcs().get(name).is_some() {
+        return false;
+    }
+    match shell.builtins().get(name) {
+        Some(registration) if !registration.disabled => {
+            registration.execution_boundary == crate::builtins::ExecutionBoundary::Command
+        }
+        _ => true,
     }
 }
 
