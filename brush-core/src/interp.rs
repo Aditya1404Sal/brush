@@ -263,7 +263,7 @@ impl Execute for ast::CompoundList {
 
             if run_async {
                 #[cfg(target_arch = "wasm32")]
-                if shell.jobs().running_count(shell.processes()) >= jobs::MAX_RUNNING_JOBS {
+                if shell.processes().running_jobs() >= jobs::MAX_RUNNING_JOBS {
                     writeln!(
                         params.stderr(shell),
                         "bash: fork: retry: Resource temporarily unavailable"
@@ -305,7 +305,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     use crate::execution::process;
     let table = shell.processes().clone();
     let command_line = ao_list.to_string();
-    let leader = table.allocate(shell.own_pid(), command_line.clone());
+    let leader = table.allocate_job(shell.own_pid(), command_line.clone());
 
     let mut cloned_shell = shell.clone();
     let mut cloned_params = params.clone();

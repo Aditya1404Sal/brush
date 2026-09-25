@@ -94,18 +94,10 @@ impl JobTask {
     }
 }
 
-/// Most background jobs one shell keeps running at once.
+/// Most background jobs one session keeps running at once, however deeply they are nested.
 pub const MAX_RUNNING_JOBS: usize = 256;
 
 impl JobManager {
-    /// Jobs whose numbered process is still running.
-    pub fn running_count(&self, table: &crate::process_table::ProcessTable) -> usize {
-        self.jobs
-            .iter()
-            .filter(|job| job.leader.is_some_and(|pid| table.is_running(pid)))
-            .count()
-    }
-
     /// Returns a new job manager.
     pub fn new() -> Self {
         Self::default()
