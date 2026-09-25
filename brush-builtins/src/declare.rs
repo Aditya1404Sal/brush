@@ -363,10 +363,18 @@ impl DeclareCommand {
             }
         }
 
-        // `readonly` takes names, not array elements, as in bash.
-        if let (DeclareVerb::Readonly, Some(index)) = (verb, &assigned_index) {
-            context.report(format_args!("`{name}[{index}]': not a valid identifier"))?;
-            return Ok(false);
+        // `readonly` takes names, not array elements, and an element named without a value
+        // needs a subscript, as in bash.
+        match (verb, &assigned_index) {
+            (DeclareVerb::Readonly, Some(index)) => {
+                context.report(format_args!("`{name}[{index}]': not a valid identifier"))?;
+                return Ok(false);
+            }
+            (_, Some(index)) if index.is_empty() && initial_value.is_none() => {
+                context.report(format_args!("`{name}[]': not a valid identifier"))?;
+                return Ok(false);
+            }
+            _ => (),
         }
 
         // A readonly variable is refused before its new value is evaluated, and an array cannot
@@ -394,13 +402,37 @@ impl DeclareCommand {
         // (`declare 'a[i+1]=v'`), are evaluated arithmetically (an associative array's are
         // words). In a compound assignment, one that is empty or counts back past the start
         // fails the declaration once the elements before it are assigned, abandoning the
-        // command; an element's (`declare 'a[-5]=v'`) fails the declaration as `a[-5]=v` would,
-        // and the variable is still declared, as in bash.
+        // command. An element's that names no element (`declare 'a[-5]=v'`, or an empty one,
+        // `declare 'm[]=v'`, for an associative array too) fails the declaration as `a[-5]=v`
+        // would, and the variable is still declared, with its attributes: kept if it exists,
+        // otherwise a new empty array (unset for a local), as in bash.
         let mut outcome = Ok(true);
+        let associative = self.assigns_associative(context, &name, current_lookup);
+        let mut bad_element = false;
+        // A new global array is made empty; an existing variable or a new local is left as is.
+        let no_element = if create_var_local
+            || self
+                .existing_variable(context.shell, name.as_str(), current_lookup)
+                .is_some()
+        {
+            None
+        } else {
+            Some(ShellValueLiteral::Array(ArrayLiteral(vec![])))
+        };
         let initial_value = match initial_value {
-            Some(ShellValueLiteral::Array(literal))
-                if !self.assigns_associative(context, &name, current_lookup) =>
+            Some(ShellValueLiteral::Array(_))
+                if associative && assigned_index.as_deref() == Some("") =>
             {
+                writeln!(
+                    context.stderr(),
+                    "{}{name}[]: bad array subscript",
+                    context.shell.diagnostic_prefix()
+                )?;
+                outcome = Ok(false);
+                bad_element = true;
+                no_element
+            }
+            Some(ShellValueLiteral::Array(literal)) if !associative => {
                 // An element is assigned into the array as it stands.
                 let existing = self
                     .existing_variable(context.shell, name.as_str(), current_lookup)
@@ -424,7 +456,8 @@ impl DeclareCommand {
                             context.shell.diagnostic_prefix()
                         )?;
                         outcome = Ok(false);
-                        None
+                        bad_element = true;
+                        no_element
                     }
                     (failed, _) => {
                         if let Some(failed) = failed {
@@ -468,6 +501,7 @@ impl DeclareCommand {
         // the assignment fails ("a: readonly variable") and the declaration still succeeds: the
         // array keeps what it held, or is a new empty one (declared but unset for a local).
         if assigned_index.is_some()
+            && !bad_element
             && initial_value.is_some()
             && self.make_readonly.to_bool() == Some(true)
         {
@@ -557,7 +591,7 @@ impl DeclareCommand {
                 self.apply_attributes_before_update(&mut var)?;
 
                 if let Some(initial_value) = initial_value {
-                    var.assign(initial_value, append || assigned_index.is_some())?;
+                    assign_declared(&mut var, initial_value, assigned_index.is_some(), append)?;
                 }
 
                 if context.shell.options().export_variables_on_modification
@@ -620,9 +654,7 @@ impl DeclareCommand {
             self.apply_attributes_before_update(var)?;
 
             if let Some(initial_value) = initial_value {
-                // We append for `name+=value`, or if the declaration included
-                // an explicit index.
-                var.assign(initial_value, append || assigned_index.is_some())?;
+                assign_declared(var, initial_value, assigned_index.is_some(), append)?;
             }
 
             self.apply_attributes_after_update(var, verb)?;
@@ -642,7 +674,7 @@ impl DeclareCommand {
             self.apply_attributes_before_update(&mut var)?;
 
             if let Some(initial_value) = initial_value {
-                var.assign(initial_value, append)?;
+                assign_declared(&mut var, initial_value, assigned_index.is_some(), append)?;
             }
 
             if context.shell.options().export_variables_on_modification && !var.value().is_array() {
@@ -1132,5 +1164,24 @@ impl AssignmentText {
             append,
             value: value.to_owned(),
         })
+    }
+}
+/// Assigns a declaration's value. An element (`a[i]=v`) is assigned as `a[i]=v` would be, so
+/// `a[i]+=v` appends to the element (adds, for an integer), as in bash; any other value is the
+/// variable's whole value, appended to for `+=` or an element's declaration that assigns none.
+fn assign_declared(
+    var: &mut ShellVariable,
+    value: ShellValueLiteral,
+    element: bool,
+    append: bool,
+) -> Result<(), brush_core::Error> {
+    match value {
+        ShellValueLiteral::Array(ArrayLiteral(elements)) if element && elements.len() == 1 => {
+            let Some((key, value)) = elements.into_iter().next() else {
+                return Ok(());
+            };
+            var.assign_at_index(key.unwrap_or_default(), value, append)
+        }
+        value => var.assign(value, append || element),
     }
 }
