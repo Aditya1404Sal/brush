@@ -1855,6 +1855,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 Ok(spawned) if !pending.is_empty() => {
                     // The command must finish writing before the substitutions read it.
                     let completed = ExecutionResult::from(spawned.wait().await?);
+                    start_persistent_output_substitutions(parent_shell, &pending);
                     run_pending_output_substitutions(parent_shell, &pending).await;
                     Ok(completed.into())
                 }
@@ -2686,6 +2687,26 @@ async fn setup_process_substitution(
     // writes and runs, with that as its input, once the command has finished.
     let mut child_params = params.clone();
     child_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+    // The list's standard descriptors are the command's as they are now, even if the command
+    // (`exec`) then changes the shell's.
+    for fd in [
+        OpenFiles::STDIN_FD,
+        OpenFiles::STDOUT_FD,
+        OpenFiles::STDERR_FD,
+    ] {
+        if matches!(
+            child_params.open_files.fd_entry(fd),
+            openfiles::OpenFileEntry::NotSpecified
+        ) && let Some(file) = params.try_fd(shell, fd)
+        {
+            child_params.open_files.set_fd(fd, file);
+        }
+    }
+    // As bash does, count down from 63 for a free descriptor.
+    let fd = (1..=63)
+        .rev()
+        .find(|fd| !params.open_files.contains_fd(*fd))
+        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
     let target_file = match kind {
         ast::ProcessSubstitutionKind::Read => {
             let (sink, output) = openfiles::memory_sink();
@@ -2704,16 +2725,11 @@ async fn setup_process_substitution(
                 list: subshell_cmd.list.clone(),
                 params: child_params,
                 input,
+                fd,
             });
             sink
         }
     };
-
-    // As bash does, count down from 63 for a free descriptor.
-    let fd = (1..=63)
-        .rev()
-        .find(|fd| !params.open_files.contains_fd(*fd))
-        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
     Ok((fd, target_file))
 }
 
@@ -2723,6 +2739,8 @@ pub(crate) struct PendingOutputSubstitution {
     list: ast::CompoundList,
     params: ExecutionParameters,
     input: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// The descriptor the command sees it as (`/dev/fd/63`).
+    fd: ShellFd,
 }
 
 /// The output substitutions one command has set up, shared by the clones of its parameters.
@@ -2748,6 +2766,22 @@ impl PendingOutputSubstitutions {
             .is_empty()
     }
 
+    /// Takes out the substitutions `keep` selects.
+    fn take_where(
+        &self,
+        mut keep: impl FnMut(&PendingOutputSubstitution) -> bool,
+    ) -> Vec<PendingOutputSubstitution> {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (taken, left) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|s| keep(s));
+        *pending = left;
+        taken
+    }
+
     fn take(&self) -> Vec<PendingOutputSubstitution> {
         std::mem::take(
             &mut *self
@@ -2765,6 +2799,71 @@ impl ExecutionParameters {
     fn own_output_substitutions(&mut self) -> PendingOutputSubstitutions {
         self.output_substitutions = PendingOutputSubstitutions::default();
         self.output_substitutions.clone()
+    }
+}
+
+/// `exec` made these substitutions' sinks descriptors of the shell itself: what writes to them
+/// is the rest of the shell. Each such list starts now, as a process alongside the shell reading
+/// through a pipe what is written, as bash's does, and ends once every descriptor writing to it
+/// is closed. Like a background job, it runs in the session's job scope.
+#[cfg(target_arch = "wasm32")]
+fn start_persistent_output_substitutions(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    pending: &PendingOutputSubstitutions,
+) {
+    use crate::execution::process;
+    let held = |shell: &Shell<_>, substitution: &PendingOutputSubstitution| {
+        shell
+            .open_files()
+            .iter_fds()
+            .any(|(_, file)| openfiles::is_memory_sink_of(file, &substitution.input))
+    };
+    for substitution in pending.take_where(|substitution| held(shell, substitution)) {
+        let (reader, writer) = openfiles::open_mem_pipe();
+        let fds: Vec<ShellFd> = shell
+            .open_files()
+            .iter_fds()
+            .filter(|(_, file)| openfiles::is_memory_sink_of(file, &substitution.input))
+            .map(|(fd, _)| fd)
+            .collect();
+        // The list's own shell must not hold the pipe it reads, or its input never ends.
+        let mut subshell = shell.clone();
+        for fd in &fds {
+            subshell.open_files_mut().remove_fd(*fd);
+        }
+        for fd in fds {
+            // The descriptor the substitution was opened on closes with the command, as in bash.
+            if fd == substitution.fd {
+                shell.open_files_mut().remove_fd(fd);
+            } else {
+                shell.open_files_mut().set_fd(fd, writer.clone());
+            }
+        }
+        drop(writer);
+        let mut params = substitution.params;
+        params.open_files.set_fd(OpenFiles::STDIN_FD, reader);
+        let table = shell.processes().clone();
+        let pid = table.allocate_substitution(shell.own_pid(), format!(">({})", substitution.list));
+        let dispositions = process::Dispositions::from_traps(shell.traps()).for_exec();
+        let numbered =
+            process::NumberedProcess::register(&table, pid, dispositions).in_background();
+        subshell.set_own_pid(pid);
+        subshell.traps_mut().reset_pipe_for_subshell();
+        subshell.traps_mut().reset_exit_for_subshell();
+        subshell.loop_depth = 0;
+        let list = substitution.list;
+        drop(process::spawn_job(
+            &shell.execution_services(),
+            &table,
+            async move {
+                numbered
+                    .run(async {
+                        let result = list.execute(&mut subshell, &params).await;
+                        subshell.exit_with_trap_in(result, &params).await
+                    })
+                    .await
+            },
+        ));
     }
 }
 

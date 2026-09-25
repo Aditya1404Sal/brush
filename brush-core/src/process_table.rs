@@ -38,8 +38,11 @@ pub struct ProcessEntry {
     pub command: String,
     /// Current status.
     pub status: ProcessStatus,
-    /// Whether this process leads a background job (`&`).
+    /// Whether this process leads a background job (`&`) or runs an output process
+    /// substitution that outlives its command (`exec > >(list)`).
     pub job: bool,
+    /// Whether this is such an output process substitution, which ends once its input closes.
+    pub substitution: bool,
     /// Allocation order within the table, for reporting processes in the order they started.
     pub order: u64,
     /// The number the process is known by: for a background pipeline, its last stage (`$!`).
@@ -147,6 +150,16 @@ impl ProcessTable {
         self.allocate_entry(ppid, command, true)
     }
 
+    /// Hands out a number, as [`Self::allocate_job`], for an output process substitution that
+    /// outlives its command.
+    pub fn allocate_substitution(&self, ppid: Pid, command: String) -> Pid {
+        let pid = self.allocate_entry(ppid, command, true);
+        if let Some(entry) = self.lock().entries.get_mut(&pid) {
+            entry.substitution = true;
+        }
+        pid
+    }
+
     fn allocate_entry(&self, ppid: Pid, command: String, job: bool) -> Pid {
         let mut inner = self.lock();
         let mut candidate = inner.next_pid;
@@ -175,6 +188,7 @@ impl ProcessTable {
                 command,
                 status: ProcessStatus::Running,
                 job,
+                substitution: false,
                 order,
                 shown: candidate,
             },

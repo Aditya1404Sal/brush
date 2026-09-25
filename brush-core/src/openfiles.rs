@@ -182,42 +182,62 @@ pub fn from_bytes(bytes: Vec<u8>) -> OpenFile {
     )))))
 }
 
+/// A write-only stream that keeps everything written to it in memory (see [`memory_sink`]).
+struct MemorySink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Read for MemorySink {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+impl std::io::Write for MemorySink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stream for MemorySink {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        Box::new(Self(self.0.clone()))
+    }
+    #[cfg(unix)]
+    fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+    #[cfg(unix)]
+    fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+}
+
 /// Creates a write-only stream that keeps everything written to it in memory, and the buffer
 /// it writes to.
 pub fn memory_sink() -> (OpenFile, Arc<std::sync::Mutex<Vec<u8>>>) {
-    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Read for Sink {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::PermissionDenied.into())
-        }
-    }
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl Stream for Sink {
-        fn clone_box(&self) -> Box<dyn Stream> {
-            Box::new(Self(self.0.clone()))
-        }
-        #[cfg(unix)]
-        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
-            Err(error::ErrorKind::CannotConvertToNativeFd.into())
-        }
-        #[cfg(unix)]
-        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
-            Err(error::ErrorKind::CannotConvertToNativeFd.into())
-        }
-    }
     let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
-    (OpenFile::Stream(Box::new(Sink(buffer.clone()))), buffer)
+    (
+        OpenFile::Stream(Box::new(MemorySink(buffer.clone()))),
+        buffer,
+    )
+}
+
+/// Whether `file` is a [`memory_sink`] writing to `buffer`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn is_memory_sink_of(file: &OpenFile, buffer: &Arc<std::sync::Mutex<Vec<u8>>>) -> bool {
+    matches!(file, OpenFile::Stream(stream) if stream
+        .as_any()
+        .and_then(|any| any.downcast_ref::<MemorySink>())
+        .is_some_and(|sink| Arc::ptr_eq(&sink.0, buffer)))
 }
 
 impl Clone for OpenFile {
