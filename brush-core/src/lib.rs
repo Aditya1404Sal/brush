@@ -39,6 +39,7 @@ pub mod patterns;
 pub mod process_table;
 pub mod processes;
 mod prompt;
+pub mod rawbytes;
 mod regex;
 pub mod results;
 mod shell;

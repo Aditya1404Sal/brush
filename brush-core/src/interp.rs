@@ -2298,8 +2298,10 @@ pub(crate) async fn setup_redirect(
 
                     // Diagnostics name the file as the script did, not its absolute path.
                     let written_path = expanded_fields.remove(0);
-                    let expanded_file_path: PathBuf =
-                        shell.absolute_path(Path::new(written_path.as_str()));
+                    // The name's bytes, including any that are not UTF-8 (see `rawbytes`).
+                    let expanded_file_path: PathBuf = shell.absolute_path(Path::new(
+                        &crate::rawbytes::to_os_string(written_path.as_str()),
+                    ));
 
                     let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
                     match kind {
@@ -2521,7 +2523,9 @@ fn setup_redirect_output_and_error_to(
     file_path: &str,
     append: bool,
 ) -> Result<(), error::Error> {
-    let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
+    // The name's bytes, including any that are not UTF-8 (see `rawbytes`).
+    let abs_file_path: PathBuf =
+        shell.absolute_path(Path::new(&crate::rawbytes::to_os_string(file_path)));
 
     let mut file_options = std::fs::File::options();
     file_options
@@ -2780,7 +2784,9 @@ fn spawn_command_task(
     )
 )]
 fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
-    let bytes = contents.as_bytes();
+    // The body's bytes, including any that are not UTF-8 (see `rawbytes`).
+    let bytes = crate::rawbytes::encode(contents);
+    let bytes = bytes.as_ref();
 
     // wasm32-wasip2 has no OS pipes (`std::io::pipe()` errors "operation not supported on this
     // platform"). A here-document / here-string body is fully known up front, so stage it through the

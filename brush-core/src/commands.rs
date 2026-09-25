@@ -1019,17 +1019,18 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
         let (mut reader, writer) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
-        let mut output_str = String::new();
+        // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`).
+        let mut output = Vec::new();
         let (cmd_result, output_result) = futures::join!(
             crate::execution::process::run_process(
                 subshell.traps().pipe_disposition(),
                 run_substitution_command(subshell, params, s)
             ),
-            futures::io::AsyncReadExt::read_to_string(reader.async_io(), &mut output_str)
+            futures::io::AsyncReadExt::read_to_end(reader.async_io(), &mut output)
         );
         output_result?;
         shell.set_last_exit_status(cmd_result?.exit_code.into());
-        Ok(output_str)
+        Ok(crate::rawbytes::decode_vec(output))
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -30,8 +30,9 @@ pub fn expand_backslash_escapes(
     let mut it = s.chars();
     while let Some(c) = it.next() {
         if c != '\\' {
-            // Not a backslash, add and move on.
-            result.append(c.to_string().into_bytes().as_mut());
+            // Not a backslash, add and move on (as the byte it stands for, if it stands for one;
+            // see `rawbytes`).
+            crate::rawbytes::push_char(&mut result, c);
             continue;
         }
 
@@ -437,7 +438,8 @@ fn ansi_c_quote(s: &str) -> String {
             '\\' => result.push_str("\\\\"),
             '\'' => result.push_str("\\'"),
             c if needs_ansi_c_quoting(c) => {
-                result.push_str(std::format!("\\{:03o}", c as u8).as_str());
+                let byte = crate::rawbytes::char_byte(c).unwrap_or(c as u8);
+                result.push_str(std::format!("\\{byte:03o}").as_str());
             }
             _ => result.push(c),
         }
@@ -477,8 +479,9 @@ const fn needs_escaping(c: char) -> bool {
     )
 }
 
+// A byte that is not UTF-8 (see `rawbytes`) is written as its octal escape, as bash writes it.
 const fn needs_ansi_c_quoting(c: char) -> bool {
-    c.is_ascii_control()
+    c.is_ascii_control() || crate::rawbytes::char_byte(c).is_some()
 }
 
 #[cfg(test)]

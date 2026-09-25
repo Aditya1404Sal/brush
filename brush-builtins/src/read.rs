@@ -314,6 +314,8 @@ struct InputReader {
     input: std::io::BufReader<PolledInput>,
     /// Bytes from a malformed UTF-8 sequence, still owed to the caller one at a time.
     pending: VecDeque<char>,
+    /// Whether the input is a terminal, where Ctrl+C and Ctrl+D are keys, not characters.
+    terminal: bool,
     /// Terminal mode guard - kept alive for RAII cleanup on drop.
     /// The guard restores original terminal settings when dropped, even though
     /// we don't access the field directly after construction.
@@ -345,6 +347,7 @@ impl InputReader {
         timeout: Option<Duration>,
         term_mode: Option<brush_core::terminal::AutoModeGuard>,
     ) -> Self {
+        let terminal = input.is_terminal();
         Self {
             input: std::io::BufReader::with_capacity(
                 1,
@@ -354,6 +357,7 @@ impl InputReader {
                 },
             ),
             pending: VecDeque::new(),
+            terminal,
             _term_mode: term_mode,
         }
     }
@@ -377,32 +381,29 @@ impl InputReader {
             }
 
             match self.input.read_char_raw() {
-                Ok(Some(ch)) => break ch,
+                Ok(Some(ch)) => break stand_for_own_bytes(ch, &mut self.pending),
                 Ok(None) => return Ok(InputEvent::Eof),
                 Err(e) => {
-                    // Hand back the bytes it consumed, one at a time; the byte that broke
-                    // the sequence was left unconsumed, for the next call to re-read.
-                    //
-                    // TODO(utf-8): `line` is a `String`, so an invalid byte can't
-                    // round-trip; bash preserves it verbatim, we re-encode it.
+                    // Hand back the bytes it consumed, one at a time, each as the character
+                    // that stands for it (see `rawbytes`); the byte that broke the sequence was
+                    // left unconsumed, for the next call to re-read.
                     if e.as_bytes().is_empty() {
                         if e.as_io_error().kind() == std::io::ErrorKind::TimedOut {
                             return Ok(InputEvent::Timeout);
                         }
                         return Err(e.into_io_error().into());
                     }
-                    self.pending
-                        .extend(e.as_bytes().iter().copied().map(char::from));
+                    self.pending.extend(
+                        e.as_bytes()
+                            .iter()
+                            .copied()
+                            .map(brush_core::rawbytes::byte_char),
+                    );
                 }
             }
         };
 
-        // Map control characters to events.
-        Ok(match ch {
-            CTRL_C => InputEvent::CtrlC,
-            CTRL_D => InputEvent::CtrlD,
-            _ => InputEvent::Char(ch),
-        })
+        Ok(input_event(ch, self.terminal))
     }
 }
 
@@ -441,6 +442,8 @@ struct InputReader {
     timer: Option<futures::future::LocalBoxFuture<'static, ()>>,
     pending: VecDeque<char>,
     bytes: VecDeque<u8>,
+    /// Whether the input is a terminal, where Ctrl+C and Ctrl+D are keys, not characters.
+    terminal: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -452,6 +455,7 @@ impl InputReader {
         services: brush_core::execution::ExecutionServices,
     ) -> Self {
         Self {
+            terminal: input.is_terminal(),
             input,
             timer: timeout
                 .filter(|time| !time.is_zero())
@@ -516,20 +520,52 @@ impl InputReader {
                 }
             }
             if let Ok(text) = std::str::from_utf8(&encoded) {
-                text.chars().next().ok_or_else(|| {
+                let ch = text.chars().next().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "empty UTF-8 sequence")
-                })?
+                })?;
+                stand_for_own_bytes(ch, &mut self.pending)
             } else {
-                self.pending
-                    .extend(encoded.into_iter().skip(1).map(char::from));
-                char::from(first)
+                // Each byte of a malformed sequence is a character of its own, standing for
+                // that byte (see `rawbytes`).
+                self.pending.extend(
+                    encoded
+                        .into_iter()
+                        .skip(1)
+                        .map(brush_core::rawbytes::byte_char),
+                );
+                brush_core::rawbytes::byte_char(first)
             }
         };
-        Ok(match ch {
-            CTRL_C => InputEvent::CtrlC,
-            CTRL_D => InputEvent::CtrlD,
-            _ => InputEvent::Char(ch),
-        })
+        Ok(input_event(ch, self.terminal))
+    }
+}
+
+/// A character decoded from valid UTF-8, as the shell holds it: a character in the range that
+/// stands for bytes that are not UTF-8 (see `rawbytes`) stands for its own bytes instead, so the
+/// first is returned and the rest queued ahead of any pending characters.
+fn stand_for_own_bytes(ch: char, pending: &mut VecDeque<char>) -> char {
+    if brush_core::rawbytes::char_byte(ch).is_none() {
+        return ch;
+    }
+    let mut buffer = [0; 4];
+    let mut bytes = ch
+        .encode_utf8(&mut buffer)
+        .bytes()
+        .map(brush_core::rawbytes::byte_char);
+    let first = bytes.next().unwrap_or(ch);
+    for (index, byte) in bytes.enumerate() {
+        pending.insert(index, byte);
+    }
+    first
+}
+
+/// The input event for a character read. Ctrl+C and Ctrl+D are keys only on a terminal; any
+/// other input holds them as ordinary characters, as bash reads them.
+const fn input_event(ch: char, terminal: bool) -> InputEvent {
+    match ch {
+        CTRL_C if terminal => InputEvent::CtrlC,
+        CTRL_D if terminal => InputEvent::CtrlD,
+        _ => InputEvent::Char(ch),
     }
 }
 
@@ -541,6 +577,8 @@ struct LineReaderConfig {
     char_limit: Option<usize>,
     /// Whether to process backslash escapes (false for -r mode).
     process_escapes: bool,
+    /// Whether the input is a terminal, whose other control characters are keys too.
+    terminal: bool,
 }
 
 /// Reads a complete line of input using the given reader and configuration.
@@ -640,8 +678,11 @@ async fn read_line_with_reader(
                     return Ok(ReadResult::Line(line));
                 }
 
-                // Ignore non-whitespace control characters.
-                if ch.is_ascii_control() && !ch.is_ascii_whitespace() {
+                // A NUL byte is skipped, as bash skips it; on a terminal, so are the other
+                // non-whitespace control characters (keys with no meaning here).
+                if ch == '\0'
+                    || (config.terminal && ch.is_ascii_control() && !ch.is_ascii_whitespace())
+                {
                     continue;
                 }
 
@@ -731,6 +772,7 @@ impl ReadCommand {
             delimiter,
             char_limit,
             process_escapes: !self.raw_mode,
+            terminal: reader.terminal,
         };
 
         read_line_with_reader(&mut reader, &config).await
@@ -895,6 +937,7 @@ mod tests {
             delimiter: Some(DEFAULT_DELIMITER),
             char_limit: None,
             process_escapes: false,
+            terminal: false,
         };
 
         // Holding `tx` means the continuation byte never arrives, so the deadline has to
@@ -906,7 +949,10 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        assert!(matches!(result, ReadResult::TimedOut(Some(line)) if line == "\u{c3}"));
+        // The partial sequence's byte is kept as the byte it is (see `rawbytes`).
+        assert!(
+            matches!(result, ReadResult::TimedOut(Some(line)) if line == brush_core::rawbytes::decode(b"\xc3"))
+        );
     }
 
     // ==================== split_line_by_ifs tests ====================

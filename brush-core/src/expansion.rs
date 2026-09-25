@@ -1134,9 +1134,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     s.as_str(),
                     escape::EscapeExpansionMode::AnsiCQuotes,
                 )?;
-                Expansion::from(ExpansionPiece::Unsplittable(
-                    String::from_utf8_lossy(expanded.as_slice()).into_owned(),
-                ))
+                Expansion::from(ExpansionPiece::Unsplittable(crate::rawbytes::decode_vec(
+                    expanded,
+                )))
             }
             brush_parser::word::WordPiece::DoubleQuotedSequence(pieces)
             | brush_parser::word::WordPiece::GettextDoubleQuotedSequence(pieces) => {
@@ -2315,7 +2315,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::ParameterTransformOp::ExpandEscapeSequences => {
                 let (result, _) =
                     escape::expand_backslash_escapes(s, escape::EscapeExpansionMode::AnsiCQuotes)?;
-                Ok(String::from_utf8_lossy(result.as_slice()).into_owned())
+                Ok(crate::rawbytes::decode_vec(result))
             }
             brush_parser::word::ParameterTransformOp::PossiblyQuoteWithArraysExpanded {
                 separate_words: _separate_words,

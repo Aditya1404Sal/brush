@@ -120,13 +120,18 @@ impl MapFileCommand {
         mut input_file: brush_core::openfiles::OpenFile,
     ) -> Result<variables::ArrayLiteral, brush_core::Error> {
         let _term_mode = setup_terminal_settings(&input_file)?;
+        // Ctrl+C and Ctrl+D are keys only on a terminal; other input holds them as characters.
+        let terminal = input_file.is_terminal();
 
         let mut entries = vec![];
         let mut read_count = 0;
         let max_count = self.max_count.try_into()?;
         let delimiter = match &self.delimiter {
             Some(d) if d.is_empty() => b'\0',
-            Some(d) => d.as_bytes().first().copied().unwrap_or(b'\n'),
+            Some(d) => brush_core::rawbytes::encode(d)
+                .first()
+                .copied()
+                .unwrap_or(b'\n'),
             None => b'\n',
         };
 
@@ -142,9 +147,9 @@ impl MapFileCommand {
                 #[cfg(not(target_arch = "wasm32"))]
                 let read = input_file.read(&mut buf);
                 match read {
-                    Ok(0) => break,                                         // End of input
-                    Ok(1) if buf[0] == b'\x03' => break,                    // Ctrl+C
-                    Ok(1) if buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
+                    Ok(0) => break,                                                     // End of input
+                    Ok(1) if terminal && buf[0] == b'\x03' => break,                    // Ctrl+C
+                    Ok(1) if terminal && buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
                     Ok(1) => {
                         let byte = buf[0];
                         line.push(byte);
@@ -171,7 +176,8 @@ impl MapFileCommand {
                 line.pop();
             }
 
-            let line_str = String::from_utf8_lossy(&line).to_string();
+            // Bytes that are not UTF-8 are kept (see `rawbytes`).
+            let line_str = brush_core::rawbytes::decode_vec(line);
 
             entries.push((None, line_str));
         }
