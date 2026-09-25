@@ -565,7 +565,7 @@ impl Display for Command {
             Self::Compound(compound_command, redirect_list) => {
                 write!(f, "{compound_command}")?;
                 if let Some(redirect_list) = redirect_list {
-                    write!(f, "{redirect_list}")?;
+                    write!(f, " {redirect_list}")?;
                 }
                 Ok(())
             }
@@ -1375,7 +1375,7 @@ impl Display for FunctionBody {
         if matches!(self.0, CompoundCommand::BraceGroup(_)) {
             write!(f, "{}", self.0)?;
             if let Some(redirect_list) = &self.1 {
-                write!(f, "{redirect_list}")?;
+                write!(f, " {redirect_list}")?;
             }
             return Ok(());
         }
@@ -1386,7 +1386,7 @@ impl Display for FunctionBody {
             let mut body = indented(f);
             write!(body, "{}", self.0)?;
             if let Some(redirect_list) = &self.1 {
-                write!(body, "{redirect_list}")?;
+                write!(body, " {redirect_list}")?;
             }
         }
         writeln!(f)?;
@@ -1817,8 +1817,11 @@ impl SourceLocation for RedirectList {
 
 impl Display for RedirectList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for item in &self.0 {
-            write!(f, " {item}")?;
+        for (i, item) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, " ")?;
+            }
+            write!(f, "{item}")?;
         }
         Ok(())
     }
@@ -1866,14 +1869,20 @@ impl Display for IoRedirect {
             Self::File(fd_num, kind, target) => match kind {
                 // As bash writes a duplication: with its descriptor, and no space (`2>&1`,
                 // `1>&2`, `0<&3`).
-                IoFileRedirectKind::DuplicateInput => {
+                IoFileRedirectKind::DuplicateInput
+                    if !matches!(target, IoFileRedirectTarget::Filename(_)) =>
+                {
                     write!(f, "{}{kind}{target}", fd_num.unwrap_or(0))?;
                 }
-                IoFileRedirectKind::DuplicateOutput => {
+                IoFileRedirectKind::DuplicateOutput
+                    if !matches!(target, IoFileRedirectTarget::Filename(_)) =>
+                {
                     write!(f, "{}{kind}{target}", fd_num.unwrap_or(1))?;
                 }
                 // The descriptor a redirection uses by default is left out, as bash leaves it out.
-                IoFileRedirectKind::Read | IoFileRedirectKind::ReadAndWrite => {
+                IoFileRedirectKind::Read
+                | IoFileRedirectKind::ReadAndWrite
+                | IoFileRedirectKind::DuplicateInput => {
                     if let Some(fd_num) = fd_num.filter(|fd| *fd != 0) {
                         write!(f, "{fd_num}")?;
                     }
@@ -1881,7 +1890,8 @@ impl Display for IoRedirect {
                 }
                 IoFileRedirectKind::Write
                 | IoFileRedirectKind::Append
-                | IoFileRedirectKind::Clobber => {
+                | IoFileRedirectKind::Clobber
+                | IoFileRedirectKind::DuplicateOutput => {
                     if let Some(fd_num) = fd_num.filter(|fd| *fd != 1) {
                         write!(f, "{fd_num}")?;
                     }
@@ -2711,8 +2721,8 @@ impl Display for UnaryAssignmentOperator {
 pub enum ArithmeticTarget {
     /// A named variable.
     Variable(String),
-    /// An element in an array.
-    ArrayElement(String, Box<ArithmeticExpr>),
+    /// An element in an array, with its subscript as written.
+    ArrayElement(String, String),
 }
 
 impl Node for ArithmeticTarget {}

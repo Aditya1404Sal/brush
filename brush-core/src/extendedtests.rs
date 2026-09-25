@@ -128,6 +128,31 @@ pub(crate) fn apply_unary_predicate_to_str(
         {
             Ok(false)
         }
+        // `/dev/fd/N` exists only while the descriptor is open, as on Linux; WASI has no such
+        // files, so the platform answers for every number.
+        #[cfg(target_arch = "wasm32")]
+        ast::UnaryPredicate::FileExists
+        | ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsCharSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsDir
+        | ast::UnaryPredicate::FileExistsAndIsRegularFile
+        | ast::UnaryPredicate::FileExistsAndIsSetgid
+        | ast::UnaryPredicate::FileExistsAndIsSymlink
+        | ast::UnaryPredicate::FileExistsAndHasStickyBit
+        | ast::UnaryPredicate::FileExistsAndIsFifo
+        | ast::UnaryPredicate::FileExistsAndIsReadable
+        | ast::UnaryPredicate::FileExistsAndIsNotZeroLength
+        | ast::UnaryPredicate::FileExistsAndIsSetuid
+        | ast::UnaryPredicate::FileExistsAndIsWritable
+        | ast::UnaryPredicate::FileExistsAndIsExecutable
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId
+        | ast::UnaryPredicate::FileExistsAndModifiedSinceLastRead
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveUserId
+        | ast::UnaryPredicate::FileExistsAndIsSocket
+            if shell.names_closed_fd(params, operand) =>
+        {
+            Ok(false)
+        }
         ast::UnaryPredicate::FileExists => {
             let path = shell.absolute_path(Path::new(operand));
             Ok(path.exists())
@@ -198,12 +223,17 @@ pub(crate) fn apply_unary_predicate_to_str(
         }
         ast::UnaryPredicate::FileExistsAndIsExecutable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.executable())
+            Ok(path.executable_or_searchable())
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
             let path = shell.absolute_path(Path::new(operand));
             if !path.exists() {
                 return Ok(false);
+            }
+
+            // WASI has no owners: every file in the shell's filesystem is its own.
+            if cfg!(target_family = "wasm") {
+                return Ok(true);
             }
 
             let md = path.metadata()?;
@@ -216,6 +246,11 @@ pub(crate) fn apply_unary_predicate_to_str(
             let path = shell.absolute_path(Path::new(operand));
             if !path.exists() {
                 return Ok(false);
+            }
+
+            // WASI has no owners: every file in the shell's filesystem is its own.
+            if cfg!(target_family = "wasm") {
+                return Ok(true);
             }
 
             let md = path.metadata()?;
@@ -283,9 +318,9 @@ async fn apply_binary_predicate(
             let (matches, captures) = match regex.matches(s.as_str()) {
                 Ok(Some(captures)) => (true, captures),
                 Ok(None) => (false, vec![]),
-                // If we can't compile the regex, don't abort the whole operation but make sure to
-                // report it.
-                // TODO(test): Docs indicate we should yield 2 on an invalid regex (not 1).
+                // A regular expression that does not compile fails the whole test (status 2).
+                Err(e) if matches!(e.kind(), error::ErrorKind::InvalidRegex(..)) => return Err(e),
+                // Otherwise don't abort the whole operation, but make sure to report it.
                 Err(e) => {
                     tracing::warn!("error using regex: {}", e);
                     (false, vec![])

@@ -36,6 +36,15 @@ impl builtins::Command for AliasCommand {
                 if let Some((name, unexpanded_value)) = alias.split_once('=')
                     && !name.is_empty()
                 {
+                    // Bash refuses a name holding a blank, a quote, `/`, `$` or an operator.
+                    if name.contains([
+                        ' ', '\t', '\n', '(', ')', '<', '>', ';', '&', '|', '"', '\'', '`', '\\',
+                        '$', '/',
+                    ]) {
+                        context.report(format_args!("`{name}': invalid alias name"))?;
+                        exit_code = ExecutionResult::general_error();
+                        continue;
+                    }
                     context
                         .shell
                         .define_alias(name.to_owned(), unexpanded_value.to_owned());

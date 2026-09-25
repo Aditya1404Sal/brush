@@ -612,6 +612,9 @@ impl builtins::Command for CompOptCommand {
                 .as_mut()
             {
                 Self::set_options(in_flight_options, &options);
+            } else {
+                context.report("not currently executing completion function")?;
+                return Ok(ExecutionResult::general_error());
             }
         }
 

@@ -119,15 +119,16 @@ impl CommandArg {
     pub(crate) fn quote_for_tracing(&self) -> Cow<'_, str> {
         match self {
             Self::String(s) => escape::quote_if_needed(s, escape::QuoteMode::SingleQuote),
+            // Bash prints the word `name=value` as it prints any word, quoted whole when it
+            // needs to be: `e=`, `'a=x y'`.
             Self::Assignment(a) => {
-                let mut s = a.name.to_string();
                 let op = if a.append { "+=" } else { "=" };
-                s.push_str(op);
-                s.push_str(&escape::quote_if_needed(
-                    a.value.to_string().as_str(),
+                escape::quote_if_needed(
+                    format!("{}{op}{}", a.name, a.value).as_str(),
                     escape::QuoteMode::SingleQuote,
-                ));
-                s.into()
+                )
+                .into_owned()
+                .into()
             }
         }
     }
@@ -395,6 +396,35 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 
                 if let Some(post_execute) = self.post_execute {
                     let _ = post_execute(&mut self.shell);
+                }
+
+                // Bash hands a command it cannot find to `command_not_found_handle`, when one is
+                // defined, run in a subshell with the command and its arguments; its status is
+                // the command's.
+                if let Some(handler) = self.shell.funcs().get(NOT_FOUND_HANDLER).cloned() {
+                    let mut subshell = self.shell.clone();
+                    // The handler does not handle the commands it cannot find itself.
+                    subshell.undefine_func(NOT_FOUND_HANDLER);
+                    let context = ExecutionContext {
+                        shell: &mut subshell,
+                        command_name: NOT_FOUND_HANDLER.to_owned(),
+                        params: self.params,
+                    };
+                    let status = match invoke_shell_function(handler, context, &self.args).await {
+                        Ok(spawned) => match spawned.wait().await? {
+                            crate::results::ExecutionWaitResult::Completed(result) => {
+                                result.exit_code
+                            }
+                            crate::results::ExecutionWaitResult::Stopped(..) => {
+                                ExecutionResult::stopped().exit_code
+                            }
+                        },
+                        Err(error) => {
+                            let _ = subshell.display_error(&mut subshell.stderr(), &error);
+                            error.into_result(&subshell).exit_code
+                        }
+                    };
+                    return Ok(ExecutionResult::from(status).into());
                 }
 
                 Err(ErrorKind::CommandNotFound(self.command_name).into())
@@ -704,6 +734,11 @@ pub(crate) fn execute_external_command(
                 sys::terminal::move_self_to_foreground()?;
             }
 
+            #[cfg(target_arch = "wasm32")]
+            if spawn_err.kind() == std::io::ErrorKind::Unsupported {
+                return Err(unexecutable(context.shell, context.command_name));
+            }
+
             if spawn_err.kind() == std::io::ErrorKind::NotFound {
                 if !context.shell.working_dir().exists() {
                     Err(
@@ -721,6 +756,24 @@ pub(crate) fn execute_external_command(
             }
         }
     }
+}
+
+/// Why command `name` cannot run on WASI, which cannot start processes: a path that names
+/// nothing or a directory fails as `execve` fails on it; a file is refused.
+#[cfg(target_arch = "wasm32")]
+fn unexecutable(shell: &Shell<impl extensions::ShellExtensions>, name: String) -> error::Error {
+    if !name.contains('/') {
+        return error::ErrorKind::ExecutingFilesUnsupported(name).into();
+    }
+    let path = shell.absolute_path(std::path::Path::new(&name));
+    match std::fs::metadata(&path) {
+        Err(_) => error::ErrorKind::CannotExecutePath(name, error::NO_SUCH_FILE),
+        Ok(metadata) if metadata.is_dir() => {
+            error::ErrorKind::CannotExecutePath(name, "Is a directory")
+        }
+        Ok(_) => error::ErrorKind::ExecutingFilesUnsupported(name),
+    }
+    .into()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -831,9 +884,12 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
         {
             if process::pipe_disposition() != PipeDisposition::Default {
                 let mut stderr = params.stderr(shell);
+                let prefix = shell.diagnostic_prefix();
                 let diagnostic = stderr
                     .async_io()
-                    .write_all(format!("{command_name}: write error: Broken pipe\n").as_bytes())
+                    .write_all(
+                        format!("{prefix}{command_name}: write error: Broken pipe\n").as_bytes(),
+                    )
                     .await;
                 if let Err(error) = diagnostic {
                     if error.kind() != std::io::ErrorKind::BrokenPipe {
@@ -898,6 +954,9 @@ async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
     Ok(None)
 }
 
+/// The function bash runs for a command it cannot find.
+const NOT_FOUND_HANDLER: &str = "command_not_found_handle";
+
 pub(crate) async fn invoke_shell_function(
     function: functions::Registration,
     mut context: ExecutionContext<'_, impl extensions::ShellExtensions>,
@@ -909,6 +968,9 @@ pub(crate) async fn invoke_shell_function(
     if let Some(redirects) = redirects {
         for redirect in &redirects.0 {
             interp::setup_redirect(context.shell, &mut context.params, redirect).await?;
+        }
+        if redirects.0.iter().any(interp::redirects_stdin) {
+            context.params.stdin_redirected = true;
         }
     }
 
@@ -936,6 +998,8 @@ pub(crate) async fn invoke_shell_function(
         .map(|handler| handler.command.clone());
     // `local -` in the body saves the options, which come back when it returns.
     let option_saves = context.shell.local_option_saves.len();
+    // The body expands the aliases in effect where the function was defined.
+    let caller_aliases = context.shell.alias_scope.replace(function.aliases());
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
@@ -949,6 +1013,7 @@ pub(crate) async fn invoke_shell_function(
         context.shell.leave_function()?;
         result
     };
+    context.shell.alias_scope = caller_aliases;
     context.shell.loop_depth = caller_loop_depth;
     context.shell.restore_local_options(option_saves);
 
@@ -966,11 +1031,9 @@ pub(crate) async fn invoke_shell_function(
                 .options()
                 .shell_functions_inherit_debug_and_return_traps)
     {
-        let _ = context
-            .shell
-            .invoke_trap_handler(traps::TrapSignal::Return, &context.params)
-            .await;
+        let _ = context.shell.run_return_trap(&context.params).await;
     }
+    context.shell.status_before_return = None;
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;
@@ -999,6 +1062,9 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     let mut subshell = shell.clone();
     #[cfg(target_arch = "wasm32")]
     subshell.traps_mut().reset_pipe_for_subshell();
+    // It runs only an EXIT trap it sets itself, when it ends.
+    #[cfg(target_arch = "wasm32")]
+    subshell.traps_mut().reset_exit_for_subshell();
 
     // Command substitutions don't inherit errexit by default. Only inherit it when
     // command_subst_inherits_errexit is enabled, otherwise disable errexit in the subshell.
@@ -1019,17 +1085,52 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
         let (mut reader, writer) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
+        // It is a process of its own, with its own `$BASHPID`.
+        let numbered = interp::subshell_process(&mut subshell);
+        // The substitution's output ends when the subshell, its EXIT trap and every job still
+        // holding its output are done.
+        let command = async move {
+            let completed = std::cell::Cell::new(false);
+            let result = numbered
+                .run(async {
+                    let result = run_wasm_substitution_command(&mut subshell, &mut params, s).await;
+                    let result = subshell.exit_with_trap_in(result, &params).await;
+                    completed.set(true);
+                    result
+                })
+                .await;
+            if !completed.get() {
+                subshell.exit_trap_after_signal(&result, &params).await;
+            }
+            result
+        };
+        // At most `MAX_SUBSTITUTION_BYTES` are kept; past that the reader closes, so the
+        // substitution's writers get SIGPIPE, and the substitution fails.
+        let read = async move {
+            use futures::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let count = reader.async_io().read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>((output, false));
+                }
+                if output.len() + count > openfiles::MAX_SUBSTITUTION_BYTES {
+                    drop(reader);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+        };
+        let (cmd_result, output_result) = futures::join!(command, read);
+        let (output, truncated) = output_result?;
+        let status = cmd_result?.exit_code.into();
+        if truncated {
+            shell.set_last_exit_status(1);
+            return Err(error::ErrorKind::SubstitutionTooLarge.into());
+        }
+        shell.set_last_exit_status(status);
         // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`).
-        let mut output = Vec::new();
-        let (cmd_result, output_result) = futures::join!(
-            crate::execution::process::run_process(
-                subshell.traps().pipe_disposition(),
-                run_substitution_command(subshell, params, s)
-            ),
-            futures::io::AsyncReadExt::read_to_end(reader.async_io(), &mut output)
-        );
-        output_result?;
-        shell.set_last_exit_status(cmd_result?.exit_code.into());
         Ok(crate::rawbytes::decode_vec(output))
     }
 
@@ -1070,16 +1171,35 @@ pub(crate) async fn invoke_command_in_current_shell_and_get_output(
 
     // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`). The command
     // and the read of its output run together, so output larger than the pipe cannot stall it.
+    // As for `$( )`, at most `MAX_SUBSTITUTION_BYTES` are kept; past that the reader closes, and
+    // the substitution fails.
     #[cfg(target_arch = "wasm32")]
     let (cmd_result, output) = {
         let (mut reader, writer) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
-        let mut output = Vec::new();
-        let (cmd_result, output_result) = futures::join!(
-            run_command_string(shell, params, command),
-            futures::io::AsyncReadExt::read_to_end(reader.async_io(), &mut output)
-        );
-        output_result?;
+        let read = async move {
+            use futures::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let count = reader.async_io().read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>((output, false));
+                }
+                if output.len() + count > openfiles::MAX_SUBSTITUTION_BYTES {
+                    drop(reader);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+        };
+        let (cmd_result, output_result) =
+            futures::join!(run_command_string(shell, params, command), read);
+        let (output, truncated) = output_result?;
+        if truncated {
+            shell.set_last_exit_status(1);
+            return Err(error::ErrorKind::SubstitutionTooLarge.into());
+        }
         (cmd_result, crate::rawbytes::decode_vec(output))
     };
 
@@ -1142,9 +1262,27 @@ async fn run_command_string(
         .await
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn run_wasm_substitution_command(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
+    command: String,
+) -> Result<ExecutionResult, error::Error> {
+    run_substitution_command_in(shell, params, command).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn run_substitution_command(
     mut shell: Shell<impl extensions::ShellExtensions>,
     mut params: ExecutionParameters,
+    command: String,
+) -> Result<ExecutionResult, error::Error> {
+    run_substitution_command_in(&mut shell, &mut params, command).await
+}
+
+async fn run_substitution_command_in(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
     command: String,
 ) -> Result<ExecutionResult, error::Error> {
     // Parse the string into a whole shell program.
@@ -1157,14 +1295,14 @@ async fn run_substitution_command(
         if let Some(redir) = try_unwrap_bare_input_redir_program(program) {
             // A file that cannot be read is reported and fails the substitution (status 1), as
             // in bash; it does not end the command using the substitution.
-            if let Err(error) = interp::setup_redirect(&mut shell, &mut params, redir).await {
-                let _ = shell.display_error(&mut params.stderr(&shell), &error);
+            if let Err(error) = interp::setup_redirect(shell, params, redir).await {
+                let _ = shell.display_error(&mut params.stderr(shell), &error);
                 return Ok(ExecutionResult::general_error());
             }
             #[cfg(target_arch = "wasm32")]
-            futures::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell)).await?;
+            futures::io::copy(&mut params.stdin(shell), &mut params.stdout(shell)).await?;
             #[cfg(not(target_arch = "wasm32"))]
-            std::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell))?;
+            std::io::copy(&mut params.stdin(shell), &mut params.stdout(shell))?;
             return Ok(ExecutionResult::new(0));
         }
     }
@@ -1172,9 +1310,12 @@ async fn run_substitution_command(
     // TODO(source-info): review this
     let source_info = crate::SourceInfo::from("main");
 
+    // The substitution's lines are numbered on from the command it is part of.
+    shell.begin_nested_code();
+
     // Handle the parse result using default shell behavior.
     shell
-        .run_parsed_result(parse_result, Some(&command), &source_info, &params)
+        .run_parsed_result(parse_result, Some(&command), &source_info, params)
         .await
 }
 

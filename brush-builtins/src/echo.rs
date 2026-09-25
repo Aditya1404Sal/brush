@@ -23,6 +23,11 @@ pub(crate) struct EchoCommand {
     /// Tokens to echo to standard output.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+
+    /// Whether `-e` or `-E` came last, as bash reads them; `None` for neither, where the
+    /// `xpg_echo` option decides.
+    #[clap(skip)]
+    escapes: Option<bool>,
 }
 
 impl builtins::Command for EchoCommand {
@@ -35,10 +40,36 @@ impl builtins::Command for EchoCommand {
     where
         I: IntoIterator<Item = String>,
     {
-        let (mut this, rest_args) = brush_core::builtins::try_parse_known::<Self>(args)?;
-        if let Some(args) = rest_args {
-            this.args.extend(args);
+        // As bash reads them: leading words made only of `n`, `e` and `E` after a dash are
+        // options, the last of `-e` and `-E` wins, and everything else is text (`--` too).
+        let mut this = Self {
+            no_trailing_newline: false,
+            interpret_backslash_escapes: false,
+            no_interpret_backslash_escapes: false,
+            args: vec![],
+            escapes: None,
+        };
+        let mut options = true;
+        for arg in args.into_iter().skip(1) {
+            let letters = arg.strip_prefix('-').unwrap_or_default();
+            if options
+                && !letters.is_empty()
+                && letters.chars().all(|c| matches!(c, 'n' | 'e' | 'E'))
+            {
+                for letter in letters.chars() {
+                    match letter {
+                        'n' => this.no_trailing_newline = true,
+                        'e' => this.escapes = Some(true),
+                        _ => this.escapes = Some(false),
+                    }
+                }
+            } else {
+                options = false;
+                this.args.push(arg);
+            }
         }
+        this.interpret_backslash_escapes = this.escapes == Some(true);
+        this.no_interpret_backslash_escapes = this.escapes == Some(false);
         Ok(this)
     }
 
@@ -49,7 +80,13 @@ impl builtins::Command for EchoCommand {
         let mut trailing_newline = !self.no_trailing_newline;
         // The output's bytes, including any that are not UTF-8 (see `rawbytes`).
         let mut s: Vec<u8>;
-        if self.interpret_backslash_escapes {
+        let interpret = self.escapes.unwrap_or_else(|| {
+            context
+                .shell
+                .options()
+                .echo_builtin_expands_escape_sequences
+        });
+        if interpret {
             s = Vec::new();
             for (i, arg) in self.args.iter().enumerate() {
                 if i > 0 {

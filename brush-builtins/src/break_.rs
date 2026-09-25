@@ -33,14 +33,17 @@ impl builtins::Command for BreakCommand {
             None => 1,
             Some(Ok(n)) if n > 0 => n,
             Some(Ok(_)) => {
-                // Bash reports the count and still leaves (or continues) the innermost loop.
+                // Bash reports the count and leaves every enclosing loop, with status 1.
                 let arg = self.which_loop.as_deref().unwrap_or_default();
                 writeln!(
                     context.stderr(),
                     "{prefix}{name}: {arg}: loop count out of range"
                 )?;
-                result = ExecutionResult::general_error();
-                1
+                let mut result = ExecutionResult::general_error();
+                result.next_control_flow = ExecutionControlFlow::BreakLoop {
+                    levels: context.shell.loop_depth() - 1,
+                };
+                return Ok(result);
             }
             Some(Err(_)) => {
                 let arg = self.which_loop.as_deref().unwrap_or_default();

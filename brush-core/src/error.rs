@@ -29,6 +29,11 @@ pub enum ErrorKind {
     #[error("cannot assign list to array member")]
     AssigningListToArrayMember,
 
+    /// A regular expression (`[[ =~ ]]`) that does not compile, with the reason as bash's
+    /// regex library words it.
+    #[error("invalid regular expression `{0}': {1}")]
+    InvalidRegex(String, &'static str),
+
     /// An attempt was made to convert an associative array to an indexed array.
     #[error("cannot convert associative array to indexed array")]
     ConvertingAssociativeArrayToIndexedArray,
@@ -54,8 +59,8 @@ pub enum ErrorKind {
     FailedToSendSignal,
 
     /// An attempt was made to assign a value to a special parameter.
-    #[error("cannot assign in this way")]
-    CannotAssignToSpecialParameter,
+    #[error("{0}: cannot assign in this way")]
+    CannotAssignToSpecialParameter(String),
 
     /// Checked expansion error.
     #[error("{0}")]
@@ -80,6 +85,15 @@ pub enum ErrorKind {
     /// Failed to execute command.
     #[error("failed to execute command '{0}': {1}")]
     FailedToExecuteCommand(String, #[source] std::io::Error),
+
+    /// A command named by a path cannot run, for the reason given (`No such file or directory`,
+    /// `Is a directory`), as the kernel's `execve` would say.
+    #[error("{0}: {1}")]
+    CannotExecutePath(String, &'static str),
+
+    /// A command resolved to a file, which this platform cannot run as a process.
+    #[error("{0}: executing files is unsupported in bash-tool")]
+    ExecutingFilesUnsupported(String),
 
     /// History item was not found.
     #[error("history item not found")]
@@ -279,9 +293,25 @@ pub enum ErrorKind {
     #[error("interrupted")]
     Interrupted,
 
-    /// Maximum function call depth was exceeded.
-    #[error("maximum function call depth exceeded")]
-    MaxFunctionCallDepthExceeded,
+    /// A function call would nest deeper than `FUNCNEST` (or the embedder's limit) allows: the
+    /// function's name and the nesting level reached.
+    #[error("{0}: maximum function nesting level exceeded ({1})")]
+    MaxFunctionCallDepthExceeded(String, usize),
+
+    /// A function call would nest deeper than the stack can hold: the function's name and the
+    /// nesting level reached.
+    #[error(
+        "{0}: maximum function nesting level exceeded ({1}): deeper nesting is unsupported in bash-tool"
+    )]
+    FunctionNestingTooDeep(String, usize),
+
+    /// A command substitution's output exceeded what the shell holds in memory.
+    #[error("command substitution: output over 16 MiB is unsupported in bash-tool")]
+    SubstitutionTooLarge,
+
+    /// Execution would nest deeper than the stack can hold.
+    #[error("maximum nesting level exceeded: deeper nesting is unsupported in bash-tool")]
+    NestingTooDeep,
 
     /// System time error.
     #[error("system time error: {0}")]
@@ -302,6 +332,11 @@ pub enum ErrorKind {
     /// An error occurred in a built-in command.
     #[error("{1}: {0}")]
     BuiltinError(Box<dyn BuiltinError>, String),
+
+    /// The embedder refused to run a prompt string's expansions (see
+    /// [`crate::Shell::set_prompt_guard`]); the diagnostic is its own.
+    #[error("{0}")]
+    PromptRefused(String),
 
     /// Operation not supported on this platform.
     #[error("operation not supported on this platform: {0}")]
@@ -387,6 +422,9 @@ where
     }
 }
 
+/// `execve`'s reason for a path that names nothing.
+pub(crate) const NO_SUCH_FILE: &str = "No such file or directory";
+
 impl From<&ErrorKind> for results::ExecutionExitCode {
     fn from(value: &ErrorKind) -> Self {
         match value {
@@ -398,7 +436,12 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
+            ErrorKind::PromptRefused(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
+            ErrorKind::CannotExecutePath(_, reason) if *reason == NO_SUCH_FILE => Self::NotFound,
+            ErrorKind::CannotExecutePath(..) => Self::CannotExecute,
+            // Found but not run: bash's status for a file it cannot execute.
+            ErrorKind::ExecutingFilesUnsupported(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
             ErrorKind::BuiltinError(inner, ..) => inner.as_exit_code(),
@@ -458,13 +501,16 @@ impl Error {
 
     /// Whether the error abandons the rest of the top-level command, as assigning to a
     /// readonly variable does in bash: it passes through function calls rather than becoming
-    /// the call's status.
+    /// the call's status. Only an assignment statement does this, and it reports the error
+    /// where it happens; a builtin or a loop that cannot assign the variable just fails.
     pub const fn abandons_command(&self) -> bool {
-        // A failed glob under failglob does the same.
-        matches!(
-            self.kind,
-            ErrorKind::ReadonlyVariableNamed(_) | ErrorKind::NoMatch(_)
-        )
+        // A failed glob under failglob, and an indirect expansion of a value that is no name, do
+        // the same, reported where the top-level command ends.
+        (matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported)
+            || matches!(
+                self.kind,
+                ErrorKind::NoMatch(_) | ErrorKind::InvalidVariableName(_)
+            )
     }
 
     /// The reason a path could not be used, as the system words it ("No such file or
@@ -475,6 +521,18 @@ impl Error {
             ErrorKind::NotADirectory(_) => "Not a directory".to_owned(),
             ErrorKind::WorkingDirMissing(_) => "No such file or directory".to_owned(),
             kind => kind.to_string(),
+        }
+    }
+
+    /// The arithmetic error this error carries, or the error itself when it is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error itself when it is not an arithmetic error.
+    pub fn into_eval_error(self) -> Result<crate::arithmetic::EvalError, Self> {
+        match self.kind {
+            ErrorKind::EvalError(error) => Ok(error),
+            _ => Err(self),
         }
     }
 
@@ -527,7 +585,7 @@ impl Error {
         // An unset variable (`set -u`, `${x?}`) ends `bash -c` with 127, as in bash; a script
         // read from a file or standard input, `set -e`, or a subshell ended by it gives 1.
         let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
-            && shell.depth() == 0
+            && shell.depth() == shell.process_depth
             && shell.options().command_string_mode
             && !shell.options().exit_on_nonzero_command_exit
             && matches!(

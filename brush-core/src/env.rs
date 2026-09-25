@@ -284,6 +284,36 @@ impl ShellEnvironment {
         resolved
     }
 
+    /// Whether following the nameref `name` comes back to a nameref already followed
+    /// (`declare -n a=b b=a`), which bash reports as a circular name reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to resolve.
+    pub fn is_circular_nameref(&self, name: &str) -> bool {
+        let mut seen: Vec<&str> = vec![];
+        let mut current = name;
+        loop {
+            let Some((_, var)) = self.get_raw(current) else {
+                return false;
+            };
+            if !var.is_treated_as_nameref() {
+                return false;
+            }
+            let ShellValue::String(target) = var.value() else {
+                return false;
+            };
+            if target.is_empty() || target == current {
+                return false;
+            }
+            seen.push(current);
+            if seen.contains(&target.as_str()) {
+                return true;
+            }
+            current = target;
+        }
+    }
+
     /// The array element a nameref names (`declare -n ref='arr[1]'`), as the array's name and the
     /// subscript as written, or `None` when `name` does not resolve to an element.
     ///
@@ -592,7 +622,8 @@ impl ShellEnvironment {
 
         let auto_export = self.export_variables_on_modification;
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
-            var.assign(value, false)?;
+            var.assign(value, false)
+                .map_err(|error| name_readonly_error(error, &name))?;
             if auto_export {
                 var.export();
             }
@@ -631,7 +662,8 @@ impl ShellEnvironment {
         let name = self.resolve_nameref(&name.into()).into_owned();
 
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
-            var.assign_at_index(index, value, false)?;
+            var.assign_at_index(index, value, false)
+                .map_err(|error| name_readonly_error(error, &name))?;
             updater(var)
         } else {
             let mut var = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
@@ -691,6 +723,15 @@ impl ShellEnvironment {
         var: ShellVariable,
     ) -> Result<(), error::Error> {
         self.add(name, var, EnvironmentScope::Global)
+    }
+}
+
+/// Names the variable in a readonly error, as bash's `NAME: readonly variable` does.
+fn name_readonly_error(error: error::Error, name: &str) -> error::Error {
+    if matches!(error.kind(), error::ErrorKind::ReadonlyVariable) {
+        error::ErrorKind::ReadonlyVariableNamed(name.to_owned()).into()
+    } else {
+        error
     }
 }
 

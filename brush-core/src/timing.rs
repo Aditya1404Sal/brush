@@ -62,6 +62,76 @@ fn get_current_stopwatch_time() -> Result<StopwatchTime, error::Error> {
     })
 }
 
+/// Bash's default `TIMEFORMAT`.
+pub(crate) const BASH_TIMEFORMAT: &str = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
+
+/// The format `time -p` uses, whatever `TIMEFORMAT` holds.
+pub(crate) const POSIX_TIMEFORMAT: &str = "real %2R\nuser %2U\nsys %2S";
+
+/// Formats `timing` as bash's `print_formatted_time` does: `%%` is a percent sign, `%[p][l]R`,
+/// `U` and `S` the real, user and system times with `p` decimal places (default 3, at most 6) and,
+/// with `l`, minutes, and `%P` the CPU percentage. Returns the error message for an invalid
+/// format character.
+pub(crate) fn format_timing(format: &str, timing: &StopwatchTiming) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let mut result = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' || chars.peek().is_none() {
+            result.push(c);
+            continue;
+        }
+        if chars.next_if_eq(&'%').is_some() {
+            result.push('%');
+            continue;
+        }
+        if chars.next_if_eq(&'P').is_some() {
+            let cpu = (timing.user + timing.system)
+                .as_micros()
+                .saturating_mul(10000)
+                .checked_div(timing.wall.as_micros())
+                .unwrap_or(0);
+            let _ = write!(result, "{}.{:02}", cpu / 100, cpu % 100);
+            continue;
+        }
+        let precision = match chars.peek().and_then(|c| c.to_digit(10)) {
+            Some(digit) => {
+                chars.next();
+                digit.min(6)
+            }
+            None => 3,
+        };
+        let long = chars.next_if_eq(&'l').is_some();
+        let duration = match chars.next() {
+            Some('R' | 'E') => timing.wall,
+            Some('U') => timing.user,
+            Some('S') => timing.system,
+            other => {
+                return Err(format!(
+                    "TIMEFORMAT: `{}': invalid format character",
+                    other.unwrap_or_default()
+                ));
+            }
+        };
+        let mut seconds = duration.as_secs();
+        if long {
+            let _ = write!(result, "{}m", seconds / 60);
+            seconds %= 60;
+        }
+        let _ = write!(result, "{seconds}");
+        if precision > 0 {
+            let micros = format!("{:06}", duration.subsec_micros());
+            result.push('.');
+            result.extend(micros.chars().take(precision as usize));
+        }
+        if long {
+            result.push('s');
+        }
+    }
+    Ok(result)
+}
+
 /// Format the given duration in a non-POSIX-y way.
 ///
 /// # Arguments

@@ -90,7 +90,18 @@ impl Regex {
             .map(|piece| piece.to_regex_str())
             .collect();
 
-        let re = compile_regex(regex_pattern, self.case_insensitive, self.multiline)?;
+        // A pattern bash's regex library refuses is refused here too, whether or not this engine
+        // would take it.
+        if let Some(reason) = invalid_regex_reason(&regex_pattern) {
+            return Err(error::ErrorKind::InvalidRegex(regex_pattern, reason).into());
+        }
+        let re = compile_regex(regex_pattern.clone(), self.case_insensitive, self.multiline)
+            .map_err(|_error| {
+                error::Error::from(error::ErrorKind::InvalidRegex(
+                    regex_pattern,
+                    "Invalid regular expression",
+                ))
+            })?;
 
         Ok(re.captures(value)?.map(|captures| {
             captures
@@ -99,6 +110,59 @@ impl Regex {
                 .collect()
         }))
     }
+}
+
+/// Why `pattern` is not a valid POSIX extended regular expression, as the C library bash uses
+/// (musl) words it, or `None` when this check finds nothing wrong.
+fn invalid_regex_reason(pattern: &str) -> Option<&'static str> {
+    const CLASSES: [&str; 12] = [
+        "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+        "upper", "xdigit",
+    ];
+    let mut chars = pattern.chars().peekable();
+    let mut depth = 0usize;
+    let mut first = true;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.next().is_none() => return Some("Trailing backslash"),
+            '*' | '+' | '?' if first => {
+                return Some("Repetition not preceded by valid expression");
+            }
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '{' => {
+                // `{m}`, `{m,}` or `{m,n}`.
+                let bound: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                let (low, high) = bound.split_once(',').unwrap_or((&bound, "0"));
+                let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+                if !digits(low) || !(high.is_empty() || digits(high)) {
+                    return Some("Invalid contents of {}");
+                }
+            }
+            '[' => {
+                // A `]` right after `[` or `[^` is part of the set.
+                chars.next_if_eq(&'^');
+                chars.next_if_eq(&']');
+                loop {
+                    match chars.next() {
+                        None => return Some("Missing ']'"),
+                        Some(']') => break,
+                        Some('[') if chars.next_if_eq(&':').is_some() => {
+                            let class: String = chars.by_ref().take_while(|c| *c != ':').collect();
+                            if !CLASSES.contains(&class.as_str()) {
+                                return Some("Unknown character class name");
+                            }
+                            chars.next_if_eq(&']');
+                        }
+                        Some(_) => (),
+                    }
+                }
+            }
+            _ => (),
+        }
+        first = false;
+    }
+    (depth > 0).then_some("Missing ')'")
 }
 
 pub(crate) fn compile_regex(

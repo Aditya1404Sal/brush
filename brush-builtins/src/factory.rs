@@ -170,7 +170,7 @@ pub fn default_builtins<SE: brush_core::ShellExtensions>(
         m.insert("shopt".into(), builtin::<shopt::ShoptCommand, SE>());
         #[cfg(feature = "builtin.dot")]
         m.insert("source".into(), builtin::<dot::DotCommand, SE>().special());
-        #[cfg(all(feature = "builtin.suspend", unix))]
+        #[cfg(all(feature = "builtin.suspend", any(unix, target_arch = "wasm32")))]
         m.insert("suspend".into(), builtin::<suspend::SuspendCommand, SE>());
         #[cfg(feature = "builtin.test")]
         m.insert("test".into(), builtin::<test::TestCommand, SE>());
@@ -215,7 +215,9 @@ pub fn default_builtins<SE: brush_core::ShellExtensions>(
         #[cfg(feature = "builtin.jobs")]
         m.insert("disown".into(), builtin::<disown::DisownCommand, SE>());
 
-        // TODO(logout): implement logout builtin
+        #[cfg(feature = "builtin.exit")]
+        m.insert("logout".into(), builtin::<exit::LogoutCommand, SE>());
+        #[cfg(not(feature = "builtin.exit"))]
         m.insert(
             "logout".into(),
             builtin::<unimp::UnimplementedCommand, SE>(),

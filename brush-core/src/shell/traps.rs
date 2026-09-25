@@ -12,9 +12,17 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
     /// Runs the `EXIT` trap handler, if any, and returns its result.
     pub async fn run_exit_trap(&mut self) -> Result<ExecutionResult, error::Error> {
+        self.run_exit_trap_in(&self.default_exec_params()).await
+    }
+
+    /// Runs the `EXIT` trap handler, if any, with the descriptors of `params` (a subshell's
+    /// redirections), and returns its result.
+    pub async fn run_exit_trap_in(
+        &mut self,
+        params: &ExecutionParameters,
+    ) -> Result<ExecutionResult, error::Error> {
         if self.traps.handles(TrapSignal::Exit) {
-            self.invoke_trap_handler(TrapSignal::Exit, &self.default_exec_params())
-                .await
+            self.invoke_trap_handler(TrapSignal::Exit, params).await
         } else {
             Ok(ExecutionResult::success())
         }
@@ -30,10 +38,49 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         &mut self,
         result: Result<ExecutionResult, error::Error>,
     ) -> Result<ExecutionResult, error::Error> {
-        match self.run_exit_trap().await {
+        self.exit_with_trap_in(result, &self.default_exec_params())
+            .await
+    }
+
+    /// As [`Self::exit_with_trap`], with the descriptors of `params`.
+    pub async fn exit_with_trap_in(
+        &mut self,
+        result: Result<ExecutionResult, error::Error>,
+        params: &ExecutionParameters,
+    ) -> Result<ExecutionResult, error::Error> {
+        match self.run_exit_trap_in(params).await {
             Ok(trap) if trap.is_exit() => Ok(trap),
             _ => result,
         }
+    }
+
+    /// Runs the `EXIT` trap of a shell whose process a signal ended before its commands could
+    /// finish, as bash does for every signal but KILL. The trap runs in a process of its own and
+    /// cannot change the shell's status, which stays `128 + signal`.
+    ///
+    /// # Arguments
+    ///
+    /// * `result`: What the shell's process returned.
+    /// * `params`: The shell's execution parameters, whose descriptors the trap writes to.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn exit_trap_after_signal(
+        &mut self,
+        result: &Result<ExecutionResult, error::Error>,
+        params: &ExecutionParameters,
+    ) {
+        use crate::execution::process;
+        let Ok(ExecutionResult {
+            terminating_signal: Some(signal),
+            ..
+        }) = result
+        else {
+            return;
+        };
+        if *signal == process::signals::KILL || !self.traps.handles(TrapSignal::Exit) {
+            return;
+        }
+        let disposition = self.traps().pipe_disposition();
+        let _ = process::run_process(disposition, self.run_exit_trap_in(params)).await;
     }
 
     /// Invokes the handler registered for `signal`, if any.
@@ -92,9 +139,18 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         // clobber the status that triggered it.
         let orig_last_exit_status = self.last_exit_status;
 
+        // Bash reads the handler with a parser of its own, one xtrace level deeper; the EXIT
+        // trap runs one level below where its subshell started (at PS4's own for the shell).
+        let trace_level = self.trace_level;
+        self.trace_level = if signal == TrapSignal::Exit {
+            self.exit_trace_level
+        } else {
+            trace_level + 1
+        };
+
         self.enter_trap_handler(signal, Some(&handler));
         #[cfg(any(target_arch = "wasm32", test))]
-        {
+        let result = {
             let mut frame = super::callstack::FrameGuard::new(
                 self,
                 |shell| {
@@ -107,16 +163,18 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
                 .shell()
                 .run_string(&handler.command, &handler.source_info, &params)
                 .await
-        }
+        };
         #[cfg(not(any(target_arch = "wasm32", test)))]
-        {
+        let result = {
             let result = self
                 .run_string(&handler.command, &handler.source_info, &params)
                 .await;
             self.leave_trap_handler();
             self.last_exit_status = orig_last_exit_status;
             result
-        }
+        };
+        self.trace_level = trace_level;
+        result
     }
 
     /// Returns whether the given trap signal is inherited in the current

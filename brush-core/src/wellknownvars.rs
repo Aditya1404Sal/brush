@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rand::RngExt as _;
@@ -111,8 +110,9 @@ pub(crate) fn init_well_known_vars(
                         .collect::<Vec<_>>(),
                 );
 
-                ShellValue::associative_array_from_literals(values)
-                    .unwrap_or_else(|_error| ShellValue::AssociativeArray(BTreeMap::new()))
+                ShellValue::associative_array_from_literals(values).unwrap_or_else(|_error| {
+                    ShellValue::AssociativeArray(variables::AssociativeValues::default())
+                })
             },
             setter: |_| (),
         }),
@@ -157,7 +157,9 @@ pub(crate) fn init_well_known_vars(
                 shell
                     .program_location_cache()
                     .to_value()
-                    .unwrap_or_else(|_error| ShellValue::AssociativeArray(BTreeMap::new()))
+                    .unwrap_or_else(|_error| {
+                        ShellValue::AssociativeArray(variables::AssociativeValues::default())
+                    })
             },
             setter: |_| (),
         }),
@@ -188,7 +190,7 @@ pub(crate) fn init_well_known_vars(
     shell.env_mut().set_global(
         "BASH_SUBSHELL",
         ShellVariable::new(ShellValue::Dynamic {
-            getter: |shell| shell.depth().to_string().into(),
+            getter: |shell| shell.subshell_level().to_string().into(),
             setter: |_| (),
         }),
     )?;
@@ -234,10 +236,10 @@ pub(crate) fn init_well_known_vars(
     shell.env_mut().set_global(
         "DIRSTACK",
         ShellVariable::new(ShellValue::Dynamic {
+            // The current directory is element 0, as in bash.
             getter: |shell| {
-                shell
-                    .directory_stack()
-                    .iter()
+                std::iter::once(shell.working_dir())
+                    .chain(shell.directory_stack().iter().map(PathBuf::as_path))
                     .map(|p| p.to_string_lossy().to_string())
                     .collect::<Vec<_>>()
                     .into()
@@ -451,25 +453,37 @@ pub(crate) fn init_well_known_vars(
         getter: get_random_value,
         setter: |_| (),
     });
-    random_var.treat_as_integer();
+    random_var
+        .treat_as_integer()
+        .set_dynamic_state(variables::DynamicState::Random(
+            variables::RandomGenerator::new(rand::rng().random()),
+        ));
     shell.env_mut().set_global("RANDOM", random_var)?;
 
     // SECONDS
-    shell.env_mut().set_global(
-        "SECONDS",
-        ShellVariable::new(ShellValue::Dynamic {
-            getter: |shell| {
-                let now = std::time::SystemTime::now();
-                let since_last = now
-                    .duration_since(shell.last_stopwatch_time())
-                    .unwrap_or_default();
-                let total_seconds = since_last.as_secs() + u64::from(shell.last_stopwatch_offset());
-                total_seconds.to_string().into()
-            },
-            // TODO(vars): implement updating SECONDS
-            setter: |_| (),
-        }),
-    )?;
+    let mut seconds_var = ShellVariable::new(ShellValue::Dynamic {
+        getter: |shell| {
+            // Assigning SECONDS restarts the count from the assigned value.
+            if let Some(seconds) = shell
+                .env()
+                .get_raw("SECONDS")
+                .and_then(|(_, var)| var.dynamic_state().assigned_seconds())
+            {
+                return seconds.to_string().into();
+            }
+            let now = std::time::SystemTime::now();
+            let since_last = now
+                .duration_since(shell.last_stopwatch_time())
+                .unwrap_or_default();
+            let total_seconds = since_last.as_secs() + u64::from(shell.last_stopwatch_offset());
+            total_seconds.to_string().into()
+        },
+        setter: |_| (),
+    });
+    seconds_var
+        .treat_as_integer()
+        .set_dynamic_state(variables::DynamicState::Seconds(None));
+    shell.env_mut().set_global("SECONDS", seconds_var)?;
 
     // SHELL (if not already set)
     if !shell.env().is_set("SHELL") {
@@ -568,9 +582,13 @@ fn get_current_user_gids() -> Vec<u32> {
     groups
 }
 
-fn get_random_value(_shell: &dyn ShellState) -> ShellValue {
-    let mut rng = rand::rng();
-    let num = rng.random_range(0..32768);
+fn get_random_value(shell: &dyn ShellState) -> ShellValue {
+    // RANDOM's own generator, which an assignment seeds.
+    let num = shell
+        .env()
+        .get_raw("RANDOM")
+        .and_then(|(_, var)| var.dynamic_state().next_random())
+        .unwrap_or_else(|| rand::rng().random_range(0..32768));
     let str = num.to_string();
     str.into()
 }
@@ -615,9 +633,10 @@ fn get_bash_lineno_value(shell: &dyn ShellState) -> variables::ShellValue {
     let stack = shell.call_stack();
 
     // BASH_LINENO[$i] contains the line number where FUNCNAME[$i] was called
-    // This is extracted from the call_site of each frame
+    // This is extracted from the call_site of each frame. Outside functions it is empty, as in
+    // bash.
     if stack.iter_function_calls().next().is_none() {
-        ShellValue::Unset(variables::ShellValueUnsetType::IndexedArray)
+        Vec::<String>::new().into()
     } else {
         stack
             .iter()

@@ -103,12 +103,10 @@ impl builtins::Command for GetOptsCommand {
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         // Validate the target variable name.
         if !env::valid_variable_name(&self.variable_name) {
-            writeln!(
-                context.stderr(),
-                "{}: `{}': not a valid identifier",
-                context.command_name,
+            context.report(format_args!(
+                "`{}': not a valid identifier",
                 self.variable_name
-            )?;
+            ))?;
             return Ok(ExecutionResult::new(1));
         }
 

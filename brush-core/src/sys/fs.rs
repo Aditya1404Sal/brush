@@ -17,6 +17,12 @@ pub trait PathExt {
     /// and avoids copies on platforms where no resolution is needed.
     fn executable(&self) -> bool;
 
+    /// Returns true if `test -x` holds for the path: it exists and may be executed, or, for a
+    /// directory, searched. This is [`Self::executable`] wherever files carry permission bits.
+    fn executable_or_searchable(&self) -> bool {
+        self.executable()
+    }
+
     /// Returns true if the path exists and is a block device.
     fn exists_and_is_block_device(&self) -> bool;
     /// Returns true if the path exists and is a character device.

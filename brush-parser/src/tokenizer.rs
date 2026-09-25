@@ -248,6 +248,9 @@ struct CrossTokenParseState {
     here_body_after_line: usize,
     /// Are we in the parentheses of a compound array assignment (`a=(...)`)?
     compound_assignment: bool,
+    /// Does a `-` follow a `>&` or `<&` just read? Bash reads it as a word of its own (closing
+    /// the descriptor), so `>&-1` is `>&-` followed by the word `1`.
+    dash_follows_duplication: bool,
 }
 
 /// Options controlling how the tokenizer operates.
@@ -606,6 +609,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 here_state: HereState::None,
                 current_here_tags: vec![],
                 queued_tokens: vec![],
+                dash_follows_duplication: false,
                 arithmetic_expansion: false,
                 command_position: true,
                 nested_constructs: 0,
@@ -863,6 +867,14 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             let next = self.peek_char()?;
             let c = next.unwrap_or('\0');
 
+            if std::mem::take(&mut self.cross_state.dash_follows_duplication) && c == '-' {
+                self.consume_char()?;
+                state.append_char(c);
+                result =
+                    state.delimit_current_token(TokenEndReason::Other, &mut self.cross_state)?;
+                continue;
+            }
+
             // When we hit the end of the input, then we're done with the current token (if there is
             // one).
             if next.is_none() {
@@ -1043,7 +1055,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                         TokenEndReason::OperatorEnd
                     };
 
+                    let dash_follows = c == '-'
+                        && (state.is_specific_operator(">&") || state.is_specific_operator("<&"));
                     result = state.delimit_current_token(reason, &mut self.cross_state)?;
+                    self.cross_state.dash_follows_duplication = dash_follows;
                 }
             //
             // See if this is a character that changes the current escaping/quoting state.
@@ -1883,6 +1898,22 @@ bc"
     #[test]
     fn tokenize_operators() -> Result<()> {
         assert_ron_snapshot!(test_tokenizer("a>>b")?);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_dash_after_duplication_as_its_own_word() -> Result<()> {
+        // As bash reads it: `>&-1` closes stdout and passes `1` on as a word.
+        let words = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|token| token.to_str().to_owned())
+                .collect())
+        };
+        assert_eq!(words("echo x >&-1")?, ["echo", "x", ">&", "-", "1"]);
+        assert_eq!(words("cat <&-x")?, ["cat", "<&", "-", "x"]);
+        assert_eq!(words("echo 2>&-")?, ["echo", "2", ">&", "-"]);
+        assert_eq!(words("echo >&1-")?, ["echo", ">&", "1-"]);
         Ok(())
     }
 

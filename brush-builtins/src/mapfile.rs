@@ -3,7 +3,7 @@ use std::io::Read;
 
 use clap::Parser;
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, env, error, variables};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins, env, error, variables};
 
 /// Read lines from standard input into an indexed array variable.
 #[derive(Parser)]
@@ -29,8 +29,8 @@ pub(crate) struct MapFileCommand {
     remove_delimiter: bool,
 
     /// File descriptor to read from (defaults to stdin).
-    #[arg(short = 'u', default_value_t = 0)]
-    fd: brush_core::ShellFd,
+    #[arg(short = 'u')]
+    fd: Option<brush_core::ShellFd>,
 
     /// Name of function to call for each group of lines.
     #[arg(short = 'C')]
@@ -56,6 +56,14 @@ impl builtins::Command for MapFileCommand {
             return error::unimp("mapfile -C/-c is not yet implemented");
         }
 
+        if !brush_core::env::valid_variable_name(&self.array_var_name) {
+            context.report(format_args!(
+                "`{}': not a valid identifier",
+                self.array_var_name
+            ))?;
+            return Ok(ExecutionExitCode::GeneralError.into());
+        }
+
         if let Some(origin) = self.origin {
             if origin < 0 {
                 context.report(format_args!("{origin}: invalid array origin"))?;
@@ -73,12 +81,21 @@ impl builtins::Command for MapFileCommand {
             }
         }
 
-        let input_file = context
-            .try_fd(self.fd)
-            .ok_or_else(|| ErrorKind::BadFileDescriptor(self.fd))?;
-
-        // Read!
-        let results = self.read_entries(input_file).await?;
+        // A descriptor named with -u must be open; a closed standard input reads as empty, as in
+        // bash.
+        let fd = self
+            .fd
+            .unwrap_or(brush_core::openfiles::OpenFiles::STDIN_FD);
+        let results = match context.try_fd(fd) {
+            Some(input_file) => self.read_entries(input_file).await?,
+            None if self.fd.is_some() => {
+                context.report(format_args!(
+                    "{fd}: invalid file descriptor: Bad file descriptor"
+                ))?;
+                return Ok(ExecutionExitCode::GeneralError.into());
+            }
+            None => variables::ArrayLiteral(vec![]),
+        };
 
         if let Some(origin) = self.origin {
             // -O: preserve existing array, assign at offset.
@@ -174,6 +191,11 @@ impl MapFileCommand {
 
             if self.remove_delimiter && line.ends_with(&[delimiter]) {
                 line.pop();
+            }
+
+            // A bash string ends at a NUL byte.
+            if let Some(nul) = line.iter().position(|byte| *byte == 0) {
+                line.truncate(nul);
             }
 
             // Bytes that are not UTF-8 are kept (see `rawbytes`).
