@@ -936,6 +936,8 @@ pub(crate) async fn invoke_shell_function(
         .map(|handler| handler.command.clone());
     // `local -` in the body saves the options, which come back when it returns.
     let option_saves = context.shell.local_option_saves.len();
+    // The body expands the aliases in effect where the function was defined.
+    let caller_aliases = context.shell.alias_scope.replace(function.aliases());
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
@@ -949,6 +951,7 @@ pub(crate) async fn invoke_shell_function(
         context.shell.leave_function()?;
         result
     };
+    context.shell.alias_scope = caller_aliases;
     context.shell.loop_depth = caller_loop_depth;
     context.shell.restore_local_options(option_saves);
 

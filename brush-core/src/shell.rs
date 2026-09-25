@@ -158,6 +158,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     programs_started: u64,
 
+    /// While a function body runs, the aliases in effect where the function was defined: bash
+    /// expands aliases as it reads the definition, not as the body runs.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) alias_scope: Option<std::sync::Arc<HashMap<String, String>>>,
+
     /// `set -o` options saved by `local -`, restored when the saving function returns.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) local_option_saves: Vec<Vec<(&'static str, bool)>>,
@@ -225,6 +230,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             command_unit: self.command_unit,
             alias_units: self.alias_units.clone(),
             programs_started: self.programs_started,
+            alias_scope: self.alias_scope.clone(),
             local_option_saves: self.local_option_saves.clone(),
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
@@ -488,6 +494,33 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Whether the alias `name` may be expanded in the command running now.
     pub(crate) fn alias_in_effect(&self, name: &str) -> bool {
         self.command_unit.is_none() || self.alias_units.get(name) != self.command_unit.as_ref()
+    }
+
+    /// The value alias `name` expands to in the command running now, if it is expanded there:
+    /// in a function body, the aliases where the function was defined; elsewhere, the aliases
+    /// defined before this top-level command, when `expand_aliases` is on.
+    pub(crate) fn alias_for_expansion(&self, name: &str) -> Option<&str> {
+        match &self.alias_scope {
+            Some(scope) => scope.get(name),
+            None if self.options.expand_aliases && self.alias_in_effect(name) => {
+                self.aliases.get(name)
+            }
+            None => None,
+        }
+        .map(String::as_str)
+    }
+
+    /// The aliases a function defined now expands in its body (see `alias_scope`).
+    pub(crate) fn aliases_for_definition(&self) -> std::sync::Arc<HashMap<String, String>> {
+        std::sync::Arc::new(
+            self.aliases
+                .keys()
+                .filter_map(|name| {
+                    self.alias_for_expansion(name)
+                        .map(|value| (name.clone(), value.to_owned()))
+                })
+                .collect(),
+        )
     }
 
     /// Marks the start of a program's top-level commands; returns its number and the unit it

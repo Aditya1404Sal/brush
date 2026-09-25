@@ -1706,7 +1706,11 @@ impl Execute for ast::FunctionDefinition {
             .map_or_else(crate::SourceInfo::default, |frame| {
                 frame.adjusted_source_info()
             });
-        shell.define_func(func_name, self.clone(), &source_info);
+        let aliases = shell.aliases_for_definition();
+        shell.define_func(func_name.clone(), self.clone(), &source_info);
+        if let Some(registration) = shell.func_mut(&func_name) {
+            registration.set_aliases(aliases);
+        }
 
         let result = ExecutionResult::success();
         shell.set_last_exit_status(result.exit_code.into());
@@ -1758,6 +1762,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
         let mut redirect_failed = false;
+        let mut alias_follows = false;
 
         // `set -x` traces a simple command to the standard error it had before its own
         // redirections, as bash does.
@@ -1831,47 +1836,36 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     }
                 }
                 CommandPrefixOrSuffixItem::Word(arg) => {
-                    let mut next_args =
+                    // The command word, and a word after an alias ending in a blank, may be
+                    // aliases (when `expand_aliases` is on, as it is in interactive shells).
+                    //
+                    // TODO(#57): aliases are supposed to be expanded as the command is read, not
+                    // as it runs; this handles bodies that amount to a sequence of words.
+                    let alias_position = args.is_empty() || alias_follows;
+                    alias_follows = false;
+                    let next_args = if alias_position
+                        && let Some((fields, trailing_blank)) =
+                            expand_alias(&mut context.shell, &params, &arg.value).await?
+                    {
+                        alias_follows = trailing_blank;
+                        fields
+                    } else {
                         expansion::full_expand_and_split_word(&mut context.shell, &params, arg)
-                            .await?;
+                            .await?
+                    };
 
                     if args.is_empty() {
-                        if let Some(cmd_name) = next_args.first() {
-                            // Aliases are only expanded when `expand_aliases` is enabled; it's
-                            // enabled by default for interactive shells.
-                            if context.shell.options().expand_aliases
-                                && context.shell.alias_in_effect(cmd_name)
-                                && let Some(alias_value) =
-                                    context.shell.aliases().get(cmd_name.as_str())
-                            {
-                                //
-                                // TODO(#57): This is a total hack; aliases are supposed to be
-                                // handled much earlier in the process.
-                                //
-                                // N.B. Tokenizing first releases our borrow of the shell's aliases,
-                                // so we can take a mutable borrow of the shell to expand the words.
-                                let alias_words = tokenize_alias_body(&context.shell, alias_value);
-                                let mut alias_pieces =
-                                    expand_words(&mut context.shell, &params, alias_words).await?;
-
-                                next_args.remove(0);
-                                alias_pieces.append(&mut next_args);
-
-                                next_args = alias_pieces;
-                            }
-
-                            // Check if we're going to be invoking a special declaration builtin.
-                            // That will change how we parse and process args. (An alias with an
-                            // empty body leaves us with no words at all.)
-                            if let Some(first_arg) = next_args.first()
-                                && context
-                                    .shell
-                                    .builtins()
-                                    .get(first_arg.as_str())
-                                    .is_some_and(|r| !r.disabled && r.declaration_builtin)
-                            {
-                                command_takes_assignments = true;
-                            }
+                        // Check if we're going to be invoking a special declaration builtin.
+                        // That will change how we parse and process args. (An alias with an
+                        // empty body leaves us with no words at all.)
+                        if let Some(first_arg) = next_args.first()
+                            && context
+                                .shell
+                                .builtins()
+                                .get(first_arg.as_str())
+                                .is_some_and(|r| !r.disabled && r.declaration_builtin)
+                        {
+                            command_takes_assignments = true;
                         }
                     }
 
@@ -2057,6 +2051,38 @@ fn tokenize_alias_body(
         },
         |tokens| tokens.iter().map(|t| t.to_str().to_owned()).collect(),
     )
+}
+
+/// Expands `word` as the alias it names, as bash does: an alias whose body starts with another
+/// alias expands that one too, though never one already expanded here. Returns the fields and
+/// whether the last alias's body ends in a blank (so the next word may be an alias too), or `None`
+/// when `word` names no alias in effect.
+async fn expand_alias(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    word: &str,
+) -> Result<Option<(Vec<String>, bool)>, error::Error> {
+    let mut words: VecDeque<String> = VecDeque::from([word.to_owned()]);
+    let mut expanded: Vec<String> = vec![];
+    let mut trailing_blank = false;
+    while let Some(first) = words.front()
+        && !expanded.contains(first)
+        && let Some(value) = shell.alias_for_expansion(first)
+    {
+        trailing_blank = value.ends_with([' ', '\t']);
+        let body = tokenize_alias_body(shell, value);
+        expanded.push(words.pop_front().unwrap_or_default());
+        for body_word in body.into_iter().rev() {
+            words.push_front(body_word);
+        }
+    }
+    if expanded.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((
+        expand_words(shell, params, words).await?,
+        trailing_blank,
+    )))
 }
 
 /// Expands the given words, with splitting enabled, yielding the fields they expand to.
