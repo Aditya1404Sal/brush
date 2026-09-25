@@ -848,6 +848,30 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 {
                     // Consume it but don't include it.
                     self.consume_char()?;
+                } else if c == '\\'
+                    && self
+                        .cross_state
+                        .current_here_tags
+                        .first()
+                        .is_some_and(|tag| !tag.tag_was_escaped_or_quoted)
+                    && state
+                        .current_token()
+                        .chars()
+                        .rev()
+                        .take_while(|c| *c == '\\')
+                        .count()
+                        % 2
+                        == 0
+                {
+                    // In an unquoted here-document, an unescaped backslash-newline joins the
+                    // lines, as bash reads it (a delimiter joined to the line before it no
+                    // longer ends the document).
+                    self.consume_char()?;
+                    if matches!(self.peek_char()?, Some('\n')) {
+                        self.consume_char()?;
+                    } else {
+                        state.append_char(c);
+                    }
                 } else {
                     self.consume_char()?;
                     state.append_char(c);
@@ -1777,6 +1801,16 @@ echo after
                 "x=$(\necho hi\n)",
                 "\n"
             ]
+        );
+        // An unquoted here-document joins backslash-newline, unless the backslash is escaped;
+        // a quoted one keeps it.
+        assert_eq!(
+            strs("cat <<EOF\na \\\nb \\\\\nc\nEOF\n")?,
+            ["cat", "<<", "EOF", "a b \\\\\nc\n", "EOF", "\n"]
+        );
+        assert_eq!(
+            strs("cat <<'EOF'\na \\\nb\nEOF\n")?,
+            ["cat", "<<", "'EOF'", "a \\\nb\n", "EOF", "\n"]
         );
         // A here tag spelled with an expansion is the tag, literally.
         assert_eq!(

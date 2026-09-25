@@ -558,6 +558,9 @@ pub(crate) async fn basic_expand_heredoc_word(
 ) -> Result<String, error::Error> {
     let mut expander = WordExpander::new(shell, params);
     expander.heredoc_mode = true;
+    // A here-document's body is expanded as if in double quotes, so the word of a
+    // `${v:+'x'}` keeps its single quotes, as in bash.
+    expander.in_double_quotes = true;
     expander.disable_brace_expansion = true;
     expander.assignment_word_tilde = false;
     expander.basic_expand_to_str(word_str.as_ref()).await
