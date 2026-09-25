@@ -172,7 +172,12 @@ pub fn bash_diagnostic(
         }
         ParseError::ParsingAtEndOfInput => {
             let tokens = tokens();
-            if let Some((token, line)) = misplaced_last(&tokens) {
+            if let Some(line) = open_compound_assignment(&tokens, tokens.len()) {
+                // Bash reads the words of a compound assignment apart, to their `)`.
+                vec![std::format!(
+                    "line {line}: unexpected EOF while looking for matching `)'"
+                )]
+            } else if let Some((token, line)) = misplaced_last(&tokens) {
                 near(token, line)
             } else if let Some(line) = open_function_parenthesis(&tokens) {
                 near("newline", line)
@@ -742,6 +747,69 @@ pub fn command_substitution_diagnostic(
         .collect()
 }
 
+/// The exit status bash gives a syntax error: 1 for one inside the parentheses of a compound array
+/// assignment (`a=(x | y)`, `a=(x` at the end), whose words bash reads apart, otherwise 2.
+pub fn syntax_error_status(error: &ParseError, source: &str, options: &crate::ParserOptions) -> u8 {
+    let tokenize = |text: &str| {
+        tokenizer::tokenize_str_with_options(text, &options.tokenizer_options()).unwrap_or_default()
+    };
+    let open = match error {
+        ParseError::ParsingNear(position) => {
+            let tokens = tokenize(source);
+            tokens
+                .iter()
+                .position(|token| token.location().start.index >= position.index)
+                .and_then(|at| open_compound_assignment(&tokens, at))
+        }
+        ParseError::ParsingAtEndOfInput => {
+            let tokens = tokenize(source);
+            open_compound_assignment(&tokens, tokens.len())
+        }
+        // A quote left open: what came before it.
+        ParseError::Tokenizing { inner, .. } => {
+            use tokenizer::TokenizerError as T;
+            match inner {
+                T::UnterminatedDoubleQuote(position)
+                | T::UnterminatedSingleQuote(position)
+                | T::UnterminatedAnsiCQuote(position)
+                | T::UnterminatedBackquote(position) => {
+                    let before: String = source.chars().take(position.index).collect();
+                    let tokens = tokenize(&before);
+                    open_compound_assignment(&tokens, tokens.len())
+                }
+                _ => None,
+            }
+        }
+    };
+    if open.is_some() { 1 } else { 2 }
+}
+
+/// The line of the `(` of a compound array assignment (`a=(`, `a+=(`) still open before token
+/// `at`, if one is.
+fn open_compound_assignment(tokens: &[crate::Token], at: usize) -> Option<usize> {
+    let mut open = None;
+    let mut previous: Option<&crate::Token> = None;
+    for token in tokens.iter().take(at) {
+        match token {
+            crate::Token::Operator(operator, location) if operator == "(" && open.is_none() => {
+                let assigns = previous.is_some_and(|word| {
+                    matches!(word, crate::Token::Word(..))
+                        && word.to_str().ends_with('=')
+                        && tokenizer::is_assignment_word(word.to_str())
+                        && word.location().end.index == location.start.index
+                });
+                if assigns {
+                    open = Some(location.start.line);
+                }
+            }
+            crate::Token::Operator(operator, _) if operator == ")" => open = None,
+            _ => {}
+        }
+        previous = Some(token);
+    }
+    open
+}
+
 /// A reserved word that ends the input where a command was expected (`if then`): bash names it
 /// rather than the end of the input.
 fn misplaced_last(tokens: &[crate::Token]) -> Option<(&str, usize)> {
@@ -999,6 +1067,39 @@ mod tests {
                 "line 2: unexpected token `EOF' in conditional command",
                 "line 2: syntax error: unexpected end of file from `[[' command on line 1",
             ]
+        );
+    }
+
+    #[test]
+    fn compound_assignment_errors_exit_one() {
+        let status = |source: &str| {
+            let options = crate::ParserOptions::default();
+            let mut reader = std::io::BufReader::new(source.as_bytes());
+            crate::Parser::new(&mut reader, &options)
+                .parse_program()
+                .err()
+                .map(|error| super::syntax_error_status(&error, source, &options))
+        };
+        for source in [
+            "x=(a b",
+            "if true; then\nx=(a\n",
+            "x=(a | b)",
+            "a[1]+=(x \"y",
+            "x=(a (b) c)",
+        ] {
+            assert_eq!(status(source), Some(1), "{source:?}");
+        }
+        for source in [
+            "x=(a b)); echo c",
+            "echo a; fi",
+            "echo \"a",
+            "if true; then",
+        ] {
+            assert_eq!(status(source), Some(2), "{source:?}");
+        }
+        assert_eq!(
+            diagnose("if true; then\nx=(a\nb"),
+            ["line 2: unexpected EOF while looking for matching `)'"]
         );
     }
 

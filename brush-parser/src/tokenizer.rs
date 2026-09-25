@@ -1756,7 +1756,7 @@ fn starts_command_words(token: &str, is_operator: bool, command_position: bool) 
 }
 
 /// Whether `token` looks like an assignment: a name, an optional subscript, then `=` or `+=`.
-fn is_assignment_word(token: &str) -> bool {
+pub(crate) fn is_assignment_word(token: &str) -> bool {
     let name_len = token
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(token.len());

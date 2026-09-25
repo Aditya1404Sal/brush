@@ -21,7 +21,7 @@ mod snapshot_tests;
 
 pub use error::{
     BindingParseError, ParseError, ParseErrorLocation, TestCommandParseError, WordParseError,
-    bash_diagnostic, command_substitution_diagnostic,
+    bash_diagnostic, command_substitution_diagnostic, syntax_error_status,
 };
 
 #[cfg(feature = "diagnostics")]
