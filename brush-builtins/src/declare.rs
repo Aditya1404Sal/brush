@@ -357,7 +357,10 @@ impl DeclareCommand {
             }
         }
 
-        let initial_value = self.evaluate_indexed_keys(context, &name, initial_value, append)?;
+        // A key that counts back past the start fails the declaration once the elements before
+        // it are assigned, as in bash.
+        let (initial_value, failed_element) =
+            self.evaluate_indexed_keys(context, &name, initial_value, append)?;
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -` saves the `set` options, to restore when the function returns.
@@ -480,7 +483,7 @@ impl DeclareCommand {
                     .shell
                     .env_mut()
                     .add(name, var, EnvironmentScope::Local)?;
-                return Ok(true);
+                return failed_element.map_or(Ok(true), Err);
             }
         }
 
@@ -555,7 +558,7 @@ impl DeclareCommand {
             context.shell.env_mut().add(name, var, scope)?;
         }
 
-        Ok(true)
+        failed_element.map_or(Ok(true), Err)
     }
 
     /// Whether the declaration changes what the variable holds (`-aAilu` and `-c`, or their `+`
@@ -593,7 +596,7 @@ impl DeclareCommand {
         name: &str,
         value: Option<ShellValueLiteral>,
         append: bool,
-    ) -> Result<Option<ShellValueLiteral>, brush_core::Error> {
+    ) -> Result<(Option<ShellValueLiteral>, Option<brush_core::Error>), brush_core::Error> {
         let existing = context.shell.env().get(name).map(|(_, var)| var.value());
         let associative = match self.make_associative_array.to_bool() {
             Some(associative) => associative,
@@ -603,14 +606,18 @@ impl DeclareCommand {
         match value {
             Some(ShellValueLiteral::Array(ArrayLiteral(elements))) if !associative => {
                 let mut evaluated = Vec::with_capacity(elements.len());
+                let mut failed = None;
                 for (key, value) in elements {
                     let key = match key {
                         Some(key) => {
                             let index =
                                 brush_core::arithmetic::eval_subscript(context.shell, &key)?;
-                            let index = keys.key(index).ok_or_else(|| {
-                                ErrorKind::BadArrayElement(format!("[{key}]={value}"))
-                            })?;
+                            let Some(index) = keys.key(index) else {
+                                failed = Some(
+                                    ErrorKind::BadArrayElement(format!("[{key}]={value}")).into(),
+                                );
+                                break;
+                            };
                             Some(index.to_string())
                         }
                         None => None,
@@ -618,9 +625,12 @@ impl DeclareCommand {
                     evaluated.push((key, value));
                     keys.placed();
                 }
-                Ok(Some(ShellValueLiteral::Array(ArrayLiteral(evaluated))))
+                Ok((
+                    Some(ShellValueLiteral::Array(ArrayLiteral(evaluated))),
+                    failed,
+                ))
             }
-            value => Ok(value),
+            value => Ok((value, None)),
         }
     }
 
