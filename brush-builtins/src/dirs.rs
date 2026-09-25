@@ -3,28 +3,6 @@ use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum DirError {
-    /// Directory stack is empty.
-    #[error("directory stack empty")]
-    DirStackEmpty,
-
-    /// A shell error occurred.
-    #[error(transparent)]
-    ShellError(#[from] brush_core::Error),
-}
-
-impl From<&DirError> for brush_core::ExecutionExitCode {
-    fn from(value: &DirError) -> Self {
-        match value {
-            DirError::DirStackEmpty => Self::GeneralError,
-            DirError::ShellError(e) => e.into(),
-        }
-    }
-}
-
-impl brush_core::BuiltinError for DirError {}
-
 /// Manage the current directory stack.
 #[derive(Default, Parser)]
 pub(crate) struct DirsCommand {
@@ -43,8 +21,59 @@ pub(crate) struct DirsCommand {
     /// Print one directory per line with its index.
     #[arg(short = 'v')]
     print_one_per_line_with_index: bool,
-    //
-    // TODO(dirs): implement +N and -N
+
+    /// Show only the Nth entry, counting from the left (`+N`) or the right (`-N`).
+    #[arg(allow_hyphen_values = true)]
+    entry: Option<String>,
+}
+
+/// The directories as `dirs` lists them: the current directory, then the stack, newest first.
+pub(crate) fn listed_dirs(
+    shell: &brush_core::Shell<impl brush_core::ShellExtensions>,
+) -> Vec<std::path::PathBuf> {
+    std::iter::once(shell.working_dir().to_path_buf())
+        .chain(shell.directory_stack().iter().rev().cloned())
+        .collect()
+}
+
+/// Where `+N` or `-N` points in a list of directories.
+pub(crate) enum StackPosition {
+    /// The operand is not `+N` or `-N`.
+    NotAnIndex,
+    /// It points past the list.
+    OutOfRange,
+    /// It points at this entry.
+    At(usize),
+}
+
+/// Where `+N` or `-N` points in a list of `len` directories, counting from the left or the
+/// right as bash does.
+pub(crate) fn stack_position(operand: &str, len: usize) -> StackPosition {
+    let (from_right, digits) = match operand.split_at_checked(1) {
+        Some(("+", digits)) => (false, digits),
+        Some(("-", digits)) => (true, digits),
+        _ => return StackPosition::NotAnIndex,
+    };
+    let Ok(n) = digits.parse::<usize>() else {
+        return StackPosition::NotAnIndex;
+    };
+    if n >= len {
+        StackPosition::OutOfRange
+    } else if from_right {
+        StackPosition::At(len - 1 - n)
+    } else {
+        StackPosition::At(n)
+    }
+}
+
+/// Makes the stack hold `dirs` after the current directory (listed newest first).
+pub(crate) fn set_stack(
+    shell: &mut brush_core::Shell<impl brush_core::ShellExtensions>,
+    dirs: &[std::path::PathBuf],
+) {
+    let stack = shell.directory_stack_mut();
+    stack.clear();
+    stack.extend(dirs.iter().rev().cloned());
 }
 
 impl builtins::Command for DirsCommand {
@@ -56,6 +85,30 @@ impl builtins::Command for DirsCommand {
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.clear {
             context.shell.directory_stack_mut().clear();
+        } else if let Some(entry) = &self.entry {
+            let dirs = listed_dirs(context.shell);
+            match stack_position(entry, dirs.len()) {
+                StackPosition::At(position) => {
+                    let mut dir_str = dirs[position].to_string_lossy().to_string();
+                    if !self.tilde_long {
+                        dir_str = context.shell.tilde_shorten(dir_str);
+                    }
+                    writeln!(context.stdout(), "{dir_str}")?;
+                }
+                _ if dirs.len() == 1 => {
+                    context.report("directory stack empty")?;
+                    return Ok(ExecutionResult::general_error());
+                }
+                StackPosition::OutOfRange => {
+                    let shown = entry.strip_prefix('+').unwrap_or(entry);
+                    context.report(format_args!("{shown}: directory stack index out of range"))?;
+                    return Ok(ExecutionResult::general_error());
+                }
+                StackPosition::NotAnIndex => {
+                    context.report(format_args!("{entry}: invalid argument"))?;
+                    return Ok(ExecutionResult::general_error());
+                }
+            }
         } else {
             let dirs = vec![context.shell.working_dir()]
                 .into_iter()
