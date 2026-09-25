@@ -1188,7 +1188,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 if cmd_output.contains('\0') {
                     writeln!(
                         self.params.stderr(self.shell),
-                        "warning: command substitution: ignored null byte in input",
+                        "{}warning: command substitution: ignored null byte in input",
+                        self.shell.diagnostic_prefix(),
                     )?;
                     cmd_output.retain(|c| c != '\0');
                 }
