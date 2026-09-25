@@ -473,7 +473,7 @@ impl Conditional<'_> {
         }
     }
 
-    fn read(&mut self) -> CondToken {
+    const fn read(&mut self) -> CondToken {
         if self.next < self.tokens.len() {
             self.next += 1;
             CondToken::At(self.next - 1)

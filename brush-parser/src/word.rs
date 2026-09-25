@@ -1691,11 +1691,11 @@ mod tests {
     #[test]
     fn parse_comment_hiding_arithmetic_close() -> Result<()> {
         let first = |word: &str| -> Result<WordPiece> {
-            Ok(super::parse(word, &ParserOptions::default())?
+            super::parse(word, &ParserOptions::default())?
                 .into_iter()
                 .next()
                 .map(|p| p.piece)
-                .ok_or_else(|| anyhow::anyhow!("no pieces"))?)
+                .ok_or_else(|| anyhow::anyhow!("no pieces"))
         };
         // A `#` after a blank starts a comment that hides the `))` on its line.
         for word in ["$((1 # c))", "$((1 #c))", "$(( (1) # c ))", "$((1\\ #c))"] {
