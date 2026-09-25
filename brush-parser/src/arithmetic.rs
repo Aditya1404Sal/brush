@@ -9,11 +9,23 @@ use crate::error;
 ///
 /// * `input` - The arithmetic expression to parse, in string form.
 pub fn parse(input: &str) -> Result<ast::ArithmeticExpr, error::WordParseError> {
+    // A long expression (`1+2+…+5000`) is parsed each time rather than cached: a cached tree is
+    // cloned on every use, and cloning a deep one recurses once per level.
+    if input.len() > MAX_CACHED_LEN {
+        return uncached_parse(input);
+    }
     cacheable_parse(input)
 }
 
+/// The longest expression the parse cache keeps.
+const MAX_CACHED_LEN: usize = 1024;
+
 #[cached::macros::cached(max_size = 64, key = "String", convert = r#"{ input.to_owned() }"#)]
 fn cacheable_parse(input: &str) -> Result<ast::ArithmeticExpr, error::WordParseError> {
+    uncached_parse(input)
+}
+
+fn uncached_parse(input: &str) -> Result<ast::ArithmeticExpr, error::WordParseError> {
     tracing::debug!(target: "arithmetic", "parsing arithmetic expression: '{input}'");
     arithmetic::full_expression(input)
         .map_err(|e| error::WordParseError::ArithmeticExpression(e.into()))

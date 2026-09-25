@@ -68,6 +68,12 @@ pub enum EvalError {
     /// An assignment to a readonly variable.
     #[error("{0}: readonly variable")]
     ReadonlyVariable(String),
+
+    /// An expression that nests deeper than the stack can hold.
+    #[error(
+        "arithmetic expression nesting level exceeded ({0}): deeper nesting is unsupported in bash-tool"
+    )]
+    NestedTooDeeply(usize),
 }
 
 /// Trait implemented by arithmetic expressions that can be evaluated.
@@ -149,13 +155,64 @@ async fn eval_expanded(
         .map_err(|error| EvalError::in_expression(&expanded_self, error))
 }
 
-/// Parses an arithmetic expression, failing as bash reports a malformed one.
+/// How deeply an expression may nest (see `syntax::nesting`): the parser and the evaluator
+/// recurse at each level, and a hundred levels fit in the stack left at the shell's deepest
+/// nesting. A chain of left-associative operators (`1+2+…`) does not nest, and may be as long as
+/// memory allows.
+const MAX_EXPRESSION_NESTING: usize = 100;
+
+/// A parsed arithmetic expression. A long chain of operators (`1+2+…+5000`) makes a deep tree,
+/// so it is taken apart with a loop rather than dropped recursively.
+pub struct ParsedExpression(ast::ArithmeticExpr);
+
+impl std::ops::Deref for ParsedExpression {
+    type Target = ast::ArithmeticExpr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ParsedExpression {
+    fn drop(&mut self) {
+        let mut parts = vec![std::mem::replace(
+            &mut self.0,
+            ast::ArithmeticExpr::Literal(0),
+        )];
+        while let Some(expr) = parts.pop() {
+            match expr {
+                ast::ArithmeticExpr::UnaryOp(_, operand)
+                | ast::ArithmeticExpr::Assignment(_, operand)
+                | ast::ArithmeticExpr::BinaryAssignment(_, _, operand) => parts.push(*operand),
+                ast::ArithmeticExpr::BinaryOp(_, left, right) => {
+                    parts.push(*left);
+                    parts.push(*right);
+                }
+                ast::ArithmeticExpr::Conditional(condition, then_expr, else_expr) => {
+                    parts.push(*condition);
+                    parts.push(*then_expr);
+                    parts.push(*else_expr);
+                }
+                ast::ArithmeticExpr::Literal(_)
+                | ast::ArithmeticExpr::Reference(_)
+                | ast::ArithmeticExpr::UnaryAssignment(..) => (),
+            }
+        }
+    }
+}
+
+/// Parses an arithmetic expression, failing as bash reports a malformed one, or as one that
+/// nests too deeply to evaluate.
 ///
 /// # Arguments
 ///
 /// * `text` - The (already expanded) expression.
-pub fn parse(text: &str) -> Result<ast::ArithmeticExpr, EvalError> {
-    match brush_parser::arithmetic::parse(text) {
+pub fn parse(text: &str) -> Result<ParsedExpression, EvalError> {
+    let nesting = syntax::nesting(text);
+    if nesting > MAX_EXPRESSION_NESTING {
+        return Err(EvalError::NestedTooDeeply(nesting));
+    }
+    match brush_parser::arithmetic::parse(text).map(ParsedExpression) {
         // Bash's grammar is stricter than the parser's in places (`-a=1`), so an expression bash
         // rejects fails even when it parses.
         Ok(expr) => match syntax::check(text) {
@@ -258,9 +315,7 @@ fn eval_expr_impl(
         ast::ArithmeticExpr::Literal(l) => *l,
         ast::ArithmeticExpr::Reference(lvalue) => deref_lvalue(shell, lvalue, depth)?,
         ast::ArithmeticExpr::UnaryOp(op, operand) => apply_unary_op(shell, *op, operand, depth)?,
-        ast::ArithmeticExpr::BinaryOp(op, left, right) => {
-            apply_binary_op(shell, *op, left, right, depth)?
-        }
+        ast::ArithmeticExpr::BinaryOp(..) => eval_binary_chain(expr, shell, depth)?,
         ast::ArithmeticExpr::Conditional(condition, then_expr, else_expr) => {
             let conditional_eval = eval_expr_impl(condition, shell, depth)?;
 
@@ -279,13 +334,8 @@ fn eval_expr_impl(
             apply_unary_assignment_op(shell, lvalue, *op, depth)?
         }
         ast::ArithmeticExpr::BinaryAssignment(op, lvalue, operand) => {
-            let value = apply_binary_op(
-                shell,
-                *op,
-                &ast::ArithmeticExpr::Reference(lvalue.clone()),
-                operand,
-                depth,
-            )?;
+            let current = deref_lvalue(shell, lvalue, depth)?;
+            let value = apply_binary_op(shell, *op, current, operand, depth)?;
             assign(shell, lvalue, value, depth)?
         }
     };
@@ -358,7 +408,7 @@ fn deref_lvalue(
     // Literals don't need depth tracking — they can't cause recursion.
     // Only increment depth when the parsed value requires further evaluation
     // (i.e., it references other variables), matching bash's behavior.
-    if matches!(parsed_value, ast::ArithmeticExpr::Literal(_)) {
+    if matches!(*parsed_value, ast::ArithmeticExpr::Literal(_)) {
         return eval_expr_impl(&parsed_value, shell, depth);
     }
 
@@ -392,20 +442,39 @@ fn apply_unary_op(
     }
 }
 
+/// Evaluates a binary operation. A chain of left-associative operators (`1+2+3+…`) nests down its
+/// left side, so it is evaluated along that side with a loop: its length costs no stack.
+fn eval_binary_chain(
+    expr: &ast::ArithmeticExpr,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    depth: u32,
+) -> Result<i64, EvalError> {
+    let mut rights = vec![];
+    let mut leftmost = expr;
+    while let ast::ArithmeticExpr::BinaryOp(op, left, right) = leftmost {
+        rights.push((*op, right.as_ref()));
+        leftmost = left;
+    }
+    let mut value = eval_expr_impl(leftmost, shell, depth)?;
+    while let Some((op, right)) = rights.pop() {
+        value = apply_binary_op(shell, op, value, right, depth)?;
+    }
+    Ok(value)
+}
+
+/// Applies a binary operator to a left operand already evaluated and a right one to evaluate
+/// (unless the operator short-circuits).
 fn apply_binary_op(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     op: ast::BinaryOperator,
-    left: &ast::ArithmeticExpr,
+    left: i64,
     right: &ast::ArithmeticExpr,
     depth: u32,
 ) -> Result<i64, EvalError> {
-    // First, special-case short-circuiting operators. For those, we need
-    // to ensure we don't eagerly evaluate both operands. After we
-    // get these out of the way, we can easily just evaluate operands
-    // for the other operators.
+    // First, special-case short-circuiting operators: the right operand is evaluated only
+    // when it decides the result.
     match op {
         ast::BinaryOperator::LogicalAnd => {
-            let left = eval_expr_impl(left, shell, depth)?;
             if left == 0 {
                 return Ok(bool_to_i64(false));
             }
@@ -414,7 +483,6 @@ fn apply_binary_op(
             return Ok(bool_to_i64(right != 0));
         }
         ast::BinaryOperator::LogicalOr => {
-            let left = eval_expr_impl(left, shell, depth)?;
             if left != 0 {
                 return Ok(bool_to_i64(true));
             }
@@ -426,7 +494,6 @@ fn apply_binary_op(
     }
 
     // The remaining operators unconditionally operate both operands.
-    let left = eval_expr_impl(left, shell, depth)?;
     let right = eval_expr_impl(right, shell, depth)?;
 
     #[expect(clippy::cast_possible_truncation)]
@@ -585,7 +652,8 @@ impl EvalError {
     #[must_use]
     pub fn in_expression(expression: &str, error: Self) -> Self {
         match error {
-            Self::Syntax(_) | Self::InExpression(..) => error,
+            // Too deep an expression is not named: it would be as long.
+            Self::Syntax(_) | Self::InExpression(..) | Self::NestedTooDeeply(_) => error,
             error => Self::InExpression(
                 syntax::without_leading_blanks(expression).to_owned(),
                 Box::new(error),
