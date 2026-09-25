@@ -12,6 +12,10 @@ pub(crate) struct SuspendCommand {
     /// Force suspend login shells.
     #[arg(short = 'f')]
     force: bool,
+
+    /// Operands: too many, which ends the shell, as in bash.
+    #[arg(trailing_var_arg = true, hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for SuspendCommand {
@@ -21,6 +25,13 @@ impl builtins::Command for SuspendCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
+        // An operand ends the shell, as in bash.
+        if !self.extra.is_empty() {
+            context.report("too many arguments")?;
+            let mut result = ExecutionResult::general_error();
+            result.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
+            return Ok(result);
+        }
         // WASM shells have no job control: as bash does then, only `-f` suspends.
         #[cfg(target_arch = "wasm32")]
         {

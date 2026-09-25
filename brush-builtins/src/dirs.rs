@@ -25,6 +25,10 @@ pub(crate) struct DirsCommand {
     /// Show only the Nth entry, counting from the left (`+N`) or the right (`-N`).
     #[arg(allow_hyphen_values = true)]
     entry: Option<String>,
+
+    /// More operands, each of which bash also checks.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    extra: Vec<String>,
 }
 
 /// The directories as `dirs` lists them: the current directory, then the stack, newest first.
@@ -83,6 +87,16 @@ impl builtins::Command for DirsCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        // As in bash: an operand that is not `+N` or `-N` is an invalid option.
+        if let Some(entry) =
+            self.entry.iter().chain(&self.extra).find(|entry| {
+                matches!(stack_position(entry, usize::MAX), StackPosition::NotAnIndex)
+            })
+        {
+            context.report(format_args!("{entry}: invalid option"))?;
+            writeln!(context.stderr(), "dirs: usage: dirs [-clpv] [+N] [-N]")?;
+            return Ok(ExecutionResult::new(2));
+        }
         if self.clear {
             context.shell.directory_stack_mut().clear();
         } else if let Some(entry) = &self.entry {

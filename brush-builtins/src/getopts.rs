@@ -8,10 +8,10 @@ use brush_core::{ExecutionResult, builtins, env, variables};
 #[derive(Parser)]
 pub(crate) struct GetOptsCommand {
     /// Specification for options
-    options_string: String,
+    options_string: Option<String>,
 
     /// Name of variable to receive next option
-    variable_name: String,
+    variable_name: Option<String>,
 
     /// Arguments to parse
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -101,16 +101,24 @@ impl builtins::Command for GetOptsCommand {
         &self,
         mut context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        // Both operands are required: bash prints its usage line alone without them.
+        let (Some(options_string), Some(variable_name)) =
+            (&self.options_string, &self.variable_name)
+        else {
+            writeln!(
+                context.stderr(),
+                "getopts: usage: getopts optstring name [arg ...]"
+            )?;
+            return Ok(ExecutionResult::new(2));
+        };
+
         // Validate the target variable name.
-        if !env::valid_variable_name(&self.variable_name) {
-            context.report(format_args!(
-                "`{}': not a valid identifier",
-                self.variable_name
-            ))?;
+        if !env::valid_variable_name(variable_name) {
+            context.report(format_args!("`{variable_name}': not a valid identifier"))?;
             return Ok(ExecutionResult::new(1));
         }
 
-        let spec = parse_option_spec(&self.options_string);
+        let spec = parse_option_spec(options_string);
 
         // If unset or non-numeric, assume OPTIND is 1.
         let next_index_signed = context
@@ -147,7 +155,7 @@ impl builtins::Command for GetOptsCommand {
 
         let result = parse_next_option(&mut context, &spec, args_to_parse, next_index)?;
 
-        update_variables(&mut context, &self.variable_name, result)
+        update_variables(&mut context, variable_name, result)
     }
 }
 
