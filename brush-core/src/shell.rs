@@ -47,6 +47,8 @@ mod traps;
 pub use builder::{CreateOptions, ShellBuilder, ShellBuilderState};
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) use callstack::FrameGuard;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use callstack::{MAX_NESTING, STACK_RESERVE};
 pub use initscripts::{ProfileLoadBehavior, RcLoadBehavior};
 pub use state::ShellState;
 
@@ -177,6 +179,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// command substitution and `eval` see their caller's loops, as in bash.
     pub(crate) loop_depth: usize,
 
+    /// How many lists (function bodies, compound commands, substitutions, `eval`, `source`)
+    /// enclose the command running now. On WASM, nesting deeper than the stack can hold is
+    /// refused (see `interp`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) nesting: usize,
+
     /// The top-level command running now, as (program, index): an alias defined while it runs
     /// is not expanded until a later one, as bash reads a whole command before running any of it.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -198,11 +206,6 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// The status before a `return` ran, which the RETURN trap sees as `$?`, as in bash.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) status_before_return: Option<u8>,
-
-    /// The process number of the last job started in the background (`$!`), kept after the job
-    /// is waited for, as in bash.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) last_background_pid: Option<crate::sys::process::ProcessId>,
 
     /// `set -o` options saved by `local -`, restored when the saving function returns.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -226,6 +229,14 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// The numbered logical process this shell clone runs as; `None` is the main shell.
     #[cfg_attr(feature = "serde", serde(skip))]
     own_pid: Option<crate::process_table::Pid>,
+
+    /// `$$` of a shell started as a new process (`bash -c`); `None` keeps the session's.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    started_pid: Option<crate::process_table::Pid>,
+
+    /// `$!`: the number of the last background job's last process, kept by subshells.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    last_background_pid: Option<crate::sys::process::ProcessId>,
 
     /// Registered processes for the stages of this background job's pipeline, in stage order.
     #[cfg(target_arch = "wasm32")]
@@ -268,12 +279,12 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
             loop_depth: self.loop_depth,
+            nesting: self.nesting,
             command_unit: self.command_unit,
             alias_units: self.alias_units.clone(),
             programs_started: self.programs_started,
             alias_scope: self.alias_scope.clone(),
             status_before_return: None,
-            last_background_pid: self.last_background_pid,
             local_option_saves: self.local_option_saves.clone(),
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
@@ -287,6 +298,8 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             prompt_guard: self.prompt_guard,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
+            started_pid: self.started_pid,
+            last_background_pid: self.last_background_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
         }
@@ -314,6 +327,30 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Marks this shell clone as running as numbered process `pid`.
     pub const fn set_own_pid(&mut self, pid: crate::process_table::Pid) {
         self.own_pid = Some(pid);
+    }
+
+    /// Makes `pid` this shell's `$$`, as for a new shell process (`bash -c`); its subshells keep
+    /// it.
+    pub const fn set_shell_pid(&mut self, pid: crate::process_table::Pid) {
+        self.started_pid = Some(pid);
+    }
+
+    /// `$!`: the number of the last process started in the background, if any. Waiting for or
+    /// disowning the job does not change it.
+    pub const fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.last_background_pid
+    }
+
+    /// Records the last process started in the background, as `$!`.
+    pub const fn set_last_background_pid(&mut self, pid: crate::sys::process::ProcessId) {
+        self.last_background_pid = Some(pid);
+    }
+
+    /// This shell's `$$`: the session's shell number, or its own if it was started as a new
+    /// shell process.
+    pub fn shell_pid(&self) -> crate::process_table::Pid {
+        self.started_pid
+            .unwrap_or_else(|| self.processes.shell_pid())
     }
 
     /// Hands this background job the registered processes of its pipeline's stages.
@@ -695,10 +732,17 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         Ok(())
     }
 
-    /// The name diagnostics start with: the shell's name (`$0`), as bash uses.
+    /// The name diagnostics start with: the shell's name (`$0`), as bash uses -- except while
+    /// sourcing a file, where bash names the file being sourced instead. `source`/`.` does not
+    /// itself change `$0` (see [`Self::current_shell_name`]), but bash's own diagnostics from
+    /// within a sourced file are still that file's name, not `$0`.
     pub fn diagnostic_name(&self) -> String {
-        self.current_shell_name()
-            .map_or_else(|| "bash".to_owned(), |n| n.to_string())
+        for frame in self.call_stack.iter() {
+            if frame.frame_type.is_run_script() || frame.frame_type.is_sourced_script() {
+                return frame.frame_type.name().into_owned();
+            }
+        }
+        self.name.clone().unwrap_or_else(|| "bash".to_owned())
     }
 
     /// The prefix bash puts on a diagnostic: `NAME: line N: ` in a script or command string,
@@ -738,7 +782,7 @@ pub struct SavedCommandStatus {
 impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns the number of the logical process this shell runs as (`$$` for the main shell).
     pub fn own_pid(&self) -> crate::process_table::Pid {
-        self.own_pid.unwrap_or_else(|| self.processes.shell_pid())
+        self.own_pid.unwrap_or_else(|| self.shell_pid())
     }
 
     /// Returns whether or not this shell is a subshell.

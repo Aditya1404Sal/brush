@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use crate::ShellFd;
 use crate::error;
-use crate::sys;
 
 /// A borrowed asynchronous stream view with no synchronous read/write methods.
 pub trait AsyncStream: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin + Send {}
@@ -64,6 +63,13 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
     /// Returns the stream as [`std::any::Any`], letting the shell recognize stream types it
     /// provides itself. Custom streams can keep the default, which returns `None`.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Identifies where the stream writes, shared by its clones (as `2>&1` makes), so
+    /// [`OpenFile::same_target`] can tell two descriptors write to one place. `None` when the
+    /// stream cannot say.
+    fn target_id(&self) -> Option<usize> {
         None
     }
 }
@@ -137,20 +143,105 @@ impl<'de> serde::Deserialize<'de> for OpenFile {
 
 /// Returns an open file that will discard all I/O.
 pub fn null() -> Result<OpenFile, error::Error> {
-    let file = sys::fs::open_null_file()?;
-    Ok(file.into())
+    #[cfg(target_arch = "wasm32")]
+    return Ok(null_sink());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let file = crate::sys::fs::open_null_file()?;
+        Ok(file.into())
+    }
 }
+
+/// The null device as a stream: reads see end-of-file and writes vanish, with nothing written
+/// anywhere. WASI has no device files.
+pub fn null_sink() -> OpenFile {
+    #[derive(Clone)]
+    struct Null;
+    impl std::io::Read for Null {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl std::io::Write for Null {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Stream for Null {
+        fn input_ready(&self) -> Option<bool> {
+            Some(true)
+        }
+        fn clone_box(&self) -> Box<dyn Stream> {
+            Box::new(Self)
+        }
+        #[cfg(unix)]
+        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+            Err(error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+        #[cfg(unix)]
+        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+            Err(error::ErrorKind::CannotConvertToNativeFd.into())
+        }
+        fn as_any(&self) -> Option<&dyn std::any::Any> {
+            Some(self)
+        }
+    }
+    NULL_SINK_TYPE.with(|id| id.set(Some(std::any::TypeId::of::<Null>())));
+    OpenFile::Stream(Box::new(Null))
+}
+
+thread_local! {
+    static NULL_SINK_TYPE: std::cell::Cell<Option<std::any::TypeId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether `file` is the null device made by [`null_sink`].
+pub fn is_null_sink(file: &OpenFile) -> bool {
+    let OpenFile::Stream(stream) = file else {
+        return false;
+    };
+    let Some(any) = stream.as_any() else {
+        return false;
+    };
+    NULL_SINK_TYPE.with(|id| id.get() == Some(any.type_id()))
+}
+
+/// The most a substitution (`$( )`, `<( )`, `>( )`) holds in memory: 16 MiB. Writers past it are
+/// refused as a closed pipe refuses them, and whoever reads the cut-off output learns it was cut.
+pub const MAX_SUBSTITUTION_BYTES: usize = 16 * 1024 * 1024;
+
+/// The error a reader gets at the end of a process substitution's output that was cut off at
+/// [`MAX_SUBSTITUTION_BYTES`].
+pub const TRUNCATED_SUBSTITUTION: &str =
+    "process substitution output over 16 MiB is unsupported in bash-tool";
 
 /// Creates a read-only shared byte stream, suitable for fully staged here-documents.
 /// This storage is invocation input, rather than an undrained bounded pipe.
 pub fn from_bytes(bytes: Vec<u8>) -> OpenFile {
-    struct Bytes(Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>);
+    from_bytes_then(bytes, None)
+}
+
+/// Like [`from_bytes`], but a read at the end fails with `error` instead of seeing end-of-file:
+/// the bytes are a prefix of what should have been there.
+pub fn from_bytes_then(bytes: Vec<u8>, error: Option<&'static str>) -> OpenFile {
+    struct Bytes(
+        Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>,
+        Option<&'static str>,
+    );
     impl std::io::Read for Bytes {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.0
+            let read = self
+                .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .read(buf)
+                .read(buf)?;
+            match self.1 {
+                Some(error) if read == 0 && !buf.is_empty() => Err(std::io::Error::other(error)),
+                _ => Ok(read),
+            }
         }
     }
     impl std::io::Write for Bytes {
@@ -166,7 +257,7 @@ pub fn from_bytes(bytes: Vec<u8>) -> OpenFile {
             Some(true)
         }
         fn clone_box(&self) -> Box<dyn Stream> {
-            Box::new(Self(self.0.clone()))
+            Box::new(Self(self.0.clone(), self.1))
         }
         #[cfg(unix)]
         fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
@@ -177,47 +268,108 @@ pub fn from_bytes(bytes: Vec<u8>) -> OpenFile {
             Err(error::ErrorKind::CannotConvertToNativeFd.into())
         }
     }
-    OpenFile::Stream(Box::new(Bytes(Arc::new(std::sync::Mutex::new(
-        std::io::Cursor::new(bytes),
-    )))))
+    OpenFile::Stream(Box::new(Bytes(
+        Arc::new(std::sync::Mutex::new(std::io::Cursor::new(bytes))),
+        error,
+    )))
 }
 
-/// Creates a write-only stream that keeps everything written to it in memory, and the buffer
-/// it writes to.
-pub fn memory_sink() -> (OpenFile, Arc<std::sync::Mutex<Vec<u8>>>) {
-    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Read for Sink {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::PermissionDenied.into())
+/// What a [`memory_sink`] kept, and whether a writer went past its limit.
+#[derive(Default)]
+pub struct Captured {
+    /// The bytes written, up to the limit.
+    pub bytes: Vec<u8>,
+    /// Whether a write was refused at the limit.
+    pub truncated: bool,
+}
+
+/// A write-only stream that keeps what is written to it in memory, up to a limit (see
+/// [`memory_sink`]).
+struct MemorySink(Arc<std::sync::Mutex<Captured>>, usize);
+
+impl std::io::Read for MemorySink {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+impl std::io::Write for MemorySink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut captured = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = self.1.saturating_sub(captured.bytes.len());
+        if room == 0 && !buf.is_empty() {
+            captured.truncated = true;
+            drop(captured);
+            #[cfg(target_arch = "wasm32")]
+            crate::execution::process::record_broken_pipe();
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        let count = buf.len().min(room);
+        captured.bytes.extend_from_slice(&buf[..count]);
+        drop(captured);
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stream for MemorySink {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        Box::new(Self(self.0.clone(), self.1))
+    }
+    fn target_id(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0).addr())
+    }
+    #[cfg(unix)]
+    fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+    #[cfg(unix)]
+    fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+/// Creates a write-only stream that keeps what is written to it in memory, up to `limit` bytes,
+/// and the buffer it writes to. A write past the limit fails as a write to a closed pipe does.
+pub fn memory_sink(limit: usize) -> (OpenFile, Arc<std::sync::Mutex<Captured>>) {
+    let buffer = Arc::new(std::sync::Mutex::new(Captured::default()));
+    (
+        OpenFile::Stream(Box::new(MemorySink(buffer.clone(), limit))),
+        buffer,
+    )
+}
+
+/// Whether `file` is a [`memory_sink`] writing to `buffer`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn is_memory_sink_of(file: &OpenFile, buffer: &Arc<std::sync::Mutex<Captured>>) -> bool {
+    matches!(file, OpenFile::Stream(stream) if stream
+        .as_any()
+        .and_then(|any| any.downcast_ref::<MemorySink>())
+        .is_some_and(|sink| Arc::ptr_eq(&sink.0, buffer)))
+}
+
+impl OpenFile {
+    /// Whether `self` and `other` write to the same place: clones of one open file, pipe end or
+    /// stream, as `2>&1` makes them.
+    pub fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Stdout(_), Self::Stdout(_)) | (Self::Stderr(_), Self::Stderr(_)) => true,
+            (Self::File(a), Self::File(b)) => Arc::ptr_eq(a, b),
+            (Self::PipeWriter(a), Self::PipeWriter(b)) => Arc::ptr_eq(a, b),
+            (Self::Stream(a), Self::Stream(b)) => {
+                a.target_id().is_some_and(|id| Some(id) == b.target_id())
+            }
+            _ => false,
         }
     }
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl Stream for Sink {
-        fn clone_box(&self) -> Box<dyn Stream> {
-            Box::new(Self(self.0.clone()))
-        }
-        #[cfg(unix)]
-        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
-            Err(error::ErrorKind::CannotConvertToNativeFd.into())
-        }
-        #[cfg(unix)]
-        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
-            Err(error::ErrorKind::CannotConvertToNativeFd.into())
-        }
-    }
-    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
-    (OpenFile::Stream(Box::new(Sink(buffer.clone()))), buffer)
 }
 
 impl Clone for OpenFile {
@@ -548,7 +700,9 @@ fn check_synchronous_input(file: &OpenFile) -> std::io::Result<()> {
 
 /// A bounded in-memory pipe for single-threaded WASM execution.
 /// Async views park on empty/full buffers and register wakeups under the state lock.
-/// Synchronous compatibility reports `WouldBlock`, never a premature EOF or capacity failure.
+/// A synchronous reader of an empty pipe gets `WouldBlock`, never a premature EOF. A synchronous
+/// writer (a builtin such as `declare -p` or `type`) cannot wait for the reader, so what it writes
+/// is kept past the capacity, up to [`super::MAX_SUBSTITUTION_BYTES`] in all.
 /// Last-writer closure delivers EOF after draining; last-reader closure wakes writers with
 /// `BrokenPipe`. The state machine is platform independent and tested on the host.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -661,13 +815,22 @@ mod mem_pipe {
                 }
                 return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
-            let n = data.len().min(inner.capacity - inner.buf.len());
+            let mut n = data
+                .len()
+                .min(inner.capacity.saturating_sub(inner.buf.len()));
             if n == 0 {
                 if let Some(waker) = waker {
                     inner.write_wakers.insert(self.1, waker.clone());
                     return Poll::Pending;
                 }
-                return Poll::Ready(Err(std::io::ErrorKind::WouldBlock.into()));
+                n = data
+                    .len()
+                    .min(super::MAX_SUBSTITUTION_BYTES.saturating_sub(inner.buf.len()));
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "synchronous output to a pipe over 16 MiB is unsupported in bash-tool",
+                    )));
+                }
             }
             inner.buf.extend(data[..n].iter().copied());
             let wake = std::mem::take(&mut inner.read_wakers);
@@ -715,6 +878,10 @@ mod mem_pipe {
 
         fn as_any(&self) -> Option<&dyn std::any::Any> {
             Some(self)
+        }
+
+        fn target_id(&self) -> Option<usize> {
+            Some(Arc::as_ptr(&self.0).addr())
         }
 
         fn clone_box(&self) -> Box<dyn super::Stream> {
@@ -1046,6 +1213,21 @@ mod mem_pipe_tests {
     /// Bytes written are read back in order. With the writer still open, an empty read is an
     /// error, not end-of-stream; once the writer drops it is a clean EOF.
     #[test]
+    fn descriptors_that_share_a_target_are_recognised() {
+        let (_, writer) = super::test_pipe(8);
+        let (_, other) = super::test_pipe(8);
+        assert!(writer.same_target(&writer.clone()));
+        assert!(!writer.same_target(&other));
+        let (sink, _) = super::memory_sink(64);
+        assert!(sink.same_target(&sink.clone()));
+        assert!(!sink.same_target(&writer));
+        let file = super::OpenFile::File(std::sync::Arc::new(tempfile::tempfile().unwrap()));
+        let second = super::OpenFile::File(std::sync::Arc::new(tempfile::tempfile().unwrap()));
+        assert!(file.same_target(&file.clone()));
+        assert!(!file.same_target(&second));
+    }
+
+    #[test]
     fn round_trips_bytes_then_reports_eof_on_writer_drop() {
         let (mut reader, mut writer) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);
 
@@ -1116,14 +1298,24 @@ mod mem_pipe_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
-    /// Capacity exhaustion is recoverable backpressure, not a broken pipe.
+    /// A synchronous writer cannot wait for the reader, so a full pipe keeps its bytes anyway, up
+    /// to the hard bound.
     #[test]
-    fn write_beyond_capacity_would_block() {
-        let (_reader, mut writer) = mem_pipe::pipe(8);
+    fn synchronous_writes_beyond_capacity_are_kept() {
+        let (mut reader, mut writer) = mem_pipe::pipe(8);
 
         writer.write_all(b"12345678").unwrap();
-        let err = writer.write_all(b"9").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        writer.write_all(b"9").unwrap();
+        let mut out = [0; 9];
+        reader.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"123456789");
+
+        let big = vec![b'x'; super::MAX_SUBSTITUTION_BYTES];
+        writer.write_all(&big).unwrap();
+        assert_eq!(
+            writer.write_all(b"y").unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
     }
 
     fn open_pipe(capacity: usize) -> (super::OpenFile, super::OpenFile) {
@@ -1201,14 +1393,11 @@ mod mem_pipe_tests {
     fn synchronous_oversized_write_reports_partial_progress() {
         let (mut reader, mut writer) = mem_pipe::pipe(1);
         assert_eq!(writer.write(b"abc").unwrap(), 1);
-        assert_eq!(
-            writer.write(b"bc").unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        // Full: a synchronous write goes past the capacity rather than failing.
+        assert_eq!(writer.write(b"bc").unwrap(), 2);
         let mut buf = [0; 4];
-        assert_eq!(reader.read(&mut buf).unwrap(), 1);
-        assert_eq!(buf[0], b'a');
-        assert_eq!(writer.write(b"bc").unwrap(), 1);
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"abc");
     }
 
     #[test]

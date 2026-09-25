@@ -196,10 +196,14 @@ impl From<TaskError> for crate::error::Error {
     }
 }
 
-/// An owned local task. Dropping the handle requests cancellation; awaiting it joins cleanup.
+/// An owned local task. Dropping the handle requests cancellation, unless the task was started
+/// as a background job its session's job scope owns; awaiting it joins cleanup.
 pub struct LocalTaskHandle<T> {
     result: oneshot::Receiver<Result<T, TaskError>>,
     control: TaskControl,
+    /// Owned by a job scope, which cancels it; dropping this handle leaves it running.
+    #[cfg(any(target_arch = "wasm32", test))]
+    adopted: bool,
 }
 
 impl<T> LocalTaskHandle<T> {
@@ -215,6 +219,10 @@ impl<T> LocalTaskHandle<T> {
 
 impl<T> Drop for LocalTaskHandle<T> {
     fn drop(&mut self) {
+        #[cfg(any(target_arch = "wasm32", test))]
+        if self.adopted {
+            return;
+        }
         self.control.abort();
     }
 }
@@ -275,7 +283,12 @@ impl ExecutionServices {
             let _ = send.send(output);
             let _ = finished_send.send(());
         }));
-        LocalTaskHandle { result, control }
+        LocalTaskHandle {
+            result,
+            control,
+            #[cfg(any(target_arch = "wasm32", test))]
+            adopted: false,
+        }
     }
 }
 

@@ -24,7 +24,22 @@ pub struct JobManager {
     /// Jobs `disown` took out of the table: they keep running, but `jobs` no longer lists them
     /// and `wait` no longer waits for them.
     disowned: Vec<Job>,
+    /// Final statuses of reaped jobs by their process numbers, oldest first: `wait PID` still
+    /// finds one after its job has left the table, as with bash's saved statuses.
+    reaped: VecDeque<(sys::process::ProcessId, u8, Option<u8>)>,
 }
+
+/// Why a job specification names no job.
+#[derive(Debug)]
+pub enum JobSpecError {
+    /// No job matches.
+    NoSuchJob,
+    /// More than one job's command matches a `%name` or `%?text` prefix.
+    Ambiguous,
+}
+
+/// How many reaped jobs' statuses a shell remembers.
+const REAPED_KEPT: usize = 1024;
 
 /// Represents a task that is part of a job.
 pub enum JobTask {
@@ -73,39 +88,39 @@ impl JobTask {
     }
 
     /// Polls the task for completion. Returns `Some(result)` if the task has completed,
-    /// or `None` if it is still running. The result is the execution result of the task.
-    /// Behaves in a best-effort manner; if an internal error occurs during polling,
-    /// it will return `None`.
-    fn poll(&mut self) -> Option<Result<ExecutionResult, error::Error>> {
+    /// or `None` if it is still running; `cx`'s waker is woken when an internal task completes
+    /// (an external process is only checked). Behaves in a best-effort manner; if an internal
+    /// error occurs during polling, it will return `None`.
+    fn poll_cx(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Option<Result<ExecutionResult, error::Error>> {
         match self {
             Self::External(process) => {
                 let check_result = process.poll();
                 check_result.map(|polled_result| polled_result.map(|output| output.into()))
             }
-            Self::Internal(handle) => match handle.now_or_never() {
-                Some(Ok(inner)) => Some(inner),
+            Self::Internal(handle) => match handle.poll_unpin(cx) {
+                std::task::Poll::Ready(Ok(inner)) => Some(inner),
                 // A cancelled (aborted) task must still be reapable: report it as killed rather
                 // than pending forever.
-                Some(Err(e)) if e.is_cancelled() => Some(Ok(ExecutionResult::new(137))),
+                std::task::Poll::Ready(Err(e)) if e.is_cancelled() => {
+                    Some(Ok(ExecutionResult::new(137)))
+                }
                 // Panicked task: preserve the existing best-effort behavior.
-                Some(Err(_)) | None => None,
+                std::task::Poll::Ready(Err(_)) | std::task::Poll::Pending => None,
             },
         }
     }
 }
 
-/// Most background jobs one shell keeps running at once.
+/// Numbers every job ever added, so a job can be found again after its table changed.
+static NEXT_JOB_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Most background jobs one session keeps running at once, however deeply they are nested.
 pub const MAX_RUNNING_JOBS: usize = 256;
 
 impl JobManager {
-    /// Jobs whose numbered process is still running.
-    pub fn running_count(&self, table: &crate::process_table::ProcessTable) -> usize {
-        self.jobs
-            .iter()
-            .filter(|job| job.leader.is_some_and(|pid| table.is_running(pid)))
-            .count()
-    }
-
     /// Returns a new job manager.
     pub fn new() -> Self {
         Self::default()
@@ -122,6 +137,7 @@ impl JobManager {
         reason = "push() guarantees the vector length is >= 1"
     )]
     pub fn add_as_current(&mut self, mut job: Job) -> &Job {
+        self.clean_up_reaped();
         // The current job becomes the previous one, and the previous one loses its mark.
         for j in &mut self.jobs {
             j.annotation = match j.annotation {
@@ -134,6 +150,7 @@ impl JobManager {
         // order (kill %1 while job 2 lives → the next job would also get id 2).
         let id = self.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
         job.id = id;
+        job.serial = NEXT_JOB_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         job.annotation = JobAnnotation::Current;
         self.jobs.push(job);
 
@@ -175,7 +192,84 @@ impl JobManager {
         Self {
             jobs: self.jobs.iter().map(Job::listing_copy).collect(),
             disowned: Vec::new(),
+            reaped: VecDeque::new(),
         }
+    }
+
+    /// Marks a job `wait` has waited for as reaped, remembering its final status for its process
+    /// numbers. As in bash, it stays in the table (so `wait %N` finds it again) until the table
+    /// is next cleaned up: when a new job starts or `jobs` runs.
+    pub fn mark_reaped(&mut self, serial: u64, status: &ExecutionResult) {
+        let Some(job) = self
+            .jobs
+            .iter_mut()
+            .chain(self.disowned.iter_mut())
+            .find(|job| job.serial == serial)
+        else {
+            return;
+        };
+        job.reaped = true;
+        let pids: Vec<_> = job.pids.iter().chain(job.leader.iter()).copied().collect();
+        self.remember(&pids, status);
+    }
+
+    /// Takes a finished job out of the table, as `wait -n` and `wait` without operands do; the
+    /// status is remembered only when `remember` is set.
+    pub fn remove_finished(&mut self, serial: u64, status: Option<&ExecutionResult>) {
+        let removed = if let Some(index) = self.jobs.iter().position(|job| job.serial == serial) {
+            Some(self.remove_listed(index))
+        } else {
+            self.disowned
+                .iter()
+                .position(|job| job.serial == serial)
+                .map(|index| self.disowned.remove(index))
+        };
+        if let (Some(job), Some(status)) = (removed, status) {
+            let pids: Vec<_> = job.pids.iter().chain(job.leader.iter()).copied().collect();
+            self.remember(&pids, status);
+        }
+    }
+
+    /// Drops the jobs already reaped by `wait` from the table.
+    fn clean_up_reaped(&mut self) {
+        while let Some(index) = self.jobs.iter().position(|job| job.reaped) {
+            self.remove_listed(index);
+        }
+        self.disowned.retain(|job| !job.reaped);
+    }
+
+    /// Removes a listed job; the previous job becomes current if it was.
+    fn remove_listed(&mut self, index: usize) -> Job {
+        let job = self.jobs.remove(index);
+        if matches!(job.annotation, JobAnnotation::Current)
+            && let Some(previous) = self.prev_job_mut()
+        {
+            previous.annotation = JobAnnotation::Current;
+        }
+        job
+    }
+
+    fn remember(&mut self, pids: &[sys::process::ProcessId], status: &ExecutionResult) {
+        for pid in pids {
+            self.reaped.retain(|(reaped, _, _)| reaped != pid);
+            self.reaped
+                .push_back((*pid, u8::from(status.exit_code), status.terminating_signal));
+        }
+        while self.reaped.len() > REAPED_KEPT {
+            self.reaped.pop_front();
+        }
+    }
+
+    /// The final status of a job reaped earlier, by one of its process numbers.
+    pub fn reaped_status(&self, pid: sys::process::ProcessId) -> Option<ExecutionResult> {
+        self.reaped
+            .iter()
+            .rev()
+            .find(|(reaped, _, _)| *reaped == pid)
+            .map(|(_, code, signal)| ExecutionResult {
+                terminating_signal: *signal,
+                ..ExecutionResult::new(*code)
+            })
     }
 
     /// Takes the job with this id out of the table, as `disown` does; returns whether there was
@@ -194,26 +288,78 @@ impl JobManager {
         true
     }
 
+    /// Jobs `disown` took out of the table, still running or not yet reaped.
+    pub fn disowned(&self) -> &[Job] {
+        &self.disowned
+    }
+
+    /// The job of this shell, listed or disowned, one of whose process numbers is `pid`. A
+    /// subshell's copies of its parent's jobs are not its own.
+    pub fn job_with_pid_mut(&mut self, pid: crate::process_table::Pid) -> Option<&mut Job> {
+        self.jobs
+            .iter_mut()
+            .chain(self.disowned.iter_mut())
+            .filter(|job| !job.listing_only)
+            .find(|job| job.pids.contains(&pid) || job.leader == Some(pid))
+    }
+
     /// Tries to resolve the given job specification to a job.
     ///
     /// # Arguments
     ///
     /// * `job_spec` - The job specification to resolve.
     pub fn resolve_job_spec(&mut self, job_spec: &str) -> Option<&mut Job> {
-        let remainder = job_spec.strip_prefix('%')?;
+        self.find_job_spec(job_spec).ok()
+    }
 
+    /// Resolves a job specification to one of this shell's own jobs: `%N`, `%%`, `%+`, `%-`,
+    /// `%name` (a command starting with `name`) or `%?text` (a command containing `text`). A
+    /// subshell's copies of its parent's jobs are listed by `jobs` but are not its own.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_spec` - The job specification to resolve.
+    pub fn find_job_spec(&mut self, job_spec: &str) -> Result<&mut Job, JobSpecError> {
+        let index = self.job_spec_index(job_spec, false)?;
+        Ok(&mut self.jobs[index])
+    }
+
+    /// Whether `job_spec` names a job this shell lists, its parent's copies included, as `jobs`
+    /// and `jobs -x` resolve it.
+    pub fn lists_job_spec(&self, job_spec: &str) -> bool {
+        self.job_spec_index(job_spec, true).is_ok()
+    }
+
+    fn job_spec_index(&self, job_spec: &str, copies: bool) -> Result<usize, JobSpecError> {
+        let remainder = job_spec.strip_prefix('%').ok_or(JobSpecError::NoSuchJob)?;
+        let eligible = |job: &Job| copies || !job.listing_only;
+        let position = |found: &dyn Fn(&Job) -> bool| {
+            self.jobs.iter().position(|job| eligible(job) && found(job))
+        };
         match remainder {
-            "%" | "+" => self.current_job_mut(),
-            "-" => self.prev_job_mut(),
+            "" | "%" | "+" => position(&|job| matches!(job.annotation, JobAnnotation::Current)),
+            "-" => position(&|job| matches!(job.annotation, JobAnnotation::Previous)),
             s if s.chars().all(char::is_numeric) => {
-                let id = s.parse::<usize>().ok()?;
-                self.jobs.iter_mut().find(|j| j.id == id)
+                let id = s.parse::<usize>().map_err(|_| JobSpecError::NoSuchJob)?;
+                position(&|job| job.id == id)
             }
-            _ => {
-                tracing::warn!(target: trace_categories::UNIMPLEMENTED, "unimplemented: job spec naming command: '{job_spec}'");
-                None
+            s => {
+                let matches = |job: &Job| match s.strip_prefix('?') {
+                    Some(text) => job.command_line.contains(text),
+                    None => job.command_line.starts_with(s),
+                };
+                let count = self
+                    .jobs
+                    .iter()
+                    .filter(|job| eligible(job) && matches(job))
+                    .count();
+                if count > 1 {
+                    return Err(JobSpecError::Ambiguous);
+                }
+                position(&matches)
             }
         }
+        .ok_or(JobSpecError::NoSuchJob)
     }
 
     /// Waits for all managed jobs to complete.
@@ -227,12 +373,17 @@ impl JobManager {
 
     /// Polls all managed jobs for completion.
     pub fn poll(&mut self) -> Result<Vec<JobResult>, error::Error> {
+        self.clean_up_reaped();
         let mut results = Vec::with_capacity(self.jobs.len());
 
         let mut i = 0;
         while i != self.jobs.len() {
             if let Some(result) = self.jobs[i].poll_done()? {
                 let job = self.jobs.remove(i);
+                if let Ok(status) = &result {
+                    let pids: Vec<_> = job.pids.iter().chain(job.leader.iter()).copied().collect();
+                    self.remember(&pids, status);
+                }
                 results.push((job, result));
             } else if matches!(self.jobs[i].state, JobState::Done) {
                 // TODO(jobs): This is a workaround to remove jobs that are done but for which we
@@ -321,6 +472,21 @@ pub struct Job {
     /// The shell-internal ID of the job.
     pub id: usize,
 
+    /// Identifies this job for as long as it exists, unlike `id`, which a later job can reuse.
+    pub serial: u64,
+
+    /// `wait` has waited for this job; it leaves the table at the next cleanup.
+    reaped: bool,
+
+    /// How the job ended, once it has: its status and the signal that ended it, if one did.
+    final_status: Option<(u8, Option<u8>)>,
+
+    /// The text of each stage, for a background pipeline of several stages.
+    stages: Vec<String>,
+
+    /// Whether `jobs` has shown the job in its current state.
+    listed: bool,
+
     /// The command line of the job.
     pub command_line: String,
 
@@ -346,9 +512,122 @@ impl Display for Job {
             "[{}]{}  {:<27}{}",
             self.id,
             self.annotation,
-            self.state.to_string(),
+            self.status_text(),
             self.display_command()
         )
+    }
+}
+
+/// The text bash shows for a job's command: the command as a function body would print it, but
+/// with subshells and brace groups on one line, `( a; b )` and `{ a; b; }`.
+pub(crate) fn job_text(ao_list: &brush_parser::ast::AndOrList) -> String {
+    let mut text = String::new();
+    push_and_or(&mut text, ao_list);
+    text
+}
+
+/// A pipeline's text, as bash shows a job's.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(dead_code, reason = "only WASM reports signal deaths")
+)]
+pub(crate) fn pipeline_text(pipeline: &brush_parser::ast::Pipeline) -> String {
+    let mut text = String::new();
+    push_pipeline(&mut text, pipeline);
+    text
+}
+
+/// The text of each stage of a background pipeline, as `jobs -l` shows them.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(dead_code, reason = "only WASM numbers pipeline stages")
+)]
+pub(crate) fn stage_texts(pipeline: &brush_parser::ast::Pipeline) -> Vec<String> {
+    pipeline
+        .seq
+        .iter()
+        .map(|command| {
+            let mut text = String::new();
+            push_command(&mut text, command);
+            text
+        })
+        .collect()
+}
+
+fn push_and_or(text: &mut String, ao_list: &brush_parser::ast::AndOrList) {
+    use brush_parser::ast::AndOr;
+    push_pipeline(text, &ao_list.first);
+    for next in &ao_list.additional {
+        let (operator, pipeline) = match next {
+            AndOr::And(pipeline) => (" && ", pipeline),
+            AndOr::Or(pipeline) => (" || ", pipeline),
+        };
+        text.push_str(operator);
+        push_pipeline(text, pipeline);
+    }
+}
+
+fn push_pipeline(text: &mut String, pipeline: &brush_parser::ast::Pipeline) {
+    use std::fmt::Write as _;
+    if let Some(timed) = &pipeline.timed {
+        let _ = write!(text, "{timed} ");
+    }
+    if pipeline.bang {
+        text.push_str("! ");
+    }
+    for (index, command) in pipeline.seq.iter().enumerate() {
+        if index > 0 {
+            text.push_str(" | ");
+        }
+        push_command(text, command);
+    }
+}
+
+fn push_command(text: &mut String, command: &brush_parser::ast::Command) {
+    use brush_parser::ast::{Command, CompoundCommand};
+    use std::fmt::Write as _;
+    let (open, list, close, redirects) = match command {
+        Command::Compound(CompoundCommand::Subshell(subshell), redirects) => {
+            ("( ", &subshell.list, " )", redirects)
+        }
+        Command::Compound(CompoundCommand::BraceGroup(group), redirects) => {
+            ("{ ", &group.list, "; }", redirects)
+        }
+        other => {
+            let _ = write!(text, "{other}");
+            return;
+        }
+    };
+    text.push_str(open);
+    let items = &list.0;
+    for (index, brush_parser::ast::CompoundListItem(ao_list, separator)) in items.iter().enumerate()
+    {
+        push_and_or(text, ao_list);
+        let last = index + 1 == items.len();
+        match separator {
+            brush_parser::ast::SeparatorOperator::Async => {
+                text.push_str(" &");
+                if !last {
+                    text.push(' ');
+                }
+            }
+            brush_parser::ast::SeparatorOperator::Sequence if !last => text.push_str("; "),
+            brush_parser::ast::SeparatorOperator::Sequence => {}
+        }
+    }
+    // A group ends its list with `;`, unless its last command runs in the background.
+    let close = if close == "; }"
+        && items
+            .last()
+            .is_some_and(|item| matches!(item.1, brush_parser::ast::SeparatorOperator::Async))
+    {
+        " }"
+    } else {
+        close
+    };
+    text.push_str(close);
+    if let Some(redirects) = redirects {
+        let _ = write!(text, " {redirects}");
     }
 }
 
@@ -366,6 +645,11 @@ impl Job {
     {
         Self {
             id: 0,
+            serial: 0,
+            reaped: false,
+            final_status: None,
+            stages: Vec::new(),
+            listed: false,
             tasks: tasks.into_iter().collect(),
             pgid: None,
             annotation: JobAnnotation::None,
@@ -385,6 +669,70 @@ impl Job {
         }
     }
 
+    /// The job's state as `jobs` shows it: `Running`, `Stopped`, and once it has finished,
+    /// `Done`, `Exit N` or how a signal ended it (`Terminated`).
+    pub fn status_text(&self) -> String {
+        match (&self.state, self.final_status) {
+            (JobState::Done, Some((_, Some(signal)))) => traps::signal_description(signal),
+            (JobState::Done, Some((code, None))) if code != 0 => std::format!("Exit {code}"),
+            (state, _) => state.to_string(),
+        }
+    }
+
+    /// The lines `jobs -l` shows for the job, as bash lays them out: the job line with the first
+    /// process's number, then one line per further pipeline stage.
+    pub fn long_lines(&self) -> Vec<String> {
+        let pid = |index: usize| {
+            self.pids
+                .get(index)
+                .map_or_else(String::new, ToString::to_string)
+        };
+        let suffix = if matches!(self.state, JobState::Running) {
+            " &"
+        } else {
+            ""
+        };
+        if self.stages.len() < 2 {
+            return vec![std::format!(
+                "[{}]{} {:>5} {:<27}{}",
+                self.id,
+                self.annotation,
+                pid(0),
+                self.status_text(),
+                self.display_command()
+            )];
+        }
+        let last = self.stages.len() - 1;
+        self.stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| {
+                let suffix = if index == last { suffix } else { "" };
+                if index == 0 {
+                    std::format!(
+                        "[{}]{} {:>5} {:<27}{stage}{suffix}",
+                        self.id,
+                        self.annotation,
+                        pid(0),
+                        self.status_text()
+                    )
+                } else {
+                    std::format!("{:>10}{:26}| {stage}{suffix}", pid(index), "")
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `jobs -n` has something new to say about this job; listing it says it.
+    pub const fn changed_since_listed(&self) -> bool {
+        !self.listed
+    }
+
+    /// Records that `jobs` has shown this job in its current state.
+    pub const fn mark_listed(&mut self) {
+        self.listed = true;
+    }
+
     /// A copy of this job for listing only (see `listing_only`).
     fn listing_copy(&self) -> Self {
         Self {
@@ -392,6 +740,11 @@ impl Job {
             pgid: self.pgid,
             annotation: self.annotation.clone(),
             id: self.id,
+            serial: self.serial,
+            reaped: self.reaped,
+            final_status: self.final_status,
+            stages: self.stages.clone(),
+            listed: self.listed,
             command_line: self.command_line.clone(),
             state: self.state.clone(),
             leader: self.leader,
@@ -410,6 +763,7 @@ impl Job {
         command_line: String,
         leader: crate::process_table::Pid,
         pids: Vec<crate::process_table::Pid>,
+        stages: Vec<String>,
     ) -> Self
     where
         I: IntoIterator<Item = JobTask>,
@@ -417,7 +771,19 @@ impl Job {
         let mut job = Self::new(tasks, command_line, JobState::Running);
         job.leader = Some(leader);
         job.pids = pids;
+        job.stages = stages;
         job
+    }
+
+    /// Whether this is a subshell's copy of its parent's job: `jobs` lists it, but it is not
+    /// this shell's to wait for or signal.
+    pub const fn is_listing_copy(&self) -> bool {
+        self.listing_only
+    }
+
+    /// Whether `wait` has already waited for this job.
+    pub const fn is_reaped(&self) -> bool {
+        self.reaped
     }
 
     /// The numbered process running this job, if it has one.
@@ -467,6 +833,17 @@ impl Job {
     pub fn poll_done(
         &mut self,
     ) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
+        self.poll_done_cx(&mut std::task::Context::from_waker(
+            futures::task::noop_waker_ref(),
+        ))
+    }
+
+    /// As [`Self::poll_done`], registering `cx`'s waker to be woken when the job's task
+    /// completes, so a waiter can sleep until then instead of polling in a loop.
+    pub fn poll_done_cx(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
         let mut result: Option<Result<ExecutionResult, error::Error>> = None;
         if self.listing_only {
             return Ok(None);
@@ -476,7 +853,7 @@ impl Job {
 
         while !self.tasks.is_empty() {
             let task = &mut self.tasks[0];
-            match task.poll() {
+            match task.poll_cx(cx) {
                 Some(r) => {
                     self.tasks.remove(0);
                     result = Some(r);
@@ -490,12 +867,34 @@ impl Job {
         tracing::debug!(target: trace_categories::JOBS, "Job {} has completed.", self.id);
 
         self.state = JobState::Done;
+        self.listed = false;
+        if let Some(Ok(result)) = &result {
+            self.record_final_status(result);
+        }
 
         Ok(result)
     }
 
+    /// How the job ended, once it has.
+    pub fn final_status(&self) -> Option<ExecutionResult> {
+        self.final_status.map(|(code, signal)| ExecutionResult {
+            terminating_signal: signal,
+            ..ExecutionResult::new(code)
+        })
+    }
+
+    fn record_final_status(&mut self, result: &ExecutionResult) {
+        self.final_status = Some((u8::from(result.exit_code), result.terminating_signal));
+    }
+
     /// Waits for the job to complete.
     pub async fn wait(&mut self) -> Result<ExecutionResult, error::Error> {
+        // Waiting again for a finished job gives the same status.
+        if self.tasks.is_empty()
+            && let Some(status) = self.final_status()
+        {
+            return Ok(status);
+        }
         let mut result = ExecutionResult::success();
 
         while let Some(task) = self.tasks.back_mut() {
@@ -512,6 +911,7 @@ impl Job {
         }
 
         self.state = JobState::Done;
+        self.record_final_status(&result);
 
         Ok(result)
     }
@@ -607,5 +1007,41 @@ impl Job {
     pub fn process_group_id(&self) -> Option<sys::process::ProcessId> {
         // TODO(jobs): Don't assume that the first PID is the PGID.
         self.pgid.or_else(|| self.representative_pid())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waiter_on_a_job_sleeps_until_the_job_ends() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tokio::task::LocalSet::new().run_until(async {
+                let handle = tokio::task::spawn_local(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(ExecutionResult::new(4))
+                });
+                let mut job =
+                    Job::new([JobTask::Internal(handle)], "job".into(), JobState::Running);
+                let mut polls = 0;
+                let result = std::future::poll_fn(|cx| {
+                    polls += 1;
+                    match job.poll_done_cx(cx) {
+                        Ok(Some(result)) => std::task::Poll::Ready(result),
+                        Ok(None) => std::task::Poll::Pending,
+                        Err(error) => std::task::Poll::Ready(Err(error)),
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(u8::from(result.exit_code), 4);
+                // Polled once to register, once when the job ended: no busy polling.
+                assert!(polls <= 3, "polled {polls} times");
+                assert!(matches!(job.state, JobState::Done));
+            }));
     }
 }

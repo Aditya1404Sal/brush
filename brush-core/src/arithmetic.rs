@@ -10,8 +10,13 @@ mod syntax;
 pub use syntax::SyntaxError;
 
 /// Maximum recursion depth for arithmetic variable dereference chains
-/// (e.g., a=b, b=c, c=a would cycle through variable dereferences).
+/// (e.g., a=b, b=c, c=a would cycle through variable dereferences). Bash allows 1024; on WASM
+/// each level costs about half a KiB of Wasmtime's 512 KiB native stack, which deeply nested
+/// shell code may already have used most of, so the limit there is 200.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
+#[cfg(target_arch = "wasm32")]
+const MAX_VARIABLE_DEREF_DEPTH: u32 = 200;
 
 /// Represents an error that occurs during evaluation of an arithmetic expression.
 #[derive(Debug, thiserror::Error)]
@@ -342,10 +347,13 @@ fn deref_lvalue(
         return eval_expr_impl(&parsed_value, shell, depth);
     }
 
-    // Bash allows 1024 nested expressions, counting the one the reference is in.
     let new_depth = depth + 1;
-    if new_depth >= MAX_VARIABLE_DEREF_DEPTH {
-        return Err(EvalError::RecursionLimitExceeded);
+    if new_depth > MAX_VARIABLE_DEREF_DEPTH {
+        // Bash names the expression it was about to evaluate, and all of it as the token.
+        return Err(EvalError::in_expression(
+            &value_str,
+            EvalError::RecursionLimitExceeded,
+        ));
     }
 
     // An error in the value names the value, as bash evaluates it as an expression of its own.

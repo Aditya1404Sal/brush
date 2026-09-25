@@ -102,7 +102,7 @@ mod set;
 mod shift;
 #[cfg(feature = "builtin.shopt")]
 mod shopt;
-#[cfg(all(feature = "builtin.suspend", unix))]
+#[cfg(all(feature = "builtin.suspend", any(unix, target_arch = "wasm32")))]
 mod suspend;
 #[cfg(feature = "builtin.test")]
 mod test;

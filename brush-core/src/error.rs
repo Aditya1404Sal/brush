@@ -86,6 +86,15 @@ pub enum ErrorKind {
     #[error("failed to execute command '{0}': {1}")]
     FailedToExecuteCommand(String, #[source] std::io::Error),
 
+    /// A command named by a path cannot run, for the reason given (`No such file or directory`,
+    /// `Is a directory`), as the kernel's `execve` would say.
+    #[error("{0}: {1}")]
+    CannotExecutePath(String, &'static str),
+
+    /// A command resolved to a file, which this platform cannot run as a process.
+    #[error("{0}: executing files is unsupported in bash-tool")]
+    ExecutingFilesUnsupported(String),
+
     /// History item was not found.
     #[error("history item not found")]
     HistoryItemNotFound,
@@ -280,9 +289,25 @@ pub enum ErrorKind {
     #[error("interrupted")]
     Interrupted,
 
-    /// Maximum function call depth was exceeded.
-    #[error("maximum function call depth exceeded")]
-    MaxFunctionCallDepthExceeded,
+    /// A function call would nest deeper than `FUNCNEST` (or the embedder's limit) allows: the
+    /// function's name and the nesting level reached.
+    #[error("{0}: maximum function nesting level exceeded ({1})")]
+    MaxFunctionCallDepthExceeded(String, usize),
+
+    /// A function call would nest deeper than the stack can hold: the function's name and the
+    /// nesting level reached.
+    #[error(
+        "{0}: maximum function nesting level exceeded ({1}): deeper nesting is unsupported in bash-tool"
+    )]
+    FunctionNestingTooDeep(String, usize),
+
+    /// A command substitution's output exceeded what the shell holds in memory.
+    #[error("command substitution: output over 16 MiB is unsupported in bash-tool")]
+    SubstitutionTooLarge,
+
+    /// Execution would nest deeper than the stack can hold.
+    #[error("maximum nesting level exceeded: deeper nesting is unsupported in bash-tool")]
+    NestingTooDeep,
 
     /// System time error.
     #[error("system time error: {0}")]
@@ -393,6 +418,9 @@ where
     }
 }
 
+/// `execve`'s reason for a path that names nothing.
+pub(crate) const NO_SUCH_FILE: &str = "No such file or directory";
+
 impl From<&ErrorKind> for results::ExecutionExitCode {
     fn from(value: &ErrorKind) -> Self {
         match value {
@@ -406,6 +434,10 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
             ErrorKind::PromptRefused(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
+            ErrorKind::CannotExecutePath(_, reason) if *reason == NO_SUCH_FILE => Self::NotFound,
+            ErrorKind::CannotExecutePath(..) => Self::CannotExecute,
+            // Found but not run: bash's status for a file it cannot execute.
+            ErrorKind::ExecutingFilesUnsupported(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
             ErrorKind::BuiltinError(inner, ..) => inner.as_exit_code(),

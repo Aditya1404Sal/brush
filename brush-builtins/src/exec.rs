@@ -44,10 +44,13 @@ impl builtins::Command for ExecCommand {
             return Ok(ExecutionResult::success());
         }
 
-        // If we know we're already running in a subshell, then `exec`ing is actually
-        // unsafe, since it would also replace the *parent* shell instance. We instead
-        // delegate to the `command` builtin to perform the execution, with an expectation
-        // of returning.
+        // Native: if we know we're already running in a subshell, then `exec`ing is actually
+        // unsafe, since it would also replace the *parent* shell instance (a real, separate OS
+        // process on Unix). We instead delegate to the `command` builtin to perform the
+        // execution, with an expectation of returning. This concern does not apply on wasm32
+        // (see below): there is no real subshell process to protect either way, so ending the
+        // subshell's own call frame is exactly what a real exec would have done to it too.
+        #[cfg(not(target_arch = "wasm32"))]
         if context.shell.is_subshell() {
             if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
                 return brush_core::error::unimp("exec with options in subshell not yet supported");
@@ -61,9 +64,11 @@ impl builtins::Command for ExecCommand {
             return cmd_cmd.execute(context).await;
         }
 
-        // wasm32: there is no execve and no process image to replace. The command runs, and the
-        // shell then ends with its status, as it would once replaced. The EXIT trap does not run:
-        // it belonged to the shell that is gone.
+        // wasm32: there is no execve and no process image to replace, in a subshell or not. The
+        // command runs, and this call frame -- the whole shell, or just the subshell running it,
+        // which is its own clone (`shell.clone()` in interp.rs) and so has its own trap set --
+        // ends with its status, as replacing it would. The EXIT trap does not run: it belonged
+        // to the frame that is gone.
         #[cfg(target_arch = "wasm32")]
         {
             if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
@@ -73,13 +78,37 @@ impl builtins::Command for ExecCommand {
                 command_and_args: self.args.clone(),
                 ..Default::default()
             };
+            // Bash's own wording for a target `exec` cannot find ("NAME: not found") differs
+            // from the generic "command not found" the `command` builtin below produces for an
+            // ordinary lookup failure. And unlike an ordinary command, a failed `exec` always
+            // ends a non-interactive shell: there is no process image left for the rest of the
+            // script to run in, exactly as there would be none after a successful one.
+            let diagnostic_prefix = context.shell.diagnostic_prefix();
+            let mut stderr = context.params.stderr(context.shell);
             let shell = context.shell;
             let inner = brush_core::ExecutionContext {
                 shell: &mut *shell,
                 command_name: context.command_name,
                 params: context.params,
             };
-            let mut result = command.execute(inner).await?;
+            let mut result = match command.execute(inner).await {
+                Ok(result) => result,
+                Err(error) => {
+                    use std::io::Write as _;
+                    let (message, exit_code) = match error.kind() {
+                        brush_core::ErrorKind::CommandNotFound(name) => (
+                            std::format!("{name}: not found"),
+                            brush_core::ExecutionExitCode::NotFound,
+                        ),
+                        _ => (
+                            error.to_string(),
+                            brush_core::ExecutionExitCode::from(&error),
+                        ),
+                    };
+                    let _ = writeln!(stderr, "{diagnostic_prefix}exec: {message}");
+                    brush_core::ExecutionResult::new(exit_code.into())
+                }
+            };
             shell
                 .traps_mut()
                 .remove_handlers(brush_core::traps::TrapSignal::Exit);

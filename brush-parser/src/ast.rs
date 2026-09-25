@@ -350,7 +350,7 @@ impl Display for Pipeline {
         }
         for (i, command) in self.seq.iter().enumerate() {
             if i > 0 {
-                write!(f, " |")?;
+                write!(f, " | ")?;
             }
             write!(f, "{command}")?;
         }
@@ -400,7 +400,7 @@ impl Display for Command {
             Self::Compound(compound_command, redirect_list) => {
                 write!(f, "{compound_command}")?;
                 if let Some(redirect_list) = redirect_list {
-                    write!(f, "{redirect_list}")?;
+                    write!(f, " {redirect_list}")?;
                 }
                 Ok(())
             }
@@ -1570,7 +1570,10 @@ impl SourceLocation for RedirectList {
 
 impl Display for RedirectList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for item in &self.0 {
+        for (i, item) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, " ")?;
+            }
             write!(f, "{item}")?;
         }
         Ok(())
@@ -1614,11 +1617,23 @@ impl Display for IoRedirect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::File(fd_num, kind, target) => {
-                if let Some(fd_num) = fd_num {
-                    write!(f, "{fd_num}")?;
+                // As bash prints them, a duplication names its descriptor and takes no space.
+                let duplicate = match kind {
+                    IoFileRedirectKind::DuplicateInput => Some(0),
+                    IoFileRedirectKind::DuplicateOutput => Some(1),
+                    _ => None,
+                };
+                match duplicate {
+                    Some(default_fd) if !matches!(target, IoFileRedirectTarget::Filename(_)) => {
+                        write!(f, "{}{kind}{target}", fd_num.unwrap_or(default_fd))?;
+                    }
+                    _ => {
+                        if let Some(fd_num) = fd_num {
+                            write!(f, "{fd_num}")?;
+                        }
+                        write!(f, "{kind} {target}")?;
+                    }
                 }
-
-                write!(f, "{kind} {target}")?;
             }
             Self::NamedFd(variable, kind, target) => {
                 write!(f, "{{{variable}}}{kind} {target}")?;

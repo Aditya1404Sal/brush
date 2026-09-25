@@ -2211,13 +2211,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
     }
 
     /// The process number `$!` names: the last job started in the background, if any.
-    fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
-        self.shell.last_background_pid.or_else(|| {
-            self.shell
-                .jobs()
-                .current_job()
-                .and_then(crate::jobs::Job::representative_pid)
-        })
+    const fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.shell.last_background_pid()
     }
 
     fn expand_special_parameter(
@@ -2245,16 +2240,15 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::SpecialParameter::ProcessId => {
                 // WASM has no host process id; `$$` is the session's synthetic shell number.
                 #[cfg(target_arch = "wasm32")]
-                return Expansion::from(self.shell.processes().shell_pid().to_string());
+                return Expansion::from(self.shell.shell_pid().to_string());
                 #[cfg(not(target_arch = "wasm32"))]
                 Expansion::from(std::process::id().to_string())
             }
-            brush_parser::word::SpecialParameter::LastBackgroundProcessId => {
-                if let Some(pid) = self.last_background_pid() {
-                    return Expansion::from(pid.to_string());
-                }
-                Expansion::from(String::new())
-            }
+            brush_parser::word::SpecialParameter::LastBackgroundProcessId => Expansion::from(
+                self.shell
+                    .last_background_pid()
+                    .map_or_else(String::new, |pid| pid.to_string()),
+            ),
             brush_parser::word::SpecialParameter::ShellName => Expansion::from(
                 self.shell
                     .current_shell_name()

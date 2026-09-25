@@ -239,6 +239,11 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         // (e.g. /dev/null on Windows, which needs to open NUL instead).
         // This is checked before absolute_path so that paths like /dev/null
         // are intercepted on platforms where they aren't valid native paths.
+        // WASI has no device files: `/dev/null` is a stream that keeps nothing.
+        #[cfg(target_arch = "wasm32")]
+        if self.absolute_path(path.as_ref()) == Path::new("/dev/null") {
+            return Ok(openfiles::null_sink());
+        }
         if let Some(result) = crate::sys::fs::try_open_special_file(path.as_ref()) {
             return result.map(openfiles::OpenFile::from);
         }
@@ -255,6 +260,14 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         }
 
         Ok(options.open(path_to_open)?.into())
+    }
+
+    /// Whether `path` names one of the shell's descriptors (`/dev/fd/N`, `/dev/stdin`) that is not
+    /// open for the command these parameters are for.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn names_closed_fd(&self, params: &ExecutionParameters, path: &str) -> bool {
+        shell_fd_path_to_fd(&self.absolute_path(Path::new(path)))
+            .is_some_and(|fd| params.try_fd(self, fd).is_none())
     }
 
     /// Replaces the shell's currently configured open files with the given set.
