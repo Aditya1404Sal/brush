@@ -3,7 +3,7 @@ use std::io::Read;
 
 use clap::Parser;
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, env, error, variables};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins, env, error, variables};
 
 /// Read lines from standard input into an indexed array variable.
 #[derive(Parser)]
@@ -29,8 +29,8 @@ pub(crate) struct MapFileCommand {
     remove_delimiter: bool,
 
     /// File descriptor to read from (defaults to stdin).
-    #[arg(short = 'u', default_value_t = 0)]
-    fd: brush_core::ShellFd,
+    #[arg(short = 'u')]
+    fd: Option<brush_core::ShellFd>,
 
     /// Name of function to call for each group of lines.
     #[arg(short = 'C')]
@@ -81,12 +81,21 @@ impl builtins::Command for MapFileCommand {
             }
         }
 
-        let input_file = context
-            .try_fd(self.fd)
-            .ok_or_else(|| ErrorKind::BadFileDescriptor(self.fd))?;
-
-        // Read!
-        let results = self.read_entries(input_file).await?;
+        // A descriptor named with -u must be open; a closed standard input reads as empty, as in
+        // bash.
+        let fd = self
+            .fd
+            .unwrap_or(brush_core::openfiles::OpenFiles::STDIN_FD);
+        let results = match context.try_fd(fd) {
+            Some(input_file) => self.read_entries(input_file).await?,
+            None if self.fd.is_some() => {
+                context.report(format_args!(
+                    "{fd}: invalid file descriptor: Bad file descriptor"
+                ))?;
+                return Ok(ExecutionExitCode::GeneralError.into());
+            }
+            None => variables::ArrayLiteral(vec![]),
+        };
 
         if let Some(origin) = self.origin {
             // -O: preserve existing array, assign at offset.

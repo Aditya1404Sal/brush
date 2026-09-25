@@ -129,9 +129,13 @@ impl builtins::Command for ReadCommand {
 
         // Retrieve the file.
         let Some(input_stream) = context.try_fd(fd_num) else {
-            context.report(format_args!(
-                "{fd_num}: invalid file descriptor: Bad file descriptor"
-            ))?;
+            // Bash words a descriptor named with -u differently from a closed standard input.
+            let reason = if self.fd_num_to_read.is_some() {
+                "invalid file descriptor"
+            } else {
+                "read error"
+            };
+            context.report(format_args!("{fd_num}: {reason}: Bad file descriptor"))?;
             return Ok(brush_core::ExecutionResult::general_error());
         };
 
