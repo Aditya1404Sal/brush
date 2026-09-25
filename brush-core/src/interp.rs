@@ -808,8 +808,28 @@ async fn wait_for_pipeline_processes_and_update_status(
     let mut stopped_children = vec![];
     let mut last_failure_exit_code: Option<(ExecutionExitCode, Option<u8>)> = None;
 
+    // A compound command or function definition run on its own in this shell leaves PIPESTATUS
+    // as the last pipeline it ran set it, as in bash; `(( ))`, `[[ ]]` and `( )` set it.
+    let keeps_statuses = matches!(
+        pipeline.seq.as_slice(),
+        [ast::Command::Function(_)
+            | ast::Command::Compound(
+                ast::CompoundCommand::BraceGroup(_)
+                    | ast::CompoundCommand::ForClause(_)
+                    | ast::CompoundCommand::ArithmeticForClause(_)
+                    | ast::CompoundCommand::SelectClause(_)
+                    | ast::CompoundCommand::CaseClause(_)
+                    | ast::CompoundCommand::IfClause(_)
+                    | ast::CompoundCommand::WhileClause(_)
+                    | ast::CompoundCommand::UntilClause(_),
+                _,
+            )]
+    );
+
     // Clear our the pipeline status so we can start filling it out.
-    shell.last_pipeline_statuses_mut().clear();
+    if !keeps_statuses {
+        shell.last_pipeline_statuses_mut().clear();
+    }
 
     while let Some(child) = process_spawn_results.pop_front() {
         let wait_result = if !stopped_children.is_empty() {
@@ -822,9 +842,11 @@ async fn wait_for_pipeline_processes_and_update_status(
             ExecutionWaitResult::Completed(current_result) => {
                 result = current_result;
                 shell.set_last_exit_status(result.exit_code.into());
-                shell
-                    .last_pipeline_statuses_mut()
-                    .push(result.exit_code.into());
+                if !keeps_statuses {
+                    shell
+                        .last_pipeline_statuses_mut()
+                        .push(result.exit_code.into());
+                }
 
                 // Track the last failure for pipefail option
                 if !result.is_success() {
