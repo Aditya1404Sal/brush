@@ -198,12 +198,17 @@ pub(crate) fn apply_unary_predicate_to_str(
         }
         ast::UnaryPredicate::FileExistsAndIsExecutable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.executable())
+            Ok(path.executable_or_searchable())
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
             let path = shell.absolute_path(Path::new(operand));
             if !path.exists() {
                 return Ok(false);
+            }
+
+            // WASI has no owners: every file in the shell's filesystem is its own.
+            if cfg!(target_family = "wasm") {
+                return Ok(true);
             }
 
             let md = path.metadata()?;
@@ -216,6 +221,11 @@ pub(crate) fn apply_unary_predicate_to_str(
             let path = shell.absolute_path(Path::new(operand));
             if !path.exists() {
                 return Ok(false);
+            }
+
+            // WASI has no owners: every file in the shell's filesystem is its own.
+            if cfg!(target_family = "wasm") {
+                return Ok(true);
             }
 
             let md = path.metadata()?;
