@@ -744,13 +744,24 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     }
 
     /// The name diagnostics start with: the shell's name (`$0`), as bash uses -- except while
-    /// sourcing a file, where bash names the file being sourced instead. `source`/`.` does not
-    /// itself change `$0` (see [`Self::current_shell_name`]), but bash's own diagnostics from
-    /// within a sourced file are still that file's name, not `$0`.
+    /// sourcing a file, where bash names the file being sourced instead, and in a function, where
+    /// it names the file the function came from (`environment` for one imported from the
+    /// environment). `source`/`.` does not itself change `$0` (see
+    /// [`Self::current_shell_name`]), but bash's own diagnostics from within a sourced file are
+    /// still that file's name, not `$0`.
     pub fn diagnostic_name(&self) -> String {
+        // As bash's: `BASH_SOURCE[0]`, the source of the running function or script, else `$0`.
         for frame in self.call_stack.iter() {
-            if frame.frame_type.is_run_script() || frame.frame_type.is_sourced_script() {
-                return frame.frame_type.name().into_owned();
+            match &frame.frame_type {
+                crate::callstack::FrameType::Function(call)
+                    if !call.function.source().source.is_empty() =>
+                {
+                    return call.function.source().source.clone();
+                }
+                frame_type if frame_type.is_run_script() || frame_type.is_sourced_script() => {
+                    return frame_type.name().into_owned();
+                }
+                _ => (),
             }
         }
         self.name.clone().unwrap_or_else(|| "bash".to_owned())

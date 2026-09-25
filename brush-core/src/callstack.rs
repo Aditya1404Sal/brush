@@ -232,7 +232,9 @@ impl Frame {
         let start_line = self.source_info.start.as_ref().map_or(1, |pos| pos.line);
         let current_line = self.current.as_ref().map(|pos| pos.line)?;
 
-        Some(start_line.saturating_sub(1) + current_line + self.current_line_offset)
+        // A source that starts at line 0 (a function imported from the environment) numbers its
+        // lines from 0, as bash does.
+        Some((start_line + current_line + self.current_line_offset).saturating_sub(1))
     }
 
     /// Returns the current line number, relative to the frame's entry.
