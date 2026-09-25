@@ -372,6 +372,42 @@ impl DeclareCommand {
             return Ok(false);
         }
 
+        // `declare -r 'a[i]=v'`: bash makes the array readonly before it assigns the element, so
+        // the assignment fails ("a: readonly variable") and the declaration still succeeds: the
+        // array keeps what it held, or is a new empty one (declared but unset for a local).
+        if assigned_index.is_some()
+            && initial_value.is_some()
+            && self.make_readonly.to_bool() == Some(true)
+        {
+            writeln!(
+                context.stderr(),
+                "{}{name}: readonly variable",
+                context.shell.diagnostic_prefix()
+            )?;
+            if let Some(var) = self.existing_variable(context.shell, name.as_str(), current_lookup)
+            {
+                self.apply_attributes_before_update(var)?;
+                self.apply_attributes_after_update(var, verb)?;
+            } else {
+                let (value, scope) = if create_var_local {
+                    (
+                        ShellValue::Unset(ShellValueUnsetType::IndexedArray),
+                        EnvironmentScope::Local,
+                    )
+                } else {
+                    (
+                        ShellValue::indexed_array_from_literals(ArrayLiteral(vec![])),
+                        EnvironmentScope::Global,
+                    )
+                };
+                let mut var = ShellVariable::new(value);
+                self.apply_attributes_before_update(&mut var)?;
+                self.apply_attributes_after_update(&mut var, verb)?;
+                context.shell.env_mut().add(name, var, scope)?;
+            }
+            return Ok(true);
+        }
+
         // A nameref must name a variable or an element of one.
         if self.make_nameref.to_bool() == Some(true)
             && let Some(ShellValueLiteral::Scalar(target)) = &initial_value
