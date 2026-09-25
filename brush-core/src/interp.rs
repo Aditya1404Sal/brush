@@ -817,19 +817,29 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     let disposition = shell.traps().pipe_disposition();
     services.spawn(async move {
         let body = async move {
+            let stderr = params.stderr(&shell);
             let context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut shell),
                 process_group_id: None,
             };
-            match command
-                .execute_in_pipeline(context, params)
-                .await?
-                .wait()
-                .await?
-            {
-                ExecutionWaitResult::Completed(result) => Ok(result),
-                ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+            let outcome = async {
+                match command
+                    .execute_in_pipeline(context, params)
+                    .await?
+                    .wait()
+                    .await?
+                {
+                    ExecutionWaitResult::Completed(result) => Ok(result),
+                    ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+                }
             }
+            .await;
+            // A stage is a subshell: an error that ends it (`${x:?}`) ends only the stage, which
+            // exits with the error's status, as in bash.
+            outcome.or_else(|error: error::Error| {
+                let _ = shell.display_error(&mut stderr.clone(), &error);
+                Ok(ExecutionResult::from(error.into_result(&shell).exit_code))
+            })
         };
         match numbered {
             Some(numbered) => numbered.run(body).await,
