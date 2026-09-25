@@ -110,12 +110,22 @@ peg::parser! {
             expected!("compound command")
 
         pub(crate) rule arithmetic_command() -> ast::ArithmeticCommand =
-            start:specific_operator("(") specific_operator("(") expr:arithmetic_expression() specific_operator(")") end:specific_operator(")") {
+            start:double_open_paren() expr:arithmetic_expression() specific_operator(")") end:specific_operator(")") {
                 let loc = SourceSpan::within(
                     start.location(),
                     end.location()
                 );
                 ast::ArithmeticCommand { expr, loc }
+            }
+
+        // `((` with nothing between the parentheses; `( (` opens two subshells, as in bash.
+        rule double_open_paren() -> &'input Token =
+            start:specific_operator("(") second:specific_operator("(") {?
+                if second.location().start.index == start.location().end.index {
+                    Ok(start)
+                } else {
+                    Err("((")
+                }
             }
 
         pub(crate) rule arithmetic_expression() -> ast::UnexpandedArithmeticExpr =
@@ -162,7 +172,7 @@ peg::parser! {
             }
 
         rule for_clause() -> ast::ForClauseCommand =
-            s:specific_word("for") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:do_group() {
+            s:specific_word("for") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
                 let start = s.location();
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
@@ -173,15 +183,25 @@ peg::parser! {
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
                 ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            } /
+            s:specific_word("for") n:name() sequential_sep() d:brace_body() {
+                let start = s.location();
+                let end = &d.loc;
+                let loc = SourceSpan::within(start, end);
+                ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
             }
 
         // N.B. select is a non-sh extension; its grammar is the for loop's.
         rule select_clause() -> ast::SelectClauseCommand =
-            s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:do_group() {
+            s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
                 let loc = SourceSpan::within(s.location(), &d.loc);
                 ast::SelectClauseCommand { variable_name: n.to_owned(), values: w, body: d, loc }
             } /
             s:specific_word("select") n:name() sequential_sep()? d:do_group() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            } /
+            s:specific_word("select") n:name() sequential_sep() d:brace_body() {
                 let loc = SourceSpan::within(s.location(), &d.loc);
                 ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
             }
@@ -214,7 +234,7 @@ peg::parser! {
 
         rule arithmetic_for_body() -> ast::DoGroupCommand =
             sequential_sep()? body:do_group() { body } /
-            body:brace_group() { ast::DoGroupCommand { list: body.list, loc: body.loc } }
+            sequential_sep()? body:brace_body() { body }
 
         rule extended_test_command() -> ast::ExtendedTestExprCommand =
             s:specific_word("[[") linebreak() expr:extended_test_expression() e:specific_word("]]") {
@@ -488,6 +508,15 @@ peg::parser! {
                 let loc = SourceSpan::within(start.location(), end.location());
                 ast::BraceGroupCommand { list, loc }
             }
+
+        // A for or select loop's body after its separator: `do ... done`, or, as bash also takes,
+        // `{ ... }`.
+        rule for_body() -> ast::DoGroupCommand =
+            do_group() /
+            brace_body()
+
+        rule brace_body() -> ast::DoGroupCommand =
+            b:brace_group() { ast::DoGroupCommand { list: b.list, loc: b.loc } }
 
         rule do_group() -> ast::DoGroupCommand =
             start:specific_word("do") list:compound_list() end:specific_word("done") {

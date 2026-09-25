@@ -1091,6 +1091,17 @@ impl Execute for ast::ForClauseCommand {
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
 
+        // A loop variable that is not a name fails the loop before it runs, as in bash.
+        if !valid_variable_name(&self.variable_name) {
+            writeln!(
+                params.stderr(shell),
+                "{}`{}': not a valid identifier",
+                shell.diagnostic_prefix(),
+                self.variable_name
+            )?;
+            return Ok(ExecutionExitCode::GeneralError.into());
+        }
+
         // If we were given explicit words to iterate over, then expand them all, with splitting
         // enabled.
         let expanded_values = if let Some(unexpanded_values) = &self.values {

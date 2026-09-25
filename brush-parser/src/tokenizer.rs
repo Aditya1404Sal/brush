@@ -673,6 +673,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     ) -> Result<(), TokenizerError> {
         let mut pending_here_doc_tokens = vec![];
         let mut drain_here_doc_tokens = false;
+        // In a command substitution, the `)` that ends a case pattern does not close it.
+        let mut cases =
+            (nesting_open == "(" && !self.cross_state.arithmetic_expansion).then(CaseTracker::new);
 
         loop {
             let cur_token = if drain_here_doc_tokens && !pending_here_doc_tokens.is_empty() {
@@ -705,6 +708,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
 
             if let Some(cur_token_value) = cur_token.token {
                 state.append_str(cur_token_value.to_str());
+                if let Some(cases) = &mut cases {
+                    cases.note(&cur_token_value);
+                }
 
                 match &cur_token_value {
                     Token::Operator(o, _) if o == nesting_open => nesting_count += 1,
@@ -727,6 +733,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 }
                 TokenEndReason::NonNewLineBlank => state.append_char(' '),
                 TokenEndReason::SpecifiedTerminatingChar => {
+                    if cases.as_mut().is_some_and(CaseTracker::closes_pattern) {
+                        state.append_char(self.next_char()?.unwrap());
+                        continue;
+                    }
                     nesting_count -= 1;
                     if nesting_count == 0 {
                         break;
@@ -1446,6 +1456,94 @@ const fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
 }
 
+/// Where the tokens of a command substitution are in the `case` commands open in it, so that the
+/// `)` ending a pattern is not taken for the one closing the substitution (bash reads the
+/// substitution as a command).
+struct CaseTracker {
+    /// For each open `case`, where its tokens are.
+    open: Vec<CaseState>,
+    /// Whether the next word starts a command, so a `case` there opens one.
+    command_start: bool,
+    /// Whether the current pattern began with its optional `(`.
+    pattern_paren: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum CaseState {
+    /// After `case WORD`, before `in`.
+    ExpectIn,
+    /// In a pattern list, before its `)`.
+    Pattern,
+    /// In the commands after a pattern list.
+    Body,
+}
+
+impl CaseTracker {
+    const fn new() -> Self {
+        Self {
+            open: vec![],
+            command_start: true,
+            pattern_paren: false,
+        }
+    }
+
+    /// Notes a token of the substitution.
+    fn note(&mut self, token: &Token) {
+        match token {
+            Token::Word(word, _) => {
+                let word = word.trim_matches(is_blank);
+                match (self.open.last(), word) {
+                    (_, "case") if self.command_start => self.open.push(CaseState::ExpectIn),
+                    (Some(CaseState::ExpectIn), "in") => {
+                        self.open.pop();
+                        self.open.push(CaseState::Pattern);
+                    }
+                    (Some(CaseState::Pattern), "esac") => {
+                        self.open.pop();
+                    }
+                    (Some(CaseState::Body), "esac") if self.command_start => {
+                        self.open.pop();
+                    }
+                    _ => (),
+                }
+                self.command_start = matches!(
+                    word,
+                    "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "{" | "!" | "time"
+                );
+            }
+            Token::Operator(operator, _) => {
+                let operator = operator.trim_matches(is_blank);
+                if matches!(operator, ";;" | ";&" | ";;&")
+                    && self.open.last() == Some(&CaseState::Body)
+                {
+                    self.open.pop();
+                    self.open.push(CaseState::Pattern);
+                }
+                if operator == "(" && self.open.last() == Some(&CaseState::Pattern) {
+                    self.pattern_paren = true;
+                }
+                self.command_start = matches!(
+                    operator,
+                    ";" | "&" | "&&" | "||" | "|" | "|&" | "(" | "\n" | ";;" | ";&" | ";;&"
+                );
+            }
+        }
+    }
+
+    /// Whether a `)` ends a case pattern rather than closing a parenthesis; it moves past the
+    /// pattern either way. A pattern's optional `(` is closed by the `)` too, so that `)` still
+    /// balances it.
+    fn closes_pattern(&mut self) -> bool {
+        if self.open.last() != Some(&CaseState::Pattern) {
+            return false;
+        }
+        self.open.pop();
+        self.open.push(CaseState::Body);
+        self.command_start = true;
+        !std::mem::take(&mut self.pattern_paren)
+    }
+}
+
 /// Whether `s` is a valid variable name.
 fn is_valid_name(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
@@ -1845,6 +1943,15 @@ echo after
         assert_eq!(
             strs("if true; then e[a[1] > 0]=v; fi")?,
             ["if", "true", ";", "then", "e[a[1] > 0]=v", ";", "fi"]
+        );
+        // A case pattern's `)` inside a substitution does not close it.
+        assert_eq!(
+            strs("x=$(case a in a) echo m;; (b|c) echo n;; esac); y=$( (echo s) )")?,
+            [
+                "x=$(case a in a) echo m;; (b|c) echo n;; esac)",
+                ";",
+                "y=$( (echo s) )"
+            ]
         );
         // A backslash that ends the input is an ordinary character.
         assert_eq!(strs("echo a \\")?, ["echo", "a", "\\"]);

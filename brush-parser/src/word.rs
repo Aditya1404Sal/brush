@@ -1373,10 +1373,29 @@ peg::parser! {
         pub(crate) rule command() -> &'input str =
             $(command_piece()*)
 
+        // Text runs stop at blanks and separators, so each word of the command is a piece of its
+        // own and a `case` command is seen where it starts.
         pub(crate) rule command_piece() -> () =
-            word_piece(<[')']>, true /*in_command*/) {} /
-            ([' ' | '\t'])+ {} /
+            case_command() {} /
+            word_piece(<command_piece_stop()>, true /*in_command*/) {} /
+            ([' ' | '\t' | '\n' | ';' | '&' | '|'])+ {} /
             ['\'' | '`'] {}
+
+        rule command_piece_stop() -> () = [')' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
+
+        // A case command, whose patterns end in `)`, taken whole through its `esac` (bash reads
+        // a substitution as a command).
+        rule case_command() =
+            "case" &keyword_end() (!("esac" keyword_end()) case_command_piece())* "esac" &keyword_end()
+
+        rule case_command_piece() =
+            case_command() /
+            word_piece(<case_command_stop()>, true /*in_command*/) {} /
+            [_] {}
+
+        rule case_command_stop() -> () = [')' | '(' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
+
+        rule keyword_end() = [' ' | '\t' | '\n' | ';' | ')' | '&' | '|'] / ![_]
 
         // As in bash, a backslash in backquotes escapes only `$`, a backquote and a backslash
         // (and, inside double quotes, a double quote); the command is the text left.
@@ -1496,6 +1515,39 @@ mod tests {
             input: word,
             result: parsed,
         })
+    }
+
+    #[test]
+    fn parse_case_command_in_substitution() -> Result<()> {
+        for (word, command, rest) in [
+            (
+                "$(case a in a) echo m;; (b|c) echo n;; esac)x",
+                "case a in a) echo m;; (b|c) echo n;; esac",
+                "x",
+            ),
+            (
+                "$(echo 1; case x in x) case y in y) echo z;; esac;; esac; echo e)",
+                "echo 1; case x in x) case y in y) echo z;; esac;; esac; echo e",
+                "",
+            ),
+            ("$(echo mycase in a) b", "echo mycase in a", " b"),
+        ] {
+            let parsed = super::parse(word, &ParserOptions::default())?;
+            assert_matches!(
+                &parsed[0].piece,
+                WordPiece::CommandSubstitution(c) if c == command,
+                "{word}"
+            );
+            let tail: String = parsed[1..]
+                .iter()
+                .map(|p| match &p.piece {
+                    WordPiece::Text(t) => t.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(tail, rest, "{word}");
+        }
+        Ok(())
     }
 
     #[test]
