@@ -44,10 +44,13 @@ impl builtins::Command for ExecCommand {
             return Ok(ExecutionResult::success());
         }
 
-        // If we know we're already running in a subshell, then `exec`ing is actually
-        // unsafe, since it would also replace the *parent* shell instance. We instead
-        // delegate to the `command` builtin to perform the execution, with an expectation
-        // of returning.
+        // Native: if we know we're already running in a subshell, then `exec`ing is actually
+        // unsafe, since it would also replace the *parent* shell instance (a real, separate OS
+        // process on Unix). We instead delegate to the `command` builtin to perform the
+        // execution, with an expectation of returning. This concern does not apply on wasm32
+        // (see below): there is no real subshell process to protect either way, so ending the
+        // subshell's own call frame is exactly what a real exec would have done to it too.
+        #[cfg(not(target_arch = "wasm32"))]
         if context.shell.is_subshell() {
             if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
                 return brush_core::error::unimp("exec with options in subshell not yet supported");
@@ -61,9 +64,11 @@ impl builtins::Command for ExecCommand {
             return cmd_cmd.execute(context).await;
         }
 
-        // wasm32: there is no execve and no process image to replace. The command runs, and the
-        // shell then ends with its status, as it would once replaced. The EXIT trap does not run:
-        // it belonged to the shell that is gone.
+        // wasm32: there is no execve and no process image to replace, in a subshell or not. The
+        // command runs, and this call frame -- the whole shell, or just the subshell running it,
+        // which is its own clone (`shell.clone()` in interp.rs) and so has its own trap set --
+        // ends with its status, as replacing it would. The EXIT trap does not run: it belonged
+        // to the frame that is gone.
         #[cfg(target_arch = "wasm32")]
         {
             if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
