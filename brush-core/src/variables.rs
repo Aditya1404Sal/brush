@@ -67,6 +67,16 @@ impl DynamicState {
         }
     }
 
+    /// Marks `RANDOM`'s generator, if this is it, as belonging to a new subshell or process: bash
+    /// reseeds it there before its first value, so each subshell's sequence is its own.
+    pub(crate) fn enter_subshell(&self) {
+        if let Self::Random(generator) = self {
+            generator
+                .reseed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The next value of `RANDOM`, if this is its generator.
     pub(crate) fn next_random(&self) -> Option<u32> {
         match self {
@@ -97,11 +107,13 @@ pub(crate) fn epoch_seconds() -> i64 {
 
 /// Bash's generator for `RANDOM`: the Park-Miller minimal standard generator, folded to 15 bits,
 /// never giving the same value twice in a row. Assigning `RANDOM` seeds it, so a seeded sequence
-/// repeats exactly as bash's does.
+/// repeats exactly as bash's does; a subshell reseeds it before its first value, as bash does.
 #[derive(Debug)]
 pub(crate) struct RandomGenerator {
     state: std::sync::atomic::AtomicU32,
     last: std::sync::atomic::AtomicU32,
+    /// Whether to reseed before the next value (a subshell that has not seeded it).
+    reseed: std::sync::atomic::AtomicBool,
 }
 
 impl RandomGenerator {
@@ -110,6 +122,7 @@ impl RandomGenerator {
         Self {
             state: std::sync::atomic::AtomicU32::new(seed),
             last: std::sync::atomic::AtomicU32::new(0),
+            reseed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -119,11 +132,17 @@ impl RandomGenerator {
         self.state
             .store(seed as u32, std::sync::atomic::Ordering::Relaxed);
         self.last.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reseed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn next(&self) -> u32 {
         use std::sync::atomic::Ordering::Relaxed;
+        if self.reseed.swap(false, Relaxed) {
+            self.state.store(rand::random(), Relaxed);
+            self.last.store(0, Relaxed);
+        }
         let last = self.last.load(Relaxed);
         let mut state = self.state.load(Relaxed);
         let value = loop {
@@ -148,6 +167,10 @@ impl Clone for RandomGenerator {
         let generator = Self::new(self.state.load(std::sync::atomic::Ordering::Relaxed));
         generator.last.store(
             self.last.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        generator.reseed.store(
+            self.reseed.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
         generator

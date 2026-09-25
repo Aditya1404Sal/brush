@@ -251,7 +251,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
-        Self {
+        let shell = Self {
             execution_services: self.execution_services,
             error_formatter: self.error_formatter.clone(),
             traps: self.traps.clone(),
@@ -308,7 +308,12 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             last_background_pid: self.last_background_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
+        };
+        // A subshell reseeds RANDOM before its first value, as bash does.
+        if let Some((_, random)) = shell.env.get_raw("RANDOM") {
+            random.dynamic_state().enter_subshell();
         }
+        shell
     }
 }
 
