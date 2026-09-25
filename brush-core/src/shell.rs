@@ -185,6 +185,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     shell_pid: Option<crate::process_table::Pid>,
 
+    /// `$!`: the number of the last background job's last process, kept by subshells.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    last_background_pid: Option<crate::sys::process::ProcessId>,
+
     /// Registered processes for the stages of this background job's pipeline, in stage order.
     #[cfg(target_arch = "wasm32")]
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -237,6 +241,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             shell_pid: self.shell_pid,
+            last_background_pid: self.last_background_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
         }
@@ -270,6 +275,17 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// it.
     pub const fn set_shell_pid(&mut self, pid: crate::process_table::Pid) {
         self.shell_pid = Some(pid);
+    }
+
+    /// `$!`: the number of the last process started in the background, if any. Waiting for or
+    /// disowning the job does not change it.
+    pub const fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.last_background_pid
+    }
+
+    /// Records the last process started in the background, as `$!`.
+    pub const fn set_last_background_pid(&mut self, pid: crate::sys::process::ProcessId) {
+        self.last_background_pid = Some(pid);
     }
 
     /// This shell's `$$`: the session's shell number, or its own if it was started as a new

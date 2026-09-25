@@ -274,6 +274,10 @@ impl Execute for ast::CompoundList {
                 }
                 let job = spawn_async_ao_list_in_task(ao_list, shell, params);
                 let job_formatted = job.to_pid_style_string();
+                let last_pid = job.representative_pid();
+                if let Some(pid) = last_pid {
+                    shell.set_last_background_pid(pid);
+                }
 
                 if shell.options().interactive && !shell.is_subshell() {
                     writeln!(params.stderr(shell), "{job_formatted}")?;
@@ -2864,6 +2868,7 @@ fn start_persistent_output_substitutions(
         params.open_files.set_fd(OpenFiles::STDIN_FD, reader);
         let table = shell.processes().clone();
         let pid = table.allocate_substitution(shell.own_pid(), format!(">({})", substitution.list));
+        shell.set_last_background_pid(pid);
         let dispositions = process::Dispositions::from_traps(shell.traps()).for_exec();
         let numbered =
             process::NumberedProcess::register(&table, pid, dispositions).in_background();
