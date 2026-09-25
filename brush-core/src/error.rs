@@ -81,6 +81,15 @@ pub enum ErrorKind {
     #[error("failed to execute command '{0}': {1}")]
     FailedToExecuteCommand(String, #[source] std::io::Error),
 
+    /// A command named by a path cannot run, for the reason given (`No such file or directory`,
+    /// `Is a directory`), as the kernel's `execve` would say.
+    #[error("{0}: {1}")]
+    CannotExecutePath(String, &'static str),
+
+    /// A command resolved to a file, which this platform cannot run as a process.
+    #[error("{0}: executing files is unsupported in bash-tool")]
+    ExecutingFilesUnsupported(String),
+
     /// History item was not found.
     #[error("history item not found")]
     HistoryItemNotFound,
@@ -399,6 +408,9 @@ where
     }
 }
 
+/// `execve`'s reason for a path that names nothing.
+pub(crate) const NO_SUCH_FILE: &str = "No such file or directory";
+
 impl From<&ErrorKind> for results::ExecutionExitCode {
     fn from(value: &ErrorKind) -> Self {
         match value {
@@ -411,6 +423,10 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
+            ErrorKind::CannotExecutePath(_, reason) if *reason == NO_SUCH_FILE => Self::NotFound,
+            ErrorKind::CannotExecutePath(..) => Self::CannotExecute,
+            // Found but not run: bash's status for a file it cannot execute.
+            ErrorKind::ExecutingFilesUnsupported(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
             ErrorKind::BuiltinError(inner, ..) => inner.as_exit_code(),

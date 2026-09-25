@@ -704,6 +704,11 @@ pub(crate) fn execute_external_command(
                 sys::terminal::move_self_to_foreground()?;
             }
 
+            #[cfg(target_arch = "wasm32")]
+            if spawn_err.kind() == std::io::ErrorKind::Unsupported {
+                return Err(unexecutable(context.shell, context.command_name));
+            }
+
             if spawn_err.kind() == std::io::ErrorKind::NotFound {
                 if !context.shell.working_dir().exists() {
                     Err(
@@ -721,6 +726,24 @@ pub(crate) fn execute_external_command(
             }
         }
     }
+}
+
+/// Why command `name` cannot run on WASI, which cannot start processes: a path that names
+/// nothing or a directory fails as `execve` fails on it; a file is refused.
+#[cfg(target_arch = "wasm32")]
+fn unexecutable(shell: &Shell<impl extensions::ShellExtensions>, name: String) -> error::Error {
+    if !name.contains('/') {
+        return error::ErrorKind::ExecutingFilesUnsupported(name).into();
+    }
+    let path = shell.absolute_path(std::path::Path::new(&name));
+    match std::fs::metadata(&path) {
+        Err(_) => error::ErrorKind::CannotExecutePath(name, error::NO_SUCH_FILE),
+        Ok(metadata) if metadata.is_dir() => {
+            error::ErrorKind::CannotExecutePath(name, "Is a directory")
+        }
+        Ok(_) => error::ErrorKind::ExecutingFilesUnsupported(name),
+    }
+    .into()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
