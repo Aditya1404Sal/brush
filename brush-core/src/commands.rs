@@ -1365,7 +1365,14 @@ async fn run_substitution_command_in(
     command: String,
     backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    // Parse the string into a whole shell program.
+    // Parse the string into a whole shell program. Bash runs a `$( )` from its command printed
+    // back (see `brush_parser::print_comsub`), so its lines are numbered as that text has them;
+    // backquotes run as written.
+    let command = if backquoted {
+        command
+    } else {
+        brush_parser::reprint_comsub_text(&command, &shell.parser_options()).unwrap_or(command)
+    };
     let parse_result = shell.parse_string(command.as_str());
 
     // Check for a command that is only an input redirection ("< file").

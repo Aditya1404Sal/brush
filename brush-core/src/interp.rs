@@ -44,8 +44,8 @@ pub(crate) enum CommandString {
     /// A `-c` string: its last command is the end of the input only when nothing but blanks, a
     /// comment and one newline follow it.
     Script,
-    /// A `$( )` substitution, which bash runs from its re-printed text: it always ends with its
-    /// last command, and each of its commands is numbered on from the line before.
+    /// A `$( )` substitution, which bash runs from its command printed back, so it always ends
+    /// with its last command.
     Substitution,
     /// A backquoted substitution, which bash runs as written.
     Backquoted,
@@ -201,8 +201,26 @@ fn line_delta(to: usize, from: usize) -> isize {
     if to >= from { magnitude } else { -magnitude }
 }
 
+/// A process substitution's list as bash runs it: printed back from its parse (see
+/// `brush_parser::print_comsub_list`) and read again, so its commands are numbered as that text
+/// has them; `None` when that text does not parse.
+fn reprinted_list(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    list: &ast::CompoundList,
+) -> Option<ast::CompoundList> {
+    let text = brush_parser::print_comsub_list(list, &shell.parser_options());
+    let program = shell.parse_string(text).ok()?;
+    Some(ast::CompoundList(
+        program
+            .complete_commands
+            .into_iter()
+            .flat_map(|list| list.0)
+            .collect(),
+    ))
+}
+
 /// Numbers a process substitution's commands on from the line of the command it belongs to, as
-/// bash numbers those of its re-printed text; its first command is on that line.
+/// bash numbers those of its text printed back; its first command is on that line.
 fn number_substitution_list(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     list: &ast::CompoundList,
@@ -466,14 +484,9 @@ async fn execute_program(
         let input = shell.pending_input.take();
         // A command string's last command may run in place of the shell, as bash's does.
         let outer_no_fork = shell.no_fork;
-        let kind = shell.exec_last.take();
-        if let Some(kind) = kind {
+        if let Some(kind) = shell.exec_last.take() {
             shell.no_fork = NoFork::for_command_string(program_ast, kind, input.as_deref());
         }
-        // Bash runs a `$( )` from its re-printed text: its commands one to a line, without the
-        // blank lines and comments around them.
-        let reprinted = matches!(kind, Some(CommandString::Substitution));
-        let mut printed_line = 1;
         let mut next_input_line = 1;
         let mut quiet_lines: Option<std::collections::HashSet<usize>> = None;
 
@@ -501,15 +514,6 @@ async fn execute_program(
                 }
                 next_input_line = next_input_line.max(end + 1);
             }
-            let shift = match ast::SourceLocation::location(command) {
-                Some(span) if reprinted => {
-                    let shift = line_delta(printed_line, span.start.line);
-                    printed_line += span.end.line.saturating_sub(span.start.line) + 1;
-                    shift
-                }
-                _ => 0,
-            };
-            shell.shift_lines(shift);
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -521,7 +525,6 @@ async fn execute_program(
                     result = err.into_result(shell);
                 }
             }
-            shell.shift_lines(-shift);
 
             // Update status
             shell.set_last_exit_status(result.exit_code.into());
@@ -3997,14 +4000,13 @@ async fn setup_process_substitution(
 
     // Asynchronously spawn off the subshell; we intentionally don't block on its
     // completion.
-    let subshell_cmd = subshell_cmd.to_owned();
+    let list =
+        reprinted_list(shell, &subshell_cmd.list).unwrap_or_else(|| subshell_cmd.list.clone());
     tokio::spawn(async move {
-        subshell.no_fork = NoFork::for_last_command(&subshell_cmd.list, true);
+        subshell.no_fork = NoFork::for_last_command(&list, true);
+        number_substitution_list(&mut subshell, &list);
         // Intentionally ignore the result of the subshell command.
-        let _ = subshell_cmd
-            .list
-            .execute(&mut subshell, &child_params)
-            .await;
+        let _ = list.execute(&mut subshell, &child_params).await;
     });
 
     // Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
@@ -4067,7 +4069,8 @@ async fn setup_process_substitution(
         ast::ProcessSubstitutionKind::Write => {
             let (sink, input) = openfiles::memory_sink(openfiles::MAX_SUBSTITUTION_BYTES);
             params.output_substitutions.push(PendingOutputSubstitution {
-                list: subshell_cmd.list.clone(),
+                list: reprinted_list(shell, &subshell_cmd.list)
+                    .unwrap_or_else(|| subshell_cmd.list.clone()),
                 params: child_params,
                 input,
                 fd,
@@ -4329,6 +4332,8 @@ async fn run_substitution_list(
     // Bash reads the list one xtrace level deeper, as a command string whose last command may
     // run in place of the substitution's process.
     subshell.trace_level += 1;
+    let reprinted = reprinted_list(shell, list);
+    let list = reprinted.as_ref().unwrap_or(list);
     subshell.no_fork = NoFork::for_last_command(list, true);
     number_substitution_list(&mut subshell, list);
     let disposition = subshell.traps().pipe_disposition();
