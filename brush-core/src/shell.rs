@@ -540,6 +540,30 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             .set_current_pos(cmd.location().map(|span| span.start));
     }
 
+    /// Shifts the line numbers of the current frame by `delta` (see
+    /// [`crate::callstack::Frame::line_shift`]).
+    pub(crate) fn shift_lines(&mut self, delta: isize) {
+        self.call_stack.shift_lines(delta);
+    }
+
+    /// The position the current command is numbered by (see [`Self::set_current_position`]).
+    pub(crate) fn current_position(&self) -> Option<std::sync::Arc<crate::SourcePosition>> {
+        self.call_stack
+            .current_frame()
+            .and_then(|frame| frame.current.clone())
+    }
+
+    /// Numbers the current command by `position` (its `LINENO`, and the line its diagnostics
+    /// name), when known.
+    pub(crate) fn set_current_position(
+        &mut self,
+        position: Option<std::sync::Arc<crate::SourcePosition>>,
+    ) {
+        if position.is_some() {
+            self.call_stack.set_current_pos(position);
+        }
+    }
+
     /// Updates the `$_` shell variable (last-argument of the previous simple
     /// command).
     ///

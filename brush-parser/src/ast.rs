@@ -1855,8 +1855,19 @@ impl Node for IoRedirect {}
 
 impl SourceLocation for IoRedirect {
     fn location(&self) -> Option<SourceSpan> {
-        // TODO(source-location): complete
-        None
+        // Where the target is written on the command's line: a here-document's delimiter, not
+        // its body. The operator is not counted.
+        match self {
+            Self::File(_, _, target) | Self::NamedFd(_, _, target) => match target {
+                IoFileRedirectTarget::Filename(word) | IoFileRedirectTarget::Duplicate(word) => {
+                    word.location()
+                }
+                IoFileRedirectTarget::ProcessSubstitution(_, subshell) => subshell.location(),
+                IoFileRedirectTarget::Fd(_) => None,
+            },
+            Self::HereDocument(_, here_doc) => here_doc.here_end.location(),
+            Self::HereString(_, word) | Self::OutputAndError(word, _) => word.location(),
+        }
     }
 }
 

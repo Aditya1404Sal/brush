@@ -763,9 +763,13 @@ impl Spec {
 
         // Run the command.
         let params = shell.default_exec_params();
-        let output =
-            commands::invoke_command_in_subshell_and_get_output(&mut shell, &params, command_line)
-                .await?;
+        let output = commands::invoke_command_in_subshell_and_get_output(
+            &mut shell,
+            &params,
+            command_line,
+            false,
+        )
+        .await?;
 
         // Split results.
         let candidates = output.lines().map(str::to_owned).collect();

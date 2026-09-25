@@ -44,9 +44,11 @@ pub(crate) enum CommandString {
     /// A `-c` string: its last command is the end of the input only when nothing but blanks, a
     /// comment and one newline follow it.
     Script,
-    /// A command or process substitution, which bash reads back from its parsed text, so it
-    /// always ends with its last command.
+    /// A `$( )` substitution, which bash runs from its re-printed text: it always ends with its
+    /// last command, and each of its commands is numbered on from the line before.
     Substitution,
+    /// A backquoted substitution, which bash runs as written.
+    Backquoted,
 }
 
 impl NoFork {
@@ -65,7 +67,7 @@ impl NoFork {
                 return Self::default();
             }
         }
-        Self::for_last_command(list, matches!(kind, CommandString::Substitution))
+        Self::for_last_command(list, !matches!(kind, CommandString::Script))
     }
 
     /// The last command of `list`, a command string's or a function body's, as bash's
@@ -191,6 +193,25 @@ fn ends_input(input: &str, end: usize) -> bool {
             .is_none_or(|(_, after)| after.is_empty());
     }
     rest.is_empty() || rest == "\n"
+}
+
+/// How many lines `to` is past `from` (negative when before it).
+fn line_delta(to: usize, from: usize) -> isize {
+    let magnitude = isize::try_from(to.abs_diff(from)).unwrap_or(isize::MAX);
+    if to >= from { magnitude } else { -magnitude }
+}
+
+/// Numbers a process substitution's commands on from the line of the command it belongs to, as
+/// bash numbers those of its re-printed text; its first command is on that line.
+fn number_substitution_list(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    list: &ast::CompoundList,
+) {
+    let base = shell.current_position().map(|position| position.line);
+    let first = ast::SourceLocation::location(list).map(|span| span.start.line);
+    if let (Some(base), Some(first)) = (base, first) {
+        shell.shift_lines(line_delta(base, first));
+    }
 }
 
 /// Whether the traps allow bash to run a command without forking: none of `EXIT`, `ERR` or a
@@ -445,9 +466,14 @@ async fn execute_program(
         let input = shell.pending_input.take();
         // A command string's last command may run in place of the shell, as bash's does.
         let outer_no_fork = shell.no_fork;
-        if let Some(kind) = shell.exec_last.take() {
+        let kind = shell.exec_last.take();
+        if let Some(kind) = kind {
             shell.no_fork = NoFork::for_command_string(program_ast, kind, input.as_deref());
         }
+        // Bash runs a `$( )` from its re-printed text: its commands one to a line, without the
+        // blank lines and comments around them.
+        let reprinted = matches!(kind, Some(CommandString::Substitution));
+        let mut printed_line = 1;
         let mut next_input_line = 1;
         let mut quiet_lines: Option<std::collections::HashSet<usize>> = None;
 
@@ -475,6 +501,15 @@ async fn execute_program(
                 }
                 next_input_line = next_input_line.max(end + 1);
             }
+            let shift = match ast::SourceLocation::location(command) {
+                Some(span) if reprinted => {
+                    let shift = line_delta(printed_line, span.start.line);
+                    printed_line += span.end.line.saturating_sub(span.start.line) + 1;
+                    shift
+                }
+                _ => 0,
+            };
+            shell.shift_lines(shift);
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -486,6 +521,7 @@ async fn execute_program(
                     result = err.into_result(shell);
                 }
             }
+            shell.shift_lines(-shift);
 
             // Update status
             shell.set_last_exit_status(result.exit_code.into());
@@ -1439,8 +1475,38 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
             return Ok(ExecutionSpawnResult::Completed(ExecutionResult::success()));
         }
 
-        // Updates the shell with information about the currently executing command.
+        // Updates the shell with information about the currently executing command. Bash numbers
+        // a simple command by the line its first word (or assignment, or redirection) ends on,
+        // and `(( ))` and `[[ ]]` by their last line.
         pipeline_context.shell.set_current_cmd(self);
+        match self {
+            Self::Simple(simple) => {
+                let first = simple
+                    .prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.0.first())
+                    .and_then(ast::SourceLocation::location)
+                    .or_else(|| {
+                        simple
+                            .word_or_name
+                            .as_ref()
+                            .and_then(ast::SourceLocation::location)
+                    });
+                pipeline_context
+                    .shell
+                    .set_current_position(first.map(|span| span.end));
+            }
+            Self::Compound(
+                compound @ (ast::CompoundCommand::Arithmetic(_)
+                | ast::CompoundCommand::ExtendedTest(_)),
+                _,
+            ) => {
+                pipeline_context.shell.set_current_position(
+                    ast::SourceLocation::location(compound).map(|span| span.end),
+                );
+            }
+            _ => {}
+        }
 
         match self {
             Self::Simple(simple) => simple.execute_in_pipeline(pipeline_context, params).await,
@@ -1481,8 +1547,12 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 }
 
                 // Set up any additional redirects. One that fails fails the command, and the
-                // list goes on.
+                // list goes on. Bash names the line the command ends on.
                 if let Some(redirects) = redirects {
+                    let position = pipeline_context.shell.current_position();
+                    pipeline_context.shell.set_current_position(
+                        ast::SourceLocation::location(redirects).map(|span| span.end),
+                    );
                     for redirect in &redirects.0 {
                         if let Err(error) =
                             setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await
@@ -1492,6 +1562,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                             return Ok(ExecutionResult::general_error().into());
                         }
                     }
+                    pipeline_context.shell.set_current_position(position);
                     if redirects.0.iter().any(redirects_stdin) {
                         params.stdin_redirected = true;
                     }
@@ -3903,6 +3974,7 @@ async fn setup_process_substitution(
     // Execute in a subshell, read one xtrace level deeper, as bash does.
     let mut subshell = shell.clone();
     subshell.trace_level += 1;
+    number_substitution_list(&mut subshell, &subshell_cmd.list);
 
     // Set up execution parameters for the child execution.
     let mut child_params = params.clone();
@@ -4258,6 +4330,7 @@ async fn run_substitution_list(
     // run in place of the substitution's process.
     subshell.trace_level += 1;
     subshell.no_fork = NoFork::for_last_command(list, true);
+    number_substitution_list(&mut subshell, list);
     let disposition = subshell.traps().pipe_disposition();
     let body = async {
         let result = list.execute(&mut subshell, params).await;

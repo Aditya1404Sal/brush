@@ -173,6 +173,9 @@ pub struct Frame {
     pub args: Arc<Vec<String>>,
     /// Optionally, indicates an additional line offset within the current source context.
     pub current_line_offset: usize,
+    /// Lines added to (or taken from) the current line: bash numbers the commands of a command
+    /// substitution by its re-printed text, one line for each of its commands.
+    pub(crate) line_shift: isize,
 }
 
 impl Frame {
@@ -207,10 +210,12 @@ impl Frame {
             pos.cloned()
         };
 
-        if self.current_line_offset > 0 {
+        if self.current_line_offset > 0 || self.line_shift != 0 {
             new_start = if let Some(new_start) = new_start {
                 let mut pos = (*new_start).clone();
-                pos.line += self.current_line_offset;
+                pos.line = (pos.line + self.current_line_offset)
+                    .checked_add_signed(self.line_shift)
+                    .unwrap_or(1);
 
                 Some(Arc::new(pos))
             } else {
@@ -235,7 +240,12 @@ impl Frame {
 
         // A source that starts at line 0 (a function imported from the environment) numbers its
         // lines from 0, as bash does.
-        Some((start_line + current_line + self.current_line_offset).saturating_sub(1))
+        Some(
+            (start_line + current_line + self.current_line_offset)
+                .checked_add_signed(self.line_shift)
+                .unwrap_or(0)
+                .saturating_sub(1),
+        )
     }
 
     /// Returns the current line number, relative to the frame's entry.
@@ -446,6 +456,13 @@ impl CallStack {
         frame.current_line_offset += delta;
     }
 
+    /// Shifts the line numbers of the top stack frame by `delta` (see [`Frame::line_shift`]).
+    pub(crate) fn shift_lines(&mut self, delta: isize) {
+        if let Some(frame) = self.frames.front_mut() {
+            frame.line_shift += delta;
+        }
+    }
+
     /// Undoes [`Self::increment_current_line_offset`].
     pub(crate) fn decrement_current_line_offset(&mut self, delta: usize) {
         if let Some(frame) = self.frames.front_mut() {
@@ -474,6 +491,7 @@ impl CallStack {
             args: Arc::new(args.into_iter().collect()),
             source_info: source_info.to_owned(),
             current_line_offset: 0,
+            line_shift: 0,
             current: None, // TODO(source-info): fill this out
             entry: None,   // TODO(source-info): fill this out
         });
@@ -502,6 +520,7 @@ impl CallStack {
             args: Arc::default(),
             source_info,
             current_line_offset: 0,
+            line_shift: 0,
             current: None, // TODO(source-info): fill this out
             entry: None,   // TODO(source-info): fill this out
         });
@@ -516,6 +535,7 @@ impl CallStack {
             args: Arc::default(),
             source_info: crate::SourceInfo::from("eval"), // TODO(source-info): fill this out
             current_line_offset: 0,
+            line_shift: 0,
             current: None, // TODO(source-info): fill this out
             entry: None,   // TODO(source-info): fill this out
         });
@@ -533,6 +553,7 @@ impl CallStack {
             args: Arc::default(),
             source_info: crate::SourceInfo::from(shell_name),
             current_line_offset: 0,
+            line_shift: 0,
             current: None, // TODO(source-info): fill this out
             entry: None,   // TODO(source-info): fill this out
         });
@@ -544,6 +565,7 @@ impl CallStack {
             frame_type: FrameType::InteractiveSession,
             args: Arc::default(),
             current_line_offset: 0,
+            line_shift: 0,
             source_info: crate::SourceInfo::from("main"),
             current: None, // TODO(source-info): fill this out
             entry: None,   // TODO(source-info): fill this out
@@ -573,6 +595,7 @@ impl CallStack {
             entry: function.definition().location().map(|span| span.start),
             current: None, // TODO(source-info): fill this out
             current_line_offset: 0,
+            line_shift: 0,
         });
 
         self.func_call_depth += 1;

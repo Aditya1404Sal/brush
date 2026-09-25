@@ -1007,11 +1007,17 @@ pub(crate) async fn invoke_shell_function(
     // A call bash would have run without forking runs the body's last command that way.
     let no_fork_call = std::mem::take(&mut context.shell.no_fork_call);
 
-    // Apply any redirects specified at function definition-time.
+    // Apply any redirects specified at function definition-time. Bash names the line the body
+    // starts on when one fails.
     if let Some(redirects) = redirects {
+        let position = context.shell.current_position();
+        context
+            .shell
+            .set_current_position(ast::SourceLocation::location(body).map(|span| span.start));
         for redirect in &redirects.0 {
             interp::setup_redirect(context.shell, &mut context.params, redirect).await?;
         }
+        context.shell.set_current_position(position);
         if redirects.0.iter().any(interp::redirects_stdin) {
             context.params.stdin_redirected = true;
         }
@@ -1051,12 +1057,14 @@ pub(crate) async fn invoke_shell_function(
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
         let result = body.execute(frame.shell(), &context.params).await;
+        let result = report_in_function(frame.shell(), &context.params, result);
         frame.finish()?;
         result
     };
     #[cfg(not(any(target_arch = "wasm32", test)))]
     let result = {
         let result = body.execute(context.shell, &context.params).await;
+        let result = report_in_function(context.shell, &context.params, result);
         context.shell.leave_function()?;
         result
     };
@@ -1101,10 +1109,28 @@ pub(crate) async fn invoke_shell_function(
     Ok(result.into())
 }
 
+/// Reports an error that leaves a function body while the body's line is still current, as bash
+/// reports it where it happens (an arithmetic error in `$(( ))` abandons the whole command, but
+/// names the body's line, not the call's).
+fn report_in_function(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    result: Result<ExecutionResult, error::Error>,
+) -> Result<ExecutionResult, error::Error> {
+    match result {
+        Err(error) if !error.is_reported() => {
+            let _ = shell.display_error(&mut params.stderr(shell), &error);
+            Err(error.into_reported())
+        }
+        result => result,
+    }
+}
+
 pub(crate) async fn invoke_command_in_subshell_and_get_output(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
     s: String,
+    backquoted: bool,
 ) -> Result<String, error::Error> {
     // Instantiate a subshell to run the command in.
     let mut subshell = shell.clone();
@@ -1141,7 +1167,9 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
             let completed = std::cell::Cell::new(false);
             let result = numbered
                 .run(async {
-                    let result = run_wasm_substitution_command(&mut subshell, &mut params, s).await;
+                    let result =
+                        run_wasm_substitution_command(&mut subshell, &mut params, s, backquoted)
+                            .await;
                     let result = subshell.exit_with_trap_in(result, &params).await;
                     completed.set(true);
                     result
@@ -1190,7 +1218,8 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
         let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
 
-        let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
+        let cmd_join_handle =
+            tokio::spawn(run_substitution_command(subshell, params, s, backquoted));
 
         let output_str = async_reader.read_to_string().await?;
 
@@ -1315,8 +1344,9 @@ async fn run_wasm_substitution_command(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &mut ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    run_substitution_command_in(shell, params, command).await
+    run_substitution_command_in(shell, params, command, backquoted).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1324,14 +1354,16 @@ async fn run_substitution_command(
     mut shell: Shell<impl extensions::ShellExtensions>,
     mut params: ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    run_substitution_command_in(&mut shell, &mut params, command).await
+    run_substitution_command_in(&mut shell, &mut params, command, backquoted).await
 }
 
 async fn run_substitution_command_in(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &mut ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
     // Parse the string into a whole shell program.
     let parse_result = shell.parse_string(command.as_str());
@@ -1362,7 +1394,11 @@ async fn run_substitution_command_in(
     shell.begin_nested_code();
 
     // Its last command may run in place of the substitution's process, as bash's does.
-    shell.exec_last = Some(interp::CommandString::Substitution);
+    shell.exec_last = Some(if backquoted {
+        interp::CommandString::Backquoted
+    } else {
+        interp::CommandString::Substitution
+    });
 
     // Handle the parse result using default shell behavior.
     let result = shell

@@ -1284,30 +1284,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::WordPiece::ParameterExpansion(p) => {
                 self.expand_parameter_expr(p).await?
             }
-            brush_parser::word::WordPiece::BackquotedCommandSubstitution(s)
-            | brush_parser::word::WordPiece::CommandSubstitution(s) => {
-                let mut cmd_output = if !self.disable_command_substitutions {
-                    commands::invoke_command_in_subshell_and_get_output(self.shell, self.params, s)
-                        .await?
-                } else {
-                    String::new()
-                };
-
-                // Strips null bytes from command substitution output for compatibility.
-                if cmd_output.contains('\0') {
-                    writeln!(
-                        self.params.stderr(self.shell),
-                        "{}warning: command substitution: ignored null byte in input",
-                        self.shell.diagnostic_prefix(),
-                    )?;
-                    cmd_output.retain(|c| c != '\0');
-                }
-
-                // We trim trailing newlines, per spec.
-                let trimmed_len = cmd_output.trim_end_matches('\n').len();
-                cmd_output.truncate(trimmed_len);
-
-                Expansion::from(ExpansionPiece::Splittable(cmd_output))
+            brush_parser::word::WordPiece::BackquotedCommandSubstitution(s) => {
+                self.expand_command_substitution(s, true).await?
+            }
+            brush_parser::word::WordPiece::CommandSubstitution(s) => {
+                self.expand_command_substitution(s, false).await?
             }
             brush_parser::word::WordPiece::ProcessSubstitution(kind, command) => {
                 let path = if self.disable_command_substitutions {
@@ -2592,6 +2573,41 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
         }
+    }
+
+    /// Expands a command substitution, `$( )` or (when `backquoted`) `` ` ` ``, to its output.
+    async fn expand_command_substitution(
+        &mut self,
+        s: String,
+        backquoted: bool,
+    ) -> Result<Expansion, error::Error> {
+        let mut cmd_output = if !self.disable_command_substitutions {
+            commands::invoke_command_in_subshell_and_get_output(
+                self.shell,
+                self.params,
+                s,
+                backquoted,
+            )
+            .await?
+        } else {
+            String::new()
+        };
+
+        // Strips null bytes from command substitution output for compatibility.
+        if cmd_output.contains('\0') {
+            writeln!(
+                self.params.stderr(self.shell),
+                "{}warning: command substitution: ignored null byte in input",
+                self.shell.diagnostic_prefix(),
+            )?;
+            cmd_output.retain(|c| c != '\0');
+        }
+
+        // We trim trailing newlines, per spec.
+        let trimmed_len = cmd_output.trim_end_matches('\n').len();
+        cmd_output.truncate(trimmed_len);
+
+        Ok(Expansion::from(ExpansionPiece::Splittable(cmd_output)))
     }
 
     /// Warns twice of an element of a circular name reference (`local -n v=v; ${v[0]}`), as
