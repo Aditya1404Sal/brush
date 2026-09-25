@@ -7,6 +7,160 @@ use crate::{SourceSpan, tokenizer};
 
 const DISPLAY_INDENT: &str = "    ";
 
+thread_local! {
+    /// How many words are being displayed (see [`Verbatim`]).
+    static VERBATIM_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// How many levels of indentation the text being displayed is at (see [`Indented`]).
+    static INDENT_LEVEL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// The here-documents whose operators a command list has displayed and whose bodies it has
+    /// yet to write (see [`write_here_doc_bodies`]); `None` when no command list is being
+    /// displayed.
+    static PENDING_HERE_DOCS: std::cell::RefCell<Option<Vec<IoHereDocument>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Whether here-document bodies were written since the last redirection or separator that
+    /// took note of them (see [`take_after_here_doc`]).
+    static AFTER_HERE_DOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the text displayed while it lives as a word's own text, which [`Indented`] copies
+/// verbatim.
+struct Verbatim;
+
+impl Verbatim {
+    fn enter() -> Self {
+        VERBATIM_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for Verbatim {
+    fn drop(&mut self) {
+        VERBATIM_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Indents each line written through it by one level, except the lines of a word's own text: a
+/// newline inside a quoted string, a command substitution or a here-document body is part of the
+/// value, and indenting the line after it would change the value (and hide a here-document's
+/// delimiter from the shell that reads the text back).
+struct Indented<'a, 'b> {
+    inner: &'a mut std::fmt::Formatter<'b>,
+    needs_indent: bool,
+}
+
+fn indented<'a, 'b>(inner: &'a mut std::fmt::Formatter<'b>) -> Indented<'a, 'b> {
+    INDENT_LEVEL.with(|level| level.set(level.get() + 1));
+    Indented {
+        inner,
+        needs_indent: true,
+    }
+}
+
+impl Drop for Indented<'_, '_> {
+    fn drop(&mut self) {
+        INDENT_LEVEL.with(|level| level.set(level.get().saturating_sub(1)));
+    }
+}
+
+impl Write for Indented<'_, '_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let verbatim = VERBATIM_DEPTH.with(|depth| depth.get() > 0);
+        for (i, line) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.inner.write_char('\n')?;
+                self.needs_indent = !verbatim;
+            }
+            // Don't indent a line with nothing on it.
+            if line.is_empty() {
+                continue;
+            }
+            if self.needs_indent {
+                self.inner.write_str(DISPLAY_INDENT)?;
+                self.needs_indent = false;
+            }
+            self.inner.write_str(line)?;
+        }
+        Ok(())
+    }
+}
+
+/// Starts holding back here-document bodies while a command list is displayed, so each is
+/// written at the end of its command's line, as bash writes a function. The guard returned
+/// knows whether this is the outermost list, which writes any bodies still held at its end.
+fn hold_here_doc_bodies() -> HereDocBodies {
+    PENDING_HERE_DOCS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        let outermost = pending.is_none();
+        if outermost {
+            *pending = Some(vec![]);
+            AFTER_HERE_DOC.with(|after| after.set(false));
+        }
+        HereDocBodies { outermost }
+    })
+}
+
+/// Stops holding back here-document bodies when the outermost list's display ends.
+struct HereDocBodies {
+    outermost: bool,
+}
+
+impl Drop for HereDocBodies {
+    fn drop(&mut self) {
+        if self.outermost {
+            PENDING_HERE_DOCS.with(|pending| *pending.borrow_mut() = None);
+            AFTER_HERE_DOC.with(|after| after.set(false));
+        }
+    }
+}
+
+/// Writes the bodies of the here-documents whose operators were displayed since the last call:
+/// a newline, then each body followed by its delimiter and a newline. Returns whether there were
+/// any.
+fn write_here_doc_bodies(f: &mut std::fmt::Formatter<'_>) -> Result<bool, std::fmt::Error> {
+    let docs = PENDING_HERE_DOCS.with(|pending| {
+        pending
+            .borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    });
+    if docs.is_empty() {
+        return Ok(false);
+    }
+    let _verbatim = Verbatim::enter();
+    for doc in &docs {
+        write!(f, "\n{}{}", doc.doc, doc.delimiter())?;
+    }
+    writeln!(f)?;
+    AFTER_HERE_DOC.with(|after| after.set(true));
+    Ok(true)
+}
+
+/// Returns whether here-document bodies were written since the last redirection or separator
+/// that took note of them, and takes note. Bash leaves the `;` out after the command that
+/// follows a here-document, and writes a condition's `then` or `do` on its own indented line.
+fn take_after_here_doc() -> bool {
+    AFTER_HERE_DOC.with(std::cell::Cell::take)
+}
+
+/// Ends a condition before its `then` or `do`, as bash does: `; ` normally, or the indentation
+/// of the line after here-document bodies (which bash, writing them, also puts after the `;`
+/// that follows the first command after a here-document).
+fn write_condition_end(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    if !write_here_doc_bodies(f)? {
+        write!(f, ";")?;
+    }
+    if take_after_here_doc() {
+        let level = INDENT_LEVEL.with(std::cell::Cell::get);
+        write!(f, "{}", DISPLAY_INDENT.repeat(level))
+    } else {
+        write!(f, " ")
+    }
+}
+
 /// Trait implemented by all AST nodes. Used to aggregate traits expected
 /// to be implemented.
 pub trait Node: Display + SourceLocation {}
@@ -248,10 +402,16 @@ impl SourceLocation for AndOr {
 
 impl Display for AndOr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::And(pipeline) => write!(f, " && {pipeline}"),
-            Self::Or(pipeline) => write!(f, " || {pipeline}"),
+        let (operator, pipeline) = match self {
+            Self::And(pipeline) => ("&&", pipeline),
+            Self::Or(pipeline) => ("||", pipeline),
+        };
+        // The bodies of here-documents in the pipeline before follow the operator.
+        write!(f, " {operator} ")?;
+        if write_here_doc_bodies(f)? {
+            write!(f, " ")?;
         }
+        write!(f, "{pipeline}")
     }
 }
 
@@ -350,7 +510,12 @@ impl Display for Pipeline {
         }
         for (i, command) in self.seq.iter().enumerate() {
             if i > 0 {
+                // The bodies of here-documents in the command before follow the `|`.
                 write!(f, " |")?;
+                if write_here_doc_bodies(f)? {
+                    write!(f, " ")?;
+                }
+                write!(f, " ")?;
             }
             write!(f, "{command}")?;
         }
@@ -523,7 +688,7 @@ impl SourceLocation for ArithmeticCommand {
 
 impl Display for ArithmeticCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "(({}))", self.expr)
+        write!(f, "(( {} ))", self.expr)
     }
 }
 
@@ -553,6 +718,7 @@ impl Display for SubshellCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "( ")?;
         write!(f, "{}", self.list)?;
+        write_here_doc_bodies(f)?;
         write!(f, " )")
     }
 }
@@ -733,7 +899,7 @@ impl Display for CaseClauseCommand {
         // Note the trailing space, which the shell emits when printing a case clause.
         write!(f, "case {} in ", self.value)?;
         for case in &self.cases {
-            write!(indenter::indented(f).with_str(DISPLAY_INDENT), "{case}")?;
+            write!(indented(f), "{case}")?;
         }
         writeln!(f)?;
         write!(f, "esac")
@@ -772,27 +938,59 @@ impl CompoundList {
         TerminatedCompoundList(self)
     }
 
+    /// Displays the list on one line, its commands separated by `; `, the way bash prints the
+    /// list inside a process substitution.
+    fn one_line(&self) -> impl Display + '_ {
+        OneLineCompoundList(self)
+    }
+
     fn fmt_items(
         &self,
         f: &mut std::fmt::Formatter<'_>,
         keep_trailing_separator: bool,
+        one_line: bool,
     ) -> std::fmt::Result {
+        let here_doc_bodies = hold_here_doc_bodies();
+
         for (i, item) in self.0.iter().enumerate() {
-            if i > 0 {
-                writeln!(f)?;
+            // An item after a `&` follows it on the same line, as bash writes it.
+            if i > 0 && !matches!(self.0[i - 1].1, SeparatorOperator::Async) {
+                if one_line {
+                    write!(f, " ")?;
+                } else {
+                    writeln!(f)?;
+                }
             }
 
             // Write the and-or list.
             write!(f, "{}", item.0)?;
 
             // Write the separator... unless we're on the last list item and it's a ';'
-            // that the enclosing construct doesn't want.
-            if keep_trailing_separator
-                || i < self.0.len() - 1
-                || !matches!(item.1, SeparatorOperator::Sequence)
-            {
-                write!(f, "{}", item.1)?;
+            // that the enclosing construct doesn't want. The bodies of the item's
+            // here-documents end its line, in place of a `;`; the last item's, when the
+            // construct doesn't want a `;`, are left for it to write before its closing word.
+            let last = i == self.0.len() - 1;
+            match item.1 {
+                SeparatorOperator::Async => {
+                    write!(f, " {}", item.1)?;
+                    let wrote_bodies = write_here_doc_bodies(f)?;
+                    if !last {
+                        write!(f, "{}", if wrote_bodies { "  " } else { " " })?;
+                    }
+                }
+                SeparatorOperator::Sequence => {
+                    if (keep_trailing_separator || !last)
+                        && !write_here_doc_bodies(f)?
+                        && !take_after_here_doc()
+                    {
+                        write!(f, "{}", item.1)?;
+                    }
+                }
             }
+        }
+
+        if here_doc_bodies.outermost {
+            write_here_doc_bodies(f)?;
         }
 
         Ok(())
@@ -801,7 +999,7 @@ impl CompoundList {
 
 impl Display for CompoundList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_items(f, false)
+        self.fmt_items(f, false, false)
     }
 }
 
@@ -809,7 +1007,15 @@ struct TerminatedCompoundList<'a>(&'a CompoundList);
 
 impl Display for TerminatedCompoundList<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt_items(f, true)
+        self.0.fmt_items(f, true, false)
+    }
+}
+
+struct OneLineCompoundList<'a>(&'a CompoundList);
+
+impl Display for OneLineCompoundList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt_items(f, false, true)
     }
 }
 
@@ -871,12 +1077,10 @@ impl SourceLocation for IfClauseCommand {
 
 impl Display for IfClauseCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "if {}; then", self.condition)?;
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.then.terminated()
-        )?;
+        write!(f, "if {}", self.condition)?;
+        write_condition_end(f)?;
+        writeln!(f, "then")?;
+        write!(indented(f), "{}", self.then.terminated())?;
         if let Some(elses) = &self.elses {
             for else_clause in elses {
                 write!(f, "{else_clause}")?;
@@ -912,16 +1116,14 @@ impl Display for ElseClause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f)?;
         if let Some(condition) = &self.condition {
-            writeln!(f, "elif {condition}; then")?;
+            write!(f, "elif {condition}")?;
+            write_condition_end(f)?;
+            writeln!(f, "then")?;
         } else {
             writeln!(f, "else")?;
         }
 
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.body.terminated()
-        )
+        write!(indented(f), "{}", self.body.terminated())
     }
 }
 
@@ -1004,8 +1206,9 @@ impl Display for CaseItem {
         writeln!(f, ")")?;
 
         if let Some(cmd) = &self.cmd {
-            write!(indenter::indented(f).with_str(DISPLAY_INDENT), "{cmd}")?;
+            write!(indented(f), "{cmd}")?;
         }
+        write_here_doc_bodies(f)?;
         writeln!(f)?;
         write!(f, "{}", self.post_action)
     }
@@ -1058,7 +1261,9 @@ impl SourceLocation for WhileOrUntilClauseCommand {
 
 impl Display for WhileOrUntilClauseCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}; {}", self.0, self.1)
+        write!(f, "{}", self.0)?;
+        write_condition_end(f)?;
+        write!(f, "{}", self.1)
     }
 }
 
@@ -1165,11 +1370,8 @@ impl SourceLocation for BraceGroupCommand {
 impl Display for BraceGroupCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{{ ")?;
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.list
-        )?;
+        write!(indented(f), "{}", self.list)?;
+        write_here_doc_bodies(f)?;
         writeln!(f)?;
         write!(f, "}}")?;
 
@@ -1194,11 +1396,7 @@ pub struct DoGroupCommand {
 impl Display for DoGroupCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "do")?;
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.list.terminated()
-        )?;
+        write!(indented(f), "{}", self.list.terminated())?;
         writeln!(f)?;
         write!(f, "done")
     }
@@ -1416,7 +1614,7 @@ impl Display for CommandPrefixOrSuffixItem {
             Self::Word(word) => write!(f, "{word}"),
             Self::AssignmentWord(_assignment, word) => write!(f, "{word}"),
             Self::ProcessSubstitution(kind, subshell_command) => {
-                write!(f, "{kind}({subshell_command})")
+                write!(f, "{kind}({})", subshell_command.list.one_line())
             }
         }
     }
@@ -1571,7 +1769,7 @@ impl SourceLocation for RedirectList {
 impl Display for RedirectList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for item in &self.0 {
-            write!(f, "{item}")?;
+            write!(f, " {item}")?;
         }
         Ok(())
     }
@@ -1612,14 +1810,35 @@ impl SourceLocation for IoRedirect {
 
 impl Display for IoRedirect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // As in bash, a command's redirections end what here-document bodies written before it
+        // do to the separator after it (see `take_after_here_doc`).
+        AFTER_HERE_DOC.with(|after| after.set(false));
         match self {
-            Self::File(fd_num, kind, target) => {
-                if let Some(fd_num) = fd_num {
-                    write!(f, "{fd_num}")?;
+            Self::File(fd_num, kind, target) => match kind {
+                // As bash writes a duplication: with its descriptor, and no space (`2>&1`,
+                // `1>&2`, `0<&3`).
+                IoFileRedirectKind::DuplicateInput => {
+                    write!(f, "{}{kind}{target}", fd_num.unwrap_or(0))?;
                 }
-
-                write!(f, "{kind} {target}")?;
-            }
+                IoFileRedirectKind::DuplicateOutput => {
+                    write!(f, "{}{kind}{target}", fd_num.unwrap_or(1))?;
+                }
+                // The descriptor a redirection uses by default is left out, as bash leaves it out.
+                IoFileRedirectKind::Read | IoFileRedirectKind::ReadAndWrite => {
+                    if let Some(fd_num) = fd_num.filter(|fd| *fd != 0) {
+                        write!(f, "{fd_num}")?;
+                    }
+                    write!(f, "{kind} {target}")?;
+                }
+                IoFileRedirectKind::Write
+                | IoFileRedirectKind::Append
+                | IoFileRedirectKind::Clobber => {
+                    if let Some(fd_num) = fd_num.filter(|fd| *fd != 1) {
+                        write!(f, "{fd_num}")?;
+                    }
+                    write!(f, "{kind} {target}")?;
+                }
+            },
             Self::NamedFd(variable, kind, target) => {
                 write!(f, "{{{variable}}}{kind} {target}")?;
             }
@@ -1631,14 +1850,14 @@ impl Display for IoRedirect {
                 write!(f, " {target}")?;
             }
             Self::HereDocument(fd_num, here_doc) => {
-                if let Some(fd_num) = fd_num {
+                if let Some(fd_num) = fd_num.filter(|fd| *fd != 0) {
                     write!(f, "{fd_num}")?;
                 }
 
                 write!(f, "<<{here_doc}")?;
             }
             Self::HereString(fd_num, s) => {
-                if let Some(fd_num) = fd_num {
+                if let Some(fd_num) = fd_num.filter(|fd| *fd != 0) {
                     write!(f, "{fd_num}")?;
                 }
 
@@ -1715,7 +1934,7 @@ impl Display for IoFileRedirectTarget {
             Self::Filename(word) => write!(f, "{word}"),
             Self::Fd(fd) => write!(f, "{fd}"),
             Self::ProcessSubstitution(kind, subshell_command) => {
-                write!(f, "{kind}{subshell_command}")
+                write!(f, "{kind}({})", subshell_command.list.one_line())
             }
             Self::Duplicate(word) => write!(f, "{word}"),
         }
@@ -1757,15 +1976,44 @@ impl SourceLocation for IoHereDocument {
     }
 }
 
+impl IoHereDocument {
+    /// The line that ends the here-document: its delimiter with any quoting removed.
+    fn delimiter(&self) -> std::borrow::Cow<'_, str> {
+        if self.here_end.value.contains(['\'', '"', '\\']) {
+            tokenizer::unquote_str(&self.here_end.value).into()
+        } else {
+            self.here_end.value.as_str().into()
+        }
+    }
+}
+
 impl Display for IoHereDocument {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.remove_tabs {
             write!(f, "-")?;
         }
 
-        writeln!(f, "{}", self.here_end)?;
-        write!(f, "{}", self.doc)?;
-        writeln!(f, "{}", self.here_end)?;
+        // A quoted delimiter is written single-quoted, as bash writes it.
+        let delimiter = self.delimiter();
+        if self.here_end.value.contains(['\'', '"', '\\']) {
+            write!(f, "'{}'", delimiter.replace('\'', "'\\''"))?;
+        } else {
+            write!(f, "{delimiter}")?;
+        }
+
+        // Inside a command list, the body waits for the end of the command's line; elsewhere
+        // it follows at once.
+        let held = PENDING_HERE_DOCS.with(|pending| {
+            pending
+                .borrow_mut()
+                .as_mut()
+                .map(|docs| docs.push(self.clone()))
+                .is_some()
+        });
+        if !held {
+            let _verbatim = Verbatim::enter();
+            write!(f, "\n{}{delimiter}\n", self.doc)?;
+        }
 
         Ok(())
     }
@@ -2079,6 +2327,8 @@ impl SourceLocation for Word {
 
 impl Display for Word {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A word's text is written as it is, newlines and all (see `Indented`).
+        let _verbatim = Verbatim::enter();
         write!(f, "{}", self.value)
     }
 }
@@ -2445,6 +2695,27 @@ mod tests {
         let reader = BufReader::new(input.as_bytes());
         let mut parser = crate::Parser::new(reader, &ParserOptions::default());
         parser.parse_program().unwrap()
+    }
+
+    /// The function the program defines, as `declare -f` shows it.
+    fn function_text(program: &Program) -> String {
+        let item = &program.complete_commands[0].0[0];
+        let Command::Function(function) = &item.0.first.seq[0] else {
+            panic!("not a function definition");
+        };
+        function.to_string()
+    }
+
+    #[test]
+    fn function_display_keeps_here_documents_and_multiline_words_whole() {
+        // As bash prints it: a here-document's header stays with its command, its body and
+        // delimiter follow the command's line unindented, and a word's own lines are not
+        // indented either. The text reads back as the same function.
+        let source = "build() {\n  cat <<EOF > \"$1\" 2>&1\nconfig for $1\n\tEOF\nEOF\n  echo \"multi\nline\" | cat <<'Q' >&2\nq $x\nQ\n  if cat <<-A; then x=$(cat <<B\nin\nB\n); fi\n\t\ta\n\tA\n}\n";
+        let expected = "build () \n{ \n    cat <<EOF > \"$1\" 2>&1\nconfig for $1\n\tEOF\nEOF\n\n    echo \"multi\nline\" | cat <<'Q' 1>&2\nq $x\nQ\n\n    if cat <<-A\na\nA\n    then\n        x=$(cat <<B\nin\nB\n);\n    fi\n}";
+        let shown = function_text(&parse(source));
+        assert_eq!(shown, expected);
+        assert_eq!(function_text(&parse(&shown)), expected);
     }
 
     #[test]
