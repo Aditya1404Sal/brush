@@ -454,9 +454,10 @@ impl Error {
 
     /// Whether the error abandons the rest of the top-level command, as assigning to a
     /// readonly variable does in bash: it passes through function calls rather than becoming
-    /// the call's status.
+    /// the call's status. Only an assignment statement does this, and it reports the error
+    /// where it happens; a builtin or a loop that cannot assign the variable just fails.
     pub const fn abandons_command(&self) -> bool {
-        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_))
+        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported
     }
 
     /// The reason a path could not be used, as the system words it ("No such file or

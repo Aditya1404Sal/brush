@@ -1133,14 +1133,20 @@ impl Execute for ast::ForClauseCommand {
                 {
                     var.assign(ShellValueLiteral::Scalar(value), false)?;
                 }
-            } else {
-                shell.env_mut().update_or_add(
-                    &self.variable_name,
-                    ShellValueLiteral::Scalar(value),
-                    |_| Ok(()),
-                    EnvironmentLookup::Anywhere,
-                    EnvironmentScope::Global,
-                )?;
+            } else if let Err(error) = shell.env_mut().update_or_add(
+                &self.variable_name,
+                ShellValueLiteral::Scalar(value),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            ) {
+                // A readonly control variable fails the loop, and the list goes on.
+                if !matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) {
+                    return Err(error);
+                }
+                let _ = shell.display_error(&mut params.stderr(shell), &error);
+                result = ExecutionResult::general_error();
+                break;
             }
 
             shell.loop_depth += 1;
@@ -1581,9 +1587,25 @@ impl Execute for ast::FunctionDefinition {
     async fn execute(
         &self,
         shell: &mut Shell<impl extensions::ShellExtensions>,
-        _params: &ExecutionParameters,
+        params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let func_name = self.fname.value.clone();
+
+        // A readonly function (`readonly -f`) keeps its definition.
+        if shell
+            .funcs()
+            .get(&func_name)
+            .is_some_and(|f| f.is_readonly())
+        {
+            writeln!(
+                params.stderr(shell),
+                "{}{func_name}: readonly function",
+                shell.diagnostic_prefix()
+            )?;
+            let result = ExecutionResult::general_error();
+            shell.set_last_exit_status(result.exit_code.into());
+            return Ok(result);
+        }
 
         // In POSIX mode, function names can't shadow special builtins.
         if shell.options().posix_mode
@@ -1864,7 +1886,7 @@ async fn execute_command<T: Into<String>>(
 
     for assignment in assignments {
         // Ensure it's tagged as exported and created in the command scope.
-        apply_assignment(
+        match apply_assignment(
             assignment,
             guard.shell(),
             &params,
@@ -1872,7 +1894,12 @@ async fn execute_command<T: Into<String>>(
             Some(EnvironmentScope::Command),
             EnvironmentScope::Command,
         )
-        .await?;
+        .await
+        {
+            // A readonly variable keeps its value: bash reports it and still runs the command.
+            Err(error) if error.abandons_command() => (),
+            result => result?,
+        }
     }
 
     if guard.shell().options().print_commands_and_arguments {
@@ -2207,6 +2234,11 @@ async fn apply_assignment_unchecked(
 
             // That's it!
             return Ok(());
+        }
+
+        // A command's own assignment cannot shadow a readonly variable either.
+        if existing_value.is_readonly() {
+            return Err(error::ErrorKind::ReadonlyVariable.into());
         }
     }
 

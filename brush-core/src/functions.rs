@@ -69,6 +69,8 @@ pub struct Registration {
     source_info: crate::SourceInfo,
     /// Whether or not this function definition should be exported to children.
     exported: bool,
+    /// Whether the function is readonly (`readonly -f`): it cannot be redefined or unset.
+    readonly: bool,
 }
 
 impl From<brush_parser::ast::FunctionDefinition> for Registration {
@@ -77,6 +79,7 @@ impl From<brush_parser::ast::FunctionDefinition> for Registration {
             definition: Arc::new(definition),
             source_info: crate::SourceInfo::default(),
             exported: false,
+            readonly: false,
         }
     }
 }
@@ -96,6 +99,7 @@ impl Registration {
             definition: Arc::new(definition),
             source_info: source_info.clone(),
             exported: false,
+            readonly: false,
         }
     }
 
@@ -122,5 +126,27 @@ impl Registration {
     /// Returns whether this function is exported.
     pub const fn is_exported(&self) -> bool {
         self.exported
+    }
+
+    /// Marks the function readonly.
+    pub const fn set_readonly(&mut self) {
+        self.readonly = true;
+    }
+
+    /// Returns whether this function is readonly.
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// The attribute letters `declare -F -p` shows for the function (`declare -f{flags} name`).
+    pub fn attribute_flags(&self) -> String {
+        let mut flags = String::new();
+        if self.readonly {
+            flags.push('r');
+        }
+        if self.exported {
+            flags.push('x');
+        }
+        flags
     }
 }

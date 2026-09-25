@@ -592,7 +592,8 @@ impl ShellEnvironment {
 
         let auto_export = self.export_variables_on_modification;
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
-            var.assign(value, false)?;
+            var.assign(value, false)
+                .map_err(|error| name_readonly_error(error, &name))?;
             if auto_export {
                 var.export();
             }
@@ -631,7 +632,8 @@ impl ShellEnvironment {
         let name = self.resolve_nameref(&name.into()).into_owned();
 
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
-            var.assign_at_index(index, value, false)?;
+            var.assign_at_index(index, value, false)
+                .map_err(|error| name_readonly_error(error, &name))?;
             updater(var)
         } else {
             let mut var = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
@@ -691,6 +693,15 @@ impl ShellEnvironment {
         var: ShellVariable,
     ) -> Result<(), error::Error> {
         self.add(name, var, EnvironmentScope::Global)
+    }
+}
+
+/// Names the variable in a readonly error, as bash's `NAME: readonly variable` does.
+fn name_readonly_error(error: error::Error, name: &str) -> error::Error {
+    if matches!(error.kind(), error::ErrorKind::ReadonlyVariable) {
+        error::ErrorKind::ReadonlyVariableNamed(name.to_owned()).into()
+    } else {
+        error
     }
 }
 

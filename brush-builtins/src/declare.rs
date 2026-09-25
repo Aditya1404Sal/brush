@@ -146,8 +146,20 @@ impl builtins::Command for DeclareCommand {
                         result = ExecutionResult::general_error();
                     }
                 } else {
-                    if !self.process_declaration(&mut context, declaration, verb)? {
-                        result = ExecutionResult::general_error();
+                    match self.process_declaration(&mut context, declaration, verb) {
+                        Ok(true) => (),
+                        Ok(false) => result = ExecutionResult::general_error(),
+                        // Bash names the readonly variable a declaration could not change;
+                        // `readonly` itself reports it without its own name.
+                        Err(error) if is_readonly_error(&error) => {
+                            let name = Self::declaration_to_name_and_value(declaration)?.0;
+                            if matches!(verb, DeclareVerb::Readonly) {
+                                return Err(ErrorKind::ReadonlyVariableNamed(name).into());
+                            }
+                            context.report(format_args!("{name}: readonly variable"))?;
+                            result = ExecutionResult::general_error();
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -157,11 +169,14 @@ impl builtins::Command for DeclareCommand {
                 self.display_matching_env_declarations(&context, verb)?;
             }
 
-            // Do the same for functions.
-            if !matches!(verb, DeclareVerb::Local | DeclareVerb::Readonly)
-                && (!self.print || self.function_names_only || self.function_names_or_defs_only)
-            {
-                self.display_matching_functions(&context)?;
+            // Do the same for functions (`readonly -f` lists the readonly ones).
+            let functions_listed = if matches!(verb, DeclareVerb::Readonly) {
+                self.function_names_only || self.function_names_or_defs_only
+            } else {
+                !self.print || self.function_names_only || self.function_names_or_defs_only
+            };
+            if !matches!(verb, DeclareVerb::Local) && functions_listed {
+                self.display_matching_functions(&context, verb)?;
             }
         }
 
@@ -192,14 +207,18 @@ impl DeclareCommand {
 
         if self.function_names_only || self.function_names_or_defs_only {
             if let Some(func_registration) = context.shell.funcs().get(name) {
+                let flags = func_registration.attribute_flags();
                 if self.function_names_only {
                     if self.print {
-                        writeln!(context.stdout(), "declare -f {name}")?;
+                        writeln!(context.stdout(), "declare -f{flags} {name}")?;
                     } else {
                         writeln!(context.stdout(), "{name}")?;
                     }
                 } else {
                     writeln!(context.stdout(), "{}", func_registration.definition())?;
+                    if self.print && !flags.is_empty() {
+                        writeln!(context.stdout(), "declare -f{flags} {name}")?;
+                    }
                 }
                 Ok(true)
             } else {
@@ -238,6 +257,7 @@ impl DeclareCommand {
         &self,
         context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         declaration: &brush_core::CommandArg,
+        verb: DeclareVerb,
     ) -> bool {
         let func = match declaration {
             brush_core::CommandArg::String(name) => context.shell.func_mut(name),
@@ -253,6 +273,9 @@ impl DeclareCommand {
             Some(true) => func.export(),
             Some(false) => func.unexport(),
             None => (),
+        }
+        if matches!(verb, DeclareVerb::Readonly) || self.make_readonly.to_bool() == Some(true) {
+            func.set_readonly();
         }
 
         // TODO(declare): function tracing (-t) isn't tracked; it's accepted silently.
@@ -271,9 +294,12 @@ impl DeclareCommand {
                 && !self.create_global);
 
         if (self.function_names_or_defs_only || self.function_names_only)
-            && (self.make_traced.to_bool().is_some() || self.make_exported.to_bool().is_some())
+            && (self.make_traced.to_bool().is_some()
+                || self.make_exported.to_bool().is_some()
+                || self.make_readonly.to_bool() == Some(true)
+                || matches!(verb, DeclareVerb::Readonly))
         {
-            return Ok(self.apply_function_attributes(context, declaration));
+            return Ok(self.apply_function_attributes(context, declaration, verb));
         }
 
         if self.function_names_or_defs_only || self.function_names_only {
@@ -339,8 +365,26 @@ impl DeclareCommand {
             }
         }
 
+        // A local cannot shadow a readonly global, as bash refuses.
+        if create_var_local
+            && self
+                .existing_variable(context.shell, name.as_str(), lookup)
+                .is_none()
+            && context
+                .shell
+                .env()
+                .get_using_policy(name.as_str(), EnvironmentLookup::OnlyInGlobal)
+                .is_some_and(ShellVariable::is_readonly)
+        {
+            return Err(ErrorKind::ReadonlyVariable.into());
+        }
+
         // Look up the variable.
         if let Some(var) = self.existing_variable(context.shell, name.as_str(), lookup) {
+            // A readonly variable keeps its value and its type.
+            if var.is_readonly() && (initial_value.is_some() || self.changes_type()) {
+                return Err(ErrorKind::ReadonlyVariable.into());
+            }
             if self.make_associative_array.is_some() {
                 var.convert_to_associative_array()?;
             }
@@ -392,6 +436,17 @@ impl DeclareCommand {
         }
 
         Ok(true)
+    }
+
+    /// Whether the declaration changes what the variable holds (`-aAilu` and `-c`, or their `+`
+    /// forms), which bash refuses for a readonly variable.
+    const fn changes_type(&self) -> bool {
+        self.make_indexed_array.is_some()
+            || self.make_associative_array.is_some()
+            || self.make_integer.to_bool().is_some()
+            || self.lowercase_value_on_assignment.to_bool().is_some()
+            || self.uppercase_value_on_assignment.to_bool().is_some()
+            || self.capitalize_value_on_assignment.to_bool().is_some()
     }
 
     /// The variable a declaration updates. `-n` and `+n` change a nameref itself, not the
@@ -654,12 +709,28 @@ impl DeclareCommand {
     fn display_matching_functions(
         &self,
         context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+        verb: DeclareVerb,
     ) -> Result<(), brush_core::Error> {
-        for (name, registration) in context.shell.funcs().iter().sorted_by_key(|v| v.0) {
+        let readonly_only =
+            matches!(verb, DeclareVerb::Readonly) || self.make_readonly.to_bool() == Some(true);
+        let exported_only = self.make_exported.to_bool() == Some(true);
+        for (name, registration) in context
+            .shell
+            .funcs()
+            .iter()
+            .filter(|(_, f)| !readonly_only || f.is_readonly())
+            .filter(|(_, f)| !exported_only || f.is_exported())
+            .sorted_by_key(|v| v.0)
+        {
+            // Bash follows a function with the attributes it has, as `declare -f` would set them.
+            let flags = registration.attribute_flags();
             if self.function_names_only {
-                writeln!(context.stdout(), "declare -f {name}")?;
+                writeln!(context.stdout(), "declare -f{flags} {name}")?;
             } else {
                 writeln!(context.stdout(), "{}", registration.definition())?;
+                if !flags.is_empty() {
+                    writeln!(context.stdout(), "declare -f{flags} {name}")?;
+                }
             }
         }
 
@@ -750,4 +821,12 @@ impl DeclareCommand {
 
         Ok(())
     }
+}
+
+/// Whether the error is an attempt to change a readonly variable.
+const fn is_readonly_error(error: &brush_core::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ReadonlyVariable | ErrorKind::ReadonlyVariableNamed(_)
+    )
 }
