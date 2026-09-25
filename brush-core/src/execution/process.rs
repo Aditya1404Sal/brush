@@ -270,6 +270,18 @@ pub(crate) fn take_pending_trap() -> Option<u8> {
     })
 }
 
+/// The oldest caught signal waiting for a trap safe point in the running process, left pending.
+pub fn pending_trapped_signal() -> Option<u8> {
+    current().and_then(|state| state.pending.borrow().first().copied())
+}
+
+/// Resolves with [`pending_trapped_signal`] once there is one. `wait` returns early with it, and
+/// the trap then runs, as in bash.
+pub fn trapped_signal() -> impl Future<Output = u8> {
+    // A delivery wakes the process's task, which polls this again.
+    std::future::poll_fn(|_| pending_trapped_signal().map_or(Poll::Pending, Poll::Ready))
+}
+
 pub(crate) struct HandlingPipe(Option<Rc<ProcessState>>);
 impl Drop for HandlingPipe {
     fn drop(&mut self) {
@@ -751,6 +763,28 @@ mod tests {
                 table.entry(ignored).unwrap().status,
                 ProcessStatus::Exited(7)
             );
+        });
+    }
+
+    #[test]
+    fn trapped_signal_wakes_a_waiter_and_stays_pending() {
+        run(async {
+            let table = ProcessTable::new(10, 11);
+            let pid = table.allocate(10, "waiter".into());
+            let (result, ()) = futures::join!(
+                run_numbered_process(&table, pid, caught(true), async {
+                    assert_eq!(pending_trapped_signal(), None);
+                    let signal = trapped_signal().await;
+                    assert_eq!(pending_trapped_signal(), Some(signal));
+                    assert_eq!(take_pending_trap(), Some(signals::TERM));
+                    Ok(ExecutionResult::new(signal))
+                }),
+                async {
+                    tokio::task::yield_now().await;
+                    assert!(signal_process(&table, pid, signals::TERM));
+                }
+            );
+            assert_eq!(u8::from(result.unwrap().exit_code), signals::TERM);
         });
     }
 

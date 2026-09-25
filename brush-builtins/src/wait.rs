@@ -23,6 +23,25 @@ pub(crate) struct WaitCommand {
     ids: Vec<String>,
 }
 
+/// Awaits `wait`, unless a signal with a trap arrives first: then `wait` returns `128 + n` at
+/// once and the trap runs, as in bash. `Err` carries that status.
+async fn interruptible<T>(
+    wait: impl std::future::Future<Output = Result<T, brush_core::Error>>,
+) -> Result<Result<T, ExecutionResult>, brush_core::Error> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let trapped = std::pin::pin!(brush_core::execution::process::trapped_signal());
+        match futures::future::select(trapped, std::pin::pin!(wait)).await {
+            futures::future::Either::Left((signal, _)) => {
+                Ok(Err(ExecutionExitCode::from(128 + signal).into()))
+            }
+            futures::future::Either::Right((result, _)) => result.map(Ok),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    wait.await.map(Ok)
+}
+
 impl builtins::Command for WaitCommand {
     type Error = brush_core::Error;
 
@@ -48,6 +67,9 @@ impl builtins::Command for WaitCommand {
                         return result;
                     }
                 }
+                if let Some(signal) = brush_core::execution::process::pending_trapped_signal() {
+                    return Ok(ExecutionExitCode::from(128 + signal).into());
+                }
                 (context.shell.execution_services().yield_now)().await;
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -64,7 +86,10 @@ impl builtins::Command for WaitCommand {
                 if id.starts_with('%') {
                     // It's a job spec.
                     if let Some(job) = context.shell.jobs_mut().resolve_job_spec(id) {
-                        result = job.wait().await?;
+                        match interruptible(job.wait()).await? {
+                            Ok(status) => result = status,
+                            Err(interrupted) => return Ok(interrupted),
+                        }
                     } else {
                         context.report(format_args!("{id}: no such job"))?;
 
@@ -83,7 +108,10 @@ impl builtins::Command for WaitCommand {
                             .iter_mut()
                             .find(|job| job.pids().contains(&pid) || job.leader() == Some(pid));
                         if let Some(job) = job {
-                            result = job.wait().await?;
+                            match interruptible(job.wait()).await? {
+                                Ok(status) => result = status,
+                                Err(interrupted) => return Ok(interrupted),
+                            }
                         } else {
                             context
                                 .report(format_args!("pid {pid} is not a child of this shell"))?;
@@ -96,7 +124,10 @@ impl builtins::Command for WaitCommand {
             }
         } else {
             // Wait for all jobs.
-            let jobs = context.shell.jobs_mut().wait_all().await?;
+            let jobs = match interruptible(context.shell.jobs_mut().wait_all()).await? {
+                Ok(jobs) => jobs,
+                Err(interrupted) => return Ok(interrupted),
+            };
 
             if context.shell.options().enable_job_control {
                 for job in jobs {
