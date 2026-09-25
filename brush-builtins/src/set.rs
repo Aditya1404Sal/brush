@@ -167,6 +167,26 @@ impl builtins::Command for SetCommand {
                 now_parsing_positional_args = true;
             }
 
+            // An option letter set does not have is refused, as bash does, rather than taken as a
+            // positional parameter.
+            if i > 0
+                && !now_parsing_positional_args
+                && let Some(unknown) = arg
+                    .chars()
+                    .skip(1)
+                    .find(|c| !"abefhkmnptuvxBCEHPTo".contains(*c))
+            {
+                let mut error = clap::Error::new(clap::error::ErrorKind::UnknownArgument);
+                error.insert(
+                    clap::error::ContextKind::InvalidArg,
+                    clap::error::ContextValue::String(format!(
+                        "{}{unknown}",
+                        arg.chars().next().unwrap_or('-')
+                    )),
+                );
+                return Err(error);
+            }
+
             if let Some(plus_options) = arg.strip_prefix("+") {
                 next_arg_is_option_value = plus_options.ends_with('o');
                 for c in plus_options.chars() {
