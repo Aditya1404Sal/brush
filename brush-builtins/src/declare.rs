@@ -330,6 +330,12 @@ impl DeclareCommand {
         let (name, assigned_index, initial_value, name_is_array, append) =
             Self::declaration_to_name_and_value(declaration)?;
 
+        // `readonly` takes names, not array elements, as in bash.
+        if let (DeclareVerb::Readonly, Some(index)) = (verb, &assigned_index) {
+            context.report(format_args!("`{name}[{index}]': not a valid identifier"))?;
+            return Ok(false);
+        }
+
         // A readonly variable is refused before its new value is evaluated, and an array cannot
         // lose its array attribute (`declare +a`), as in bash.
         let current_lookup = if create_var_local {
