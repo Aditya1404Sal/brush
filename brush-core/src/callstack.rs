@@ -168,8 +168,9 @@ pub struct Frame {
     /// younger frame. May be `None` if the current location is not known. When present,
     /// it is relative to the frame of reference of `source_info`.
     pub current: Option<Arc<crate::SourcePosition>>,
-    /// Positional arguments (not including $0). May not be present for all frames.
-    pub args: Vec<String>,
+    /// Positional arguments (not including $0). May not be present for all frames. Shared with
+    /// the frame's clones (a subshell's call stack) until one of them changes them.
+    pub args: Arc<Vec<String>>,
     /// Optionally, indicates an additional line offset within the current source context.
     pub current_line_offset: usize,
 }
@@ -470,7 +471,7 @@ impl CallStack {
                 call_type,
                 source_info: source_info.to_owned(),
             }),
-            args: args.into_iter().collect(),
+            args: Arc::new(args.into_iter().collect()),
             source_info: source_info.to_owned(),
             current_line_offset: 0,
             current: None, // TODO(source-info): fill this out
@@ -498,7 +499,7 @@ impl CallStack {
 
         self.frames.push_front(Frame {
             frame_type: FrameType::TrapHandler(signal),
-            args: vec![],
+            args: Arc::default(),
             source_info,
             current_line_offset: 0,
             current: None, // TODO(source-info): fill this out
@@ -512,7 +513,7 @@ impl CallStack {
     pub fn push_eval(&mut self) {
         self.frames.push_front(Frame {
             frame_type: FrameType::Eval,
-            args: vec![],
+            args: Arc::default(),
             source_info: crate::SourceInfo::from("eval"), // TODO(source-info): fill this out
             current_line_offset: 0,
             current: None, // TODO(source-info): fill this out
@@ -529,7 +530,7 @@ impl CallStack {
     pub fn push_command_string(&mut self, shell_name: &str) {
         self.frames.push_front(Frame {
             frame_type: FrameType::CommandString,
-            args: vec![],
+            args: Arc::default(),
             source_info: crate::SourceInfo::from(shell_name),
             current_line_offset: 0,
             current: None, // TODO(source-info): fill this out
@@ -541,7 +542,7 @@ impl CallStack {
     pub fn push_interactive_session(&mut self) {
         self.frames.push_front(Frame {
             frame_type: FrameType::InteractiveSession,
-            args: vec![],
+            args: Arc::default(),
             current_line_offset: 0,
             source_info: crate::SourceInfo::from("main"),
             current: None, // TODO(source-info): fill this out
@@ -567,7 +568,7 @@ impl CallStack {
                 function_name: name.into(),
                 function: function.to_owned(),
             }),
-            args: args.into_iter().collect(),
+            args: Arc::new(args.into_iter().collect()),
             source_info: function.source().clone(),
             entry: function.definition().location().map(|span| span.start),
             current: None, // TODO(source-info): fill this out

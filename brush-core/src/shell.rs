@@ -91,8 +91,8 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     jobs: jobs::JobManager,
 
-    /// Shell aliases.
-    aliases: HashMap<String, String>,
+    /// Shell aliases, shared with the shell's clones until one of them changes them.
+    aliases: std::sync::Arc<HashMap<String, String>>,
 
     /// The status of the last completed command.
     last_exit_status: u8,
@@ -174,8 +174,9 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Shell name
     name: Option<String>,
 
-    /// Positional shell arguments (not including shell name).
-    args: Vec<String>,
+    /// Positional shell arguments (not including shell name), shared with the shell's clones
+    /// until one of them changes them.
+    args: std::sync::Arc<Vec<String>>,
 
     /// Shell version
     version: Option<String>,
@@ -439,7 +440,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
-            args: options.shell_args.unwrap_or_default(),
+            args: std::sync::Arc::new(options.shell_args.unwrap_or_default()),
             version: options.shell_version,
             product_display_str: options.shell_product_display_str,
             working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
@@ -675,7 +676,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             Some(unit) => self.alias_units.insert(name.clone(), unit),
             None => self.alias_units.remove(&name),
         };
-        self.aliases.insert(name, value);
+        std::sync::Arc::make_mut(&mut self.aliases).insert(name, value);
     }
 
     /// Whether the alias `name` may be expanded in the command running now.
@@ -880,7 +881,7 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 
     /// Returns a mutable reference to the shell's aliases.
     pub fn aliases_mut(&mut self) -> &mut HashMap<String, String> {
-        &mut self.aliases
+        std::sync::Arc::make_mut(&mut self.aliases)
     }
 
     /// Returns the shell's job manager.

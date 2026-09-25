@@ -973,6 +973,111 @@ mod tests {
         assert!(valid_variable_name("A1"));
     }
 
+    /// The string a variable holds, or an element of it.
+    fn text(env: &ShellEnvironment, name: &str, index: Option<&str>) -> Option<String> {
+        let (_, var) = env.get(name)?;
+        match (var.value(), index) {
+            (ShellValue::String(value), None) => Some(value.clone()),
+            (ShellValue::IndexedArray(values), Some(index)) => {
+                values.get(&index.parse().ok()?).cloned()
+            }
+            (ShellValue::AssociativeArray(values), Some(index)) => values.get(index).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Whether two environments hold the very same value for `name`, not a copy of it.
+    fn shared(one: &ShellEnvironment, other: &ShellEnvironment, name: &str) -> bool {
+        match (one.get(name), other.get(name)) {
+            (Some((_, a)), Some((_, b))) => std::ptr::eq(a.value(), b.value()),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_clone_shares_values_until_it_changes_them_and_never_changes_the_original()
+    -> Result<(), error::Error> {
+        let mut parent = ShellEnvironment::new();
+        for (name, value) in [("s", "parent"), ("t", "kept"), ("p", "base")] {
+            parent.set_global(name, ShellVariable::new(ShellValue::String(value.into())))?;
+        }
+        for (index, value) in [("0", "a0"), ("1", "a1")] {
+            parent.update_or_add_array_element(
+                "a",
+                index.into(),
+                value.into(),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )?;
+        }
+        let mut map = ShellVariable::new(ShellValue::Unset(
+            variables::ShellValueUnsetType::AssociativeArray,
+        ));
+        map.assign_at_index("k".into(), "parent".into(), false)?;
+        parent.set_global("m", map)?;
+
+        // A subshell or a pipeline stage starts as a clone that copies no value.
+        let mut child = parent.clone();
+        for name in ["s", "t", "p", "a", "m"] {
+            assert!(shared(&parent, &child, name), "{name} is copied");
+        }
+
+        // Its changes stay its own, and copy only what they change.
+        child.update_or_add(
+            "s",
+            variables::ShellValueLiteral::Scalar("child".into()),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+        if let Some((_, var)) = child.get_mut("p") {
+            var.assign(variables::ShellValueLiteral::Scalar("+more".into()), true)?;
+        }
+        child.update_or_add_array_element(
+            "a",
+            "1".into(),
+            "child".into(),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+        child.unset_index("a", "0")?;
+        if let Some((_, var)) = child.get_mut("m") {
+            var.assign_at_index("k".into(), "child".into(), false)?;
+            var.assign_at_index("new".into(), "x".into(), false)?;
+        }
+        child.unset("t")?;
+
+        assert_eq!(text(&parent, "s", None).as_deref(), Some("parent"));
+        assert_eq!(text(&parent, "t", None).as_deref(), Some("kept"));
+        assert_eq!(text(&parent, "p", None).as_deref(), Some("base"));
+        assert_eq!(text(&parent, "a", Some("0")).as_deref(), Some("a0"));
+        assert_eq!(text(&parent, "a", Some("1")).as_deref(), Some("a1"));
+        assert_eq!(text(&parent, "m", Some("k")).as_deref(), Some("parent"));
+        assert_eq!(text(&parent, "m", Some("new")), None);
+
+        assert_eq!(text(&child, "s", None).as_deref(), Some("child"));
+        assert_eq!(text(&child, "t", None), None);
+        assert_eq!(text(&child, "p", None).as_deref(), Some("base+more"));
+        assert_eq!(text(&child, "a", Some("0")), None);
+        assert_eq!(text(&child, "a", Some("1")).as_deref(), Some("child"));
+        assert_eq!(text(&child, "m", Some("k")).as_deref(), Some("child"));
+        assert_eq!(text(&child, "m", Some("new")).as_deref(), Some("x"));
+        for name in ["s", "p", "a", "m"] {
+            assert!(!shared(&parent, &child, name), "{name} is still shared");
+        }
+
+        // The parent's own changes do not reach a clone taken before them either.
+        let snapshot = parent.clone();
+        if let Some((_, var)) = parent.get_mut("a") {
+            var.assign_at_index("2".into(), "later".into(), false)?;
+        }
+        assert_eq!(text(&snapshot, "a", Some("2")), None);
+        assert_eq!(text(&parent, "a", Some("2")).as_deref(), Some("later"));
+        Ok(())
+    }
+
     #[test]
     fn element_names_split_into_array_and_subscript() {
         let split = |name| split_element_name(name);

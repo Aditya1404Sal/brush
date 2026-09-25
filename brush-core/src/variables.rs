@@ -12,8 +12,9 @@ use crate::{error, escape, extensions};
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShellVariable {
-    /// The value currently associated with the variable.
-    value: ShellValue,
+    /// The value currently associated with the variable. Clones of the variable (a subshell's,
+    /// a pipeline stage's) share it until one of them changes it.
+    value: std::sync::Arc<ShellValue>,
     /// Whether or not the variable is marked as exported to child processes.
     exported: bool,
     /// Whether or not the variable is marked as read-only.
@@ -194,7 +195,7 @@ pub enum ShellVariableUpdateTransform {
 impl Default for ShellVariable {
     fn default() -> Self {
         Self {
-            value: ShellValue::String(String::new()),
+            value: std::sync::Arc::new(ShellValue::String(String::new())),
             exported: false,
             readonly: false,
             enumerable: true,
@@ -215,13 +216,13 @@ impl ShellVariable {
     /// * `value` - The value to associate with the variable.
     pub fn new<I: Into<ShellValue>>(value: I) -> Self {
         Self {
-            value: value.into(),
+            value: std::sync::Arc::new(value.into()),
             ..Self::default()
         }
     }
 
     /// Returns the value associated with the variable.
-    pub const fn value(&self) -> &ShellValue {
+    pub fn value(&self) -> &ShellValue {
         &self.value
     }
 
@@ -360,7 +361,7 @@ impl ShellVariable {
                     0,
                     self.value.to_cow_str_without_dynamic_support().to_string(),
                 );
-                self.value = ShellValue::IndexedArray(new_values);
+                self.value = std::sync::Arc::new(ShellValue::IndexedArray(new_values));
                 Ok(())
             }
         }
@@ -379,7 +380,7 @@ impl ShellVariable {
                     String::from("0"),
                     self.value.to_cow_str_without_dynamic_support().to_string(),
                 );
-                self.value = ShellValue::AssociativeArray(new_values);
+                self.value = std::sync::Arc::new(ShellValue::AssociativeArray(new_values));
                 Ok(())
             }
         }
@@ -400,7 +401,7 @@ impl ShellVariable {
         let value = self.convert_value_literal_for_assignment(value);
 
         if append {
-            match (&self.value, &value) {
+            match (&*self.value, &value) {
                 // If we're appending an array to a declared-but-unset variable (or appending
                 // anything to a declared-but-unset array), then fill it out first.
                 (ShellValue::Unset(_), ShellValueLiteral::Array(_))
@@ -429,7 +430,7 @@ impl ShellVariable {
             let treat_as_int = self.is_treated_as_integer();
             let update_transform = self.get_update_transform();
 
-            match &mut self.value {
+            match std::sync::Arc::make_mut(&mut self.value) {
                 ShellValue::String(base) => match value {
                     ShellValueLiteral::Scalar(suffix) => {
                         if treat_as_int {
@@ -473,7 +474,7 @@ impl ShellVariable {
                 ShellValue::Dynamic { .. } => Ok(()),
             }
         } else {
-            match (&self.value, value) {
+            match (&*self.value, value) {
                 // If we're updating an array value with a string, then treat it as an update to
                 // just the "0"-indexed element of the array.
                 (
@@ -497,7 +498,9 @@ impl ShellVariable {
                     | ShellValue::Dynamic { .. },
                     ShellValueLiteral::Array(literal_values),
                 ) => {
-                    self.value = ShellValue::indexed_array_from_literals(literal_values);
+                    self.value = std::sync::Arc::new(ShellValue::indexed_array_from_literals(
+                        literal_values,
+                    ));
                     Ok(())
                 }
 
@@ -508,7 +511,9 @@ impl ShellVariable {
                     | ShellValue::Unset(ShellValueUnsetType::AssociativeArray),
                     ShellValueLiteral::Array(literal_values),
                 ) => {
-                    self.value = ShellValue::associative_array_from_literals(literal_values)?;
+                    self.value = std::sync::Arc::new(ShellValue::associative_array_from_literals(
+                        literal_values,
+                    )?);
                     Ok(())
                 }
 
@@ -521,7 +526,7 @@ impl ShellVariable {
 
                 // Assign a scalar value to a scalar or unset (and untyped) variable.
                 (ShellValue::String(_) | ShellValue::Unset(_), ShellValueLiteral::Scalar(s)) => {
-                    self.value = ShellValue::String(s);
+                    self.value = std::sync::Arc::new(ShellValue::String(s));
                     Ok(())
                 }
             }
@@ -547,7 +552,7 @@ impl ShellVariable {
             return Err(error::ErrorKind::ReadonlyVariable.into());
         }
 
-        match &self.value {
+        match &*self.value {
             ShellValue::Unset(_) => {
                 self.assign(ShellValueLiteral::Array(ArrayLiteral(vec![])), false)?;
             }
@@ -560,7 +565,7 @@ impl ShellVariable {
         let treat_as_int = self.is_treated_as_integer();
         let value = self.convert_value_str_for_assignment(value);
 
-        match &mut self.value {
+        match std::sync::Arc::make_mut(&mut self.value) {
             ShellValue::IndexedArray(arr) => {
                 let key = get_key_for_indexed_array(arr, array_index.as_str())?;
 
@@ -670,7 +675,7 @@ impl ShellVariable {
     ///
     /// * `index` - The index at which to unset the value.
     pub fn unset_index(&mut self, index: &str) -> Result<bool, error::Error> {
-        match &mut self.value {
+        match std::sync::Arc::make_mut(&mut self.value) {
             ShellValue::Unset(ty) => match ty {
                 ShellValueUnsetType::Untyped => Err(error::ErrorKind::NotArray.into()),
                 ShellValueUnsetType::AssociativeArray | ShellValueUnsetType::IndexedArray => {
@@ -694,9 +699,9 @@ impl ShellVariable {
     /// * `shell` - The shell in which the variable is being resolved.
     pub fn resolve_value(&self, shell: &Shell<impl extensions::ShellExtensions>) -> ShellValue {
         // N.B. We do *not* specially handle a dynamic value that resolves to a dynamic value.
-        match &self.value {
+        match &*self.value {
             ShellValue::Dynamic { getter, .. } => getter(shell),
-            _ => self.value.clone(),
+            _ => (*self.value).clone(),
         }
     }
 
