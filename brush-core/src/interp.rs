@@ -366,7 +366,8 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     cloned_shell.set_stage_processes(stage_processes);
 
     // Bash forks once for `( list ) &`: the subshell is the job itself, so its traps are the job's.
-    let subshell_body = sole_subshell_body(ao_list).cloned();
+    let subshell_body =
+        sole_subshell_body(ao_list).map(|(list, redirects)| (list.clone(), redirects.cloned()));
     // The job outlives the subshell, stage or child shell that starts it, as an orphan does.
     // The job is a subshell: it runs only an EXIT trap it sets itself, when it ends.
     cloned_shell.traps_mut().reset_exit_for_subshell();
@@ -375,14 +376,38 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         let result = leader_process
             .run(async {
                 let result = match subshell_body {
-                    Some(list) => match list.execute(&mut cloned_shell, &cloned_params).await {
-                        Ok(result) => Ok(result),
-                        Err(error) => {
-                            let mut stderr = cloned_params.stderr(&cloned_shell);
-                            let _ = cloned_shell.display_error(&mut stderr, &error);
-                            Ok(error.into_result(&cloned_shell))
+                    Some((list, redirects)) => {
+                        // `( list ) >log &` is the same one process, its output redirected. Its
+                        // own background commands keep an input it redirects.
+                        let mut redirected = Ok(());
+                        if redirects
+                            .iter()
+                            .flat_map(|redirects| &redirects.0)
+                            .any(redirects_stdin)
+                        {
+                            cloned_params.async_stdin_kept = true;
                         }
-                    },
+                        for redirect in redirects.iter().flat_map(|redirects| &redirects.0) {
+                            redirected =
+                                setup_redirect(&mut cloned_shell, &mut cloned_params, redirect)
+                                    .await;
+                            if redirected.is_err() {
+                                break;
+                            }
+                        }
+                        let executed = match redirected {
+                            Ok(()) => list.execute(&mut cloned_shell, &cloned_params).await,
+                            Err(error) => Err(error),
+                        };
+                        match executed {
+                            Ok(result) => Ok(result),
+                            Err(error) => {
+                                let mut stderr = cloned_params.stderr(&cloned_shell);
+                                let _ = cloned_shell.display_error(&mut stderr, &error);
+                                Ok(error.into_result(&cloned_shell))
+                            }
+                        }
+                    }
                     None => {
                         cloned_ao_list
                             .execute(&mut cloned_shell, &cloned_params)
@@ -448,9 +473,13 @@ async fn job_slot_available(shell: &Shell<impl extensions::ShellExtensions>) -> 
     shell.processes().running_jobs() < jobs::MAX_RUNNING_JOBS
 }
 
-/// The body of a background list that is exactly one plain `( list )`.
+/// The body of a background list that is exactly one `( list )`, and its redirections. A
+/// redirection to an output process substitution runs only after its command, so a subshell
+/// with one keeps its own process.
 #[cfg(target_arch = "wasm32")]
-const fn sole_subshell_body(ao_list: &ast::AndOrList) -> Option<&ast::CompoundList> {
+fn sole_subshell_body(
+    ao_list: &ast::AndOrList,
+) -> Option<(&ast::CompoundList, Option<&ast::RedirectList>)> {
     let pipeline = &ao_list.first;
     if !ao_list.additional.is_empty() || pipeline.bang || pipeline.timed.is_some() {
         return None;
@@ -459,9 +488,24 @@ const fn sole_subshell_body(ao_list: &ast::AndOrList) -> Option<&ast::CompoundLi
         [
             ast::Command::Compound(
                 ast::CompoundCommand::Subshell(ast::SubshellCommand { list, .. }),
-                None,
+                redirects,
             ),
-        ] => Some(list),
+        ] if redirects.as_ref().is_none_or(|redirects| {
+            !redirects.0.iter().any(|redirect| {
+                matches!(
+                    redirect,
+                    ast::IoRedirect::File(_, _, ast::IoFileRedirectTarget::ProcessSubstitution(..))
+                        | ast::IoRedirect::NamedFd(
+                            _,
+                            _,
+                            ast::IoFileRedirectTarget::ProcessSubstitution(..)
+                        )
+                )
+            })
+        }) =>
+        {
+            Some((list, redirects.as_ref()))
+        }
         _ => None,
     }
 }
