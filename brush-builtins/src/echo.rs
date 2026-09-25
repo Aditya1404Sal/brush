@@ -78,7 +78,8 @@ impl builtins::Command for EchoCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut trailing_newline = !self.no_trailing_newline;
-        let mut s;
+        // The output's bytes, including any that are not UTF-8 (see `rawbytes`).
+        let mut s: Vec<u8>;
         let interpret = self.escapes.unwrap_or_else(|| {
             context
                 .shell
@@ -86,17 +87,17 @@ impl builtins::Command for EchoCommand {
                 .echo_builtin_expands_escape_sequences
         });
         if interpret {
-            s = String::new();
+            s = Vec::new();
             for (i, arg) in self.args.iter().enumerate() {
                 if i > 0 {
-                    s.push(' ');
+                    s.push(b' ');
                 }
 
-                let (expanded_arg, keep_going) = escape::expand_backslash_escapes(
+                let (mut expanded_arg, keep_going) = escape::expand_backslash_escapes(
                     arg.as_str(),
                     escape::EscapeExpansionMode::EchoBuiltin,
                 )?;
-                s.push_str(&String::from_utf8_lossy(expanded_arg.as_slice()));
+                s.append(&mut expanded_arg);
 
                 if !keep_going {
                     trailing_newline = false;
@@ -104,23 +105,23 @@ impl builtins::Command for EchoCommand {
                 }
             }
         } else {
-            s = self.args.join(" ");
+            s = brush_core::rawbytes::encode(&self.args.join(" ")).into_owned();
         }
 
         if trailing_newline {
-            s.push('\n');
+            s.push(b'\n');
         }
 
         #[cfg(target_arch = "wasm32")]
         {
             use futures::io::AsyncWriteExt;
             let mut stdout = context.stdout();
-            stdout.async_io().write_all(s.as_bytes()).await?;
+            stdout.async_io().write_all(&s).await?;
             stdout.async_io().flush().await?;
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            write!(context.stdout(), "{s}")?;
+            context.stdout().write_all(&s)?;
             context.stdout().flush()?;
         }
 

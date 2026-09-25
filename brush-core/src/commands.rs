@@ -1136,13 +1136,8 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
             return Err(error::ErrorKind::SubstitutionTooLarge.into());
         }
         shell.set_last_exit_status(status);
-        String::from_utf8(output).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
-            .into()
-        })
+        // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`).
+        Ok(crate::rawbytes::decode_vec(output))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1169,6 +1164,108 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
         Ok(output_str)
     }
+}
+
+/// Runs a command string in the shell itself rather than a copy of it, as bash runs a
+/// `${ command; }` substitution, and returns what it wrote to its standard output.
+pub(crate) async fn invoke_command_in_current_shell_and_get_output(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: String,
+) -> Result<String, error::Error> {
+    let mut params = params.clone();
+
+    // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`). The command
+    // and the read of its output run together, so output larger than the pipe cannot stall it.
+    // As for `$( )`, at most `MAX_SUBSTITUTION_BYTES` are kept; past that the reader closes, and
+    // the substitution fails.
+    #[cfg(target_arch = "wasm32")]
+    let (cmd_result, output) = {
+        let (mut reader, writer) = openfiles::open_mem_pipe();
+        params.set_fd(OpenFiles::STDOUT_FD, writer);
+        let read = async move {
+            use futures::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let count = reader.async_io().read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>((output, false));
+                }
+                if output.len() + count > openfiles::MAX_SUBSTITUTION_BYTES {
+                    drop(reader);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+        };
+        let (cmd_result, output_result) =
+            futures::join!(run_command_string(shell, params, command), read);
+        let (output, truncated) = output_result?;
+        if truncated {
+            shell.set_last_exit_status(1);
+            return Err(error::ErrorKind::SubstitutionTooLarge.into());
+        }
+        (cmd_result, crate::rawbytes::decode_vec(output))
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let (cmd_result, output) = {
+        let (reader, writer) = std::io::pipe()?;
+        params.set_fd(OpenFiles::STDOUT_FD, writer.into());
+        let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
+        let (cmd_result, output) = futures::join!(
+            run_command_string(shell, params, command),
+            async_reader.read_to_string()
+        );
+        (cmd_result, output?)
+    };
+
+    shell.set_last_exit_status(cmd_result?.exit_code.into());
+    Ok(output)
+}
+
+/// Runs a command string in the shell itself, as a `${| command; }` substitution does, and
+/// returns the value it left in `REPLY`, which is local to it.
+pub(crate) async fn invoke_command_in_current_shell_for_reply(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: String,
+) -> Result<String, error::Error> {
+    const REPLY: &str = "REPLY";
+    let saved = shell
+        .env()
+        .get(REPLY)
+        .map(|(scope, var)| (scope, var.clone()));
+    shell.env_mut().unset(REPLY)?;
+
+    let result = run_command_string(shell, params.clone(), command).await;
+
+    let value = shell
+        .env_str(REPLY)
+        .map(|v| v.into_owned())
+        .unwrap_or_default();
+    shell.env_mut().unset(REPLY)?;
+    if let Some((scope, var)) = saved {
+        shell.env_mut().add(REPLY, var, scope)?;
+    }
+
+    shell.set_last_exit_status(result?.exit_code.into());
+    Ok(value)
+}
+
+/// Runs a command string with the given parameters, which it owns, so its output closes when it
+/// finishes.
+async fn run_command_string(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: ExecutionParameters,
+    command: String,
+) -> Result<ExecutionResult, error::Error> {
+    let parse_result = shell.parse_string(command.as_str());
+    let source_info = crate::SourceInfo::from("main");
+    shell
+        .run_parsed_result(parse_result, Some(&command), &source_info, &params)
+        .await
 }
 
 #[cfg(target_arch = "wasm32")]

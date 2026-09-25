@@ -93,7 +93,12 @@ impl ExpandAndEvaluate for ast::UnexpandedArithmeticExpr {
         params: &ExecutionParameters,
         trace_if_needed: bool,
     ) -> Result<i64, EvalError> {
-        expand_and_eval(shell, params, self.value.as_str(), trace_if_needed).await
+        // The text is expanded as bash expands an arithmetic expression, not as a word.
+        let expr = self.value.as_str();
+        let expanded = expansion::basic_expand_arithmetic_text(shell, params, expr)
+            .await
+            .map_err(|_e| EvalError::FailedToExpandExpression(expr.to_owned()))?;
+        eval_expanded(shell, params, expanded, trace_if_needed).await
     }
 }
 
@@ -119,6 +124,16 @@ pub(crate) async fn expand_and_eval(
         .await
         .map_err(|_e| EvalError::FailedToExpandExpression(expr.to_owned()))?;
 
+    eval_expanded(shell, params, expanded_self, trace_if_needed).await
+}
+
+/// Parses and evaluates an expanded arithmetic expression.
+async fn eval_expanded(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    expanded_self: String,
+    trace_if_needed: bool,
+) -> Result<i64, EvalError> {
     // Now parse.
     let expr = parse(&expanded_self)?;
 

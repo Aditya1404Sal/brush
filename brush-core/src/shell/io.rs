@@ -96,7 +96,8 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             return Ok(());
         }
         let str = self.error_formatter.format_error(err, self);
-        write!(file, "{str}")?;
+        // A name or value in the message holds the bytes it stands for (see `rawbytes`).
+        file.write_all(&crate::rawbytes::encode(&str))?;
 
         Ok(())
     }

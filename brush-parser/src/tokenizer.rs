@@ -134,12 +134,31 @@ pub enum TokenizerError {
     MissingHereTag(String),
 
     /// An unterminated here document sequence was encountered at the end of the input stream.
-    #[error("unterminated here document sequence; tag(s) [{0}] found at: [{1}]")]
-    UnterminatedHereDocuments(String, String),
+    #[error(
+        "unterminated here document sequence; tag(s) [{}] found at: [{}]",
+        .0.iter().map(|d| d.tag.as_str()).collect::<Vec<_>>().join(", "),
+        .0.iter().map(|d| d.position.to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    UnterminatedHereDocuments(Vec<UnterminatedHereDocument>),
 
     /// An I/O error occurred while reading from the input stream.
     #[error("failed to read input")]
     ReadError(#[from] std::io::Error),
+}
+
+/// A here-document that the input ended in before its delimiter.
+#[derive(Clone, Debug)]
+pub struct UnterminatedHereDocument {
+    /// Its tag, as written (`'EOF'`).
+    pub tag: String,
+    /// The delimiter it wants: its tag without quoting.
+    pub delimiter: String,
+    /// Where its tag is.
+    pub position: SourcePosition,
+    /// The line read last before its body began, which bash names in its warning: the line
+    /// that ends its command for the first here-document there, otherwise the line the previous
+    /// here-document ended on, or the last line when the input ended first.
+    pub line: usize,
 }
 
 impl TokenizerError {
@@ -167,6 +186,8 @@ impl TokenizerError {
 pub(crate) struct Tokens<'a> {
     /// Sequence of tokens.
     pub tokens: &'a [Token],
+    /// The text the tokens were read from, when known.
+    pub source: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +240,14 @@ struct CrossTokenParseState {
     queued_tokens: Vec<TokenizeResult>,
     /// Are we in an arithmetic expansion?
     arithmetic_expansion: bool,
+    /// Is the next word in a command's first words, where it can be an assignment?
+    command_position: bool,
+    /// How many nested constructs (`$(...)`, `${...}` and the like) are being tokenized.
+    nested_constructs: u32,
+    /// The line read last before the body of the here-document being read began.
+    here_body_after_line: usize,
+    /// Are we in the parentheses of a compound array assignment (`a=(...)`)?
+    compound_assignment: bool,
     /// Does a `-` follow a `>&` or `<&` just read? Bash reads it as a word of its own (closing
     /// the descriptor), so `>&-1` is `>&-` followed by the word `1`.
     dash_follows_duplication: bool,
@@ -248,6 +277,10 @@ impl Default for TokenizerOptions {
 /// A tokenizer for shell scripts.
 pub(crate) struct Tokenizer<'a, R: ?Sized + std::io::BufRead> {
     char_reader: std::iter::Peekable<utf8_chars::Chars<'a, R>>,
+    /// A character read and put back (see `peek_second_char`), to be read again first.
+    put_back: Option<char>,
+    /// The text read so far.
+    text: String,
     cross_state: CrossTokenParseState,
     options: TokenizerOptions,
 }
@@ -355,6 +388,13 @@ impl TokenParseState {
 
         // TODO(tokenizer): Make sure the here-tag meets criteria (and isn't a newline).
         let current_here_state = std::mem::take(&mut cross_token_state.here_state);
+        if !matches!(current_here_state, HereState::InHereDocs) {
+            cross_token_state.command_position = starts_command_words(
+                self.current_token(),
+                self.token_is_operator,
+                cross_token_state.command_position,
+            );
+        }
         match current_here_state {
             HereState::NextTokenIsHereTag { remove_tabs } => {
                 // Don't yield the operator as a token yet. We need to make sure we collect
@@ -406,6 +446,8 @@ impl TokenParseState {
             HereState::NextLineIsHereDoc => {
                 if self.is_newline() {
                     cross_token_state.here_state = HereState::InHereDocs;
+                    cross_token_state.here_body_after_line =
+                        last_line_read(&cross_token_state.cursor);
                 } else {
                     cross_token_state.here_state = HereState::NextLineIsHereDoc;
                 }
@@ -467,6 +509,8 @@ impl TokenParseState {
                     cross_token_state.here_state = HereState::None;
                 } else {
                     cross_token_state.here_state = HereState::InHereDocs;
+                    cross_token_state.here_body_after_line =
+                        last_line_read(&cross_token_state.cursor);
                 }
 
                 return Ok(None);
@@ -554,6 +598,8 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         Tokenizer {
             options: options.clone(),
             char_reader: reader.chars().peekable(),
+            put_back: None,
+            text: String::new(),
             cross_state: CrossTokenParseState {
                 cursor: SourcePosition {
                     index: 0,
@@ -565,6 +611,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 queued_tokens: vec![],
                 dash_follows_duplication: false,
                 arithmetic_expansion: false,
+                command_position: true,
+                nested_constructs: 0,
+                here_body_after_line: 0,
+                compound_assignment: false,
             },
         }
     }
@@ -575,11 +625,18 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     }
 
     fn next_char(&mut self) -> Result<Option<char>, TokenizerError> {
-        let c = self
-            .char_reader
-            .next()
-            .transpose()
-            .map_err(TokenizerError::ReadError)?;
+        let c = match self.put_back.take() {
+            Some(c) => Some(c),
+            None => {
+                let c = self
+                    .char_reader
+                    .next()
+                    .transpose()
+                    .map_err(TokenizerError::ReadError)?;
+                self.text.extend(c);
+                c
+            }
+        };
 
         if let Some(ch) = c {
             if ch == '\n' {
@@ -600,6 +657,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     }
 
     fn peek_char(&mut self) -> Result<Option<char>, TokenizerError> {
+        if let Some(c) = self.put_back {
+            return Ok(Some(c));
+        }
         match self.char_reader.peek() {
             Some(result) => match result {
                 Ok(c) => Ok(Some(*c)),
@@ -609,8 +669,64 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         }
     }
 
+    /// Returns the character after the next one (not a newline), consuming neither.
+    fn peek_second_char(&mut self) -> Result<Option<char>, TokenizerError> {
+        let Some(first) = self.next_char()? else {
+            return Ok(None);
+        };
+        let second = self.peek_char();
+        self.put_back = Some(first);
+        self.cross_state.cursor.column -= 1;
+        self.cross_state.cursor.index -= 1;
+        second
+    }
+
+    /// Takes the text read so far.
+    pub fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+
     pub fn next_token(&mut self) -> Result<TokenizeResult, TokenizerError> {
         self.next_token_until(None, false /* include space? */)
+    }
+
+    /// Sets aside the here-documents pending on the current line while a nested construct
+    /// (`$(...)`, `$((...))`, `$[...]` or `${...}`) is tokenized.
+    ///
+    /// The construct's tokens belong to it, not to the tokens queued up after a pending here tag,
+    /// and the pending bodies start on the line after the one the construct ends on, as in bash.
+    /// A here-document opened inside the construct is tokenized there.
+    fn set_aside_pending_here_docs(&mut self) -> (HereState, Vec<HereTag>, bool, bool) {
+        self.cross_state.nested_constructs += 1;
+        (
+            std::mem::take(&mut self.cross_state.here_state),
+            std::mem::take(&mut self.cross_state.current_here_tags),
+            std::mem::replace(&mut self.cross_state.command_position, false),
+            std::mem::replace(&mut self.cross_state.compound_assignment, false),
+        )
+    }
+
+    /// Restores here-documents set aside by `set_aside_pending_here_docs`, keeping any the
+    /// nested construct left pending after them.
+    fn restore_pending_here_docs(
+        &mut self,
+        (here_state, mut here_tags, command_position, compound_assignment): (
+            HereState,
+            Vec<HereTag>,
+            bool,
+            bool,
+        ),
+    ) {
+        self.cross_state.nested_constructs -= 1;
+        self.cross_state.command_position = command_position;
+        self.cross_state.compound_assignment = compound_assignment;
+        if here_tags.is_empty() && matches!(here_state, HereState::None) {
+            return;
+        }
+
+        here_tags.append(&mut self.cross_state.current_here_tags);
+        self.cross_state.current_here_tags = here_tags;
+        self.cross_state.here_state = here_state;
     }
 
     /// Consumes a nested construct (e.g., `$((...))` or `$[...]`), handling nested delimiters
@@ -632,6 +748,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     ) -> Result<(), TokenizerError> {
         let mut pending_here_doc_tokens = vec![];
         let mut drain_here_doc_tokens = false;
+        // In a command substitution, the `)` that ends a case pattern does not close it.
+        let mut cases =
+            (nesting_open == "(" && !self.cross_state.arithmetic_expansion).then(CaseTracker::new);
 
         loop {
             let cur_token = if drain_here_doc_tokens && !pending_here_doc_tokens.is_empty() {
@@ -664,9 +783,27 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
 
             if let Some(cur_token_value) = cur_token.token {
                 state.append_str(cur_token_value.to_str());
+                if let Some(cases) = &mut cases {
+                    cases.note(&cur_token_value);
+                }
 
-                if matches!(cur_token_value, Token::Operator(o, _) if o == nesting_open) {
-                    nesting_count += 1;
+                match &cur_token_value {
+                    Token::Operator(o, _) if o == nesting_open => nesting_count += 1,
+                    // `[` is not an operator, so a subscript's opening bracket is inside a word
+                    // (`$[a[0] < 9]`); each one left open needs its own closing bracket. A word
+                    // can also hold both (`+(a[1])`, read whole as a pattern).
+                    Token::Word(w, _) if nesting_open == "[" || nesting_open == "{" => {
+                        let (open, close) = if nesting_open == "[" {
+                            ('[', ']')
+                        } else {
+                            ('{', '}')
+                        };
+                        let open = w.matches(open).count();
+                        let closed = w.matches(close).count();
+                        nesting_count +=
+                            u32::try_from(open.saturating_sub(closed)).unwrap_or(u32::MAX);
+                    }
+                    _ => (),
                 }
             }
 
@@ -676,6 +813,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 }
                 TokenEndReason::NonNewLineBlank => state.append_char(' '),
                 TokenEndReason::SpecifiedTerminatingChar => {
+                    if cases.as_mut().is_some_and(CaseTracker::closes_pattern) {
+                        state.append_char(self.next_char()?.unwrap());
+                        continue;
+                    }
                     nesting_count -= 1;
                     if nesting_count == 0 {
                         break;
@@ -740,7 +881,13 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 // TODO(tokenizer): Verify we're not waiting on some terminating character?
                 // Verify we're out of all quotes.
                 if state.in_escape {
-                    return Err(TokenizerError::UnterminatedEscapeSequence);
+                    if matches!(state.quote_mode, QuoteMode::None) {
+                        // A backslash that ends the input is an ordinary character, as in
+                        // bash (`echo \` prints it); it is already in the token.
+                        state.in_escape = false;
+                    } else {
+                        return Err(TokenizerError::UnterminatedEscapeSequence);
+                    }
                 }
                 match state.quote_mode {
                     QuoteMode::None => (),
@@ -762,24 +909,46 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                         continue;
                     }
 
-                    let tag_names = self
+                    // The input can end on a here-document's tag (`cat <<EOF`).
+                    if matches!(
+                        self.cross_state.here_state,
+                        HereState::CurrentTokenIsHereTag { .. }
+                    ) && state.started_token()
+                    {
+                        state.delimit_current_token(
+                            TokenEndReason::EndOfInput,
+                            &mut self.cross_state,
+                        )?;
+                    }
+
+                    // The body being read began after `here_body_after_line`; any other starts
+                    // at the end of the input.
+                    let last_line = last_line_read(&self.cross_state.cursor);
+                    let reading_body = matches!(self.cross_state.here_state, HereState::InHereDocs);
+                    let documents = self
                         .cross_state
                         .current_here_tags
                         .iter()
-                        .map(|tag| tag.tag.trim())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let tag_positions = self
-                        .cross_state
-                        .current_here_tags
-                        .iter()
-                        .map(|tag| std::format!("{}", tag.position))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(TokenizerError::UnterminatedHereDocuments(
-                        tag_names,
-                        tag_positions,
-                    ));
+                        .enumerate()
+                        .map(|(i, tag)| {
+                            let tag_text = tag.tag.trim();
+                            UnterminatedHereDocument {
+                                tag: tag_text.to_owned(),
+                                delimiter: if tag.tag_was_escaped_or_quoted {
+                                    unquote_str(tag_text)
+                                } else {
+                                    tag_text.to_owned()
+                                },
+                                position: tag.position.clone(),
+                                line: if i == 0 && reading_body {
+                                    self.cross_state.here_body_after_line
+                                } else {
+                                    last_line
+                                },
+                            }
+                        })
+                        .collect();
+                    return Err(TokenizerError::UnterminatedHereDocuments(documents));
                 }
 
                 result = state
@@ -799,6 +968,30 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 {
                     // Consume it but don't include it.
                     self.consume_char()?;
+                } else if c == '\\'
+                    && self
+                        .cross_state
+                        .current_here_tags
+                        .first()
+                        .is_some_and(|tag| !tag.tag_was_escaped_or_quoted)
+                    && state
+                        .current_token()
+                        .chars()
+                        .rev()
+                        .take_while(|c| *c == '\\')
+                        .count()
+                        % 2
+                        == 0
+                {
+                    // In an unquoted here-document, an unescaped backslash-newline joins the
+                    // lines, as bash reads it (a delimiter joined to the line before it no
+                    // longer ends the document).
+                    self.consume_char()?;
+                    if matches!(self.peek_char()?, Some('\n')) {
+                        self.consume_char()?;
+                    } else {
+                        state.append_char(c);
+                    }
                 } else {
                     self.consume_char()?;
                     state.append_char(c);
@@ -960,7 +1153,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                 self.cross_state.arithmetic_expansion = true;
                             }
 
+                            let pending = self.set_aside_pending_here_docs();
                             self.consume_nested_construct(&mut state, ')', "(", initial_nesting)?;
+                            self.restore_pending_here_docs(pending);
 
                             if is_arithmetic {
                                 self.cross_state.arithmetic_expansion = false;
@@ -978,7 +1173,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                             // some text will be interpreted differently as a result.
                             self.cross_state.arithmetic_expansion = true;
 
+                            let pending = self.set_aside_pending_here_docs();
                             self.consume_nested_construct(&mut state, ']', "[", 1)?;
+                            self.restore_pending_here_docs(pending);
 
                             self.cross_state.arithmetic_expansion = false;
                         }
@@ -990,6 +1187,16 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                             // Consume the '{' and add it to the token.
                             state.append_char(self.next_char()?.unwrap());
 
+                            // `${ command; }` and `${| command; }` (bash 5.3) hold a command,
+                            // read like the one in `$(...)`.
+                            if matches!(self.peek_char()?, Some(' ' | '\t' | '\n' | '|')) {
+                                let pending = self.set_aside_pending_here_docs();
+                                self.consume_nested_construct(&mut state, '}', "{", 1)?;
+                                self.restore_pending_here_docs(pending);
+                                continue;
+                            }
+
+                            let pending = self.set_aside_pending_here_docs();
                             let mut pending_here_doc_tokens = vec![];
                             let mut drain_here_doc_tokens = false;
 
@@ -1053,6 +1260,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                     _ => (),
                                 }
                             }
+                            self.restore_pending_here_docs(pending);
                         }
                         _ => {
                             // This is either a different character, or else the end of the string.
@@ -1096,6 +1304,21 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 }
             }
             //
+            // In a command's first words, `NAME[` starts an array element to assign to. As bash
+            // does, read through the matching `]` as part of the word, blanks and operators
+            // included (`b[x > 2]=y`).
+            else if c == '['
+                && self.cross_state.command_position
+                && self.cross_state.nested_constructs == 0
+                && state.unquoted()
+                && !state.in_operator()
+                && is_valid_name(state.current_token())
+            {
+                self.consume_char()?;
+                state.append_char(c);
+                self.consume_array_subscript(&mut state)?;
+            }
+            //
             // [Extension]
             // If extended globbing is enabled, the last consumed character is an
             // unquoted start of an extglob pattern, *and* if the current character
@@ -1135,9 +1358,43 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     }
                 }
             //
+            // As in bash, `<(` or `>(` inside a word (`--file=<(list)`), or starting an element
+            // of a compound array assignment (`a=(<(list))`), is a process substitution read as
+            // part of the word.
+            //
+            } else if matches!(c, '<' | '>')
+                && !self.options.sh_mode
+                && state.unquoted()
+                && !state.in_operator()
+                && !self.cross_state.arithmetic_expansion
+                && if state.started_token() {
+                    !state.only_blanks_so_far()
+                } else {
+                    self.cross_state.compound_assignment
+                }
+                && matches!(self.peek_second_char(), Ok(Some('(')))
+            {
+                self.consume_char()?;
+                state.append_char(c);
+                self.consume_char()?;
+                state.append_char('(');
+
+                let pending = self.set_aside_pending_here_docs();
+                self.consume_nested_construct(&mut state, ')', "(", 1)?;
+                self.restore_pending_here_docs(pending);
+            //
             // If the character *can* start an operator, then it will.
             //
             } else if state.unquoted() && Self::can_start_operator(c) {
+                // `NAME=(` (or `NAME+=(`) opens a compound array assignment, and its `)` closes
+                // it.
+                if c == '(' && state.started_token() {
+                    self.cross_state.compound_assignment =
+                        is_assignment_word(state.current_token())
+                            && state.current_token().ends_with('=');
+                } else if c == ')' {
+                    self.cross_state.compound_assignment = false;
+                }
                 if state.started_token() {
                     result = state.delimit_current_token(
                         TokenEndReason::OperatorStart,
@@ -1186,7 +1443,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             {
                 self.consume_char()?;
                 state.append_char(c);
-            } else if c == '#' {
+            } else if c == '#' && !self.cross_state.arithmetic_expansion {
                 // Consume the '#'.
                 self.consume_char()?;
 
@@ -1218,6 +1475,37 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         let result = result.unwrap();
 
         Ok(result)
+    }
+
+    /// Consumes an array subscript through its matching `]` (the `[` already consumed), quotes
+    /// and nested brackets included, appending it to the token.
+    fn consume_array_subscript(
+        &mut self,
+        state: &mut TokenParseState,
+    ) -> Result<(), TokenizerError> {
+        let mut depth = 1;
+        let mut quote = None;
+        while depth > 0 {
+            let Some(c) = self.next_char()? else {
+                return Err(TokenizerError::UnterminatedExpansion(']'));
+            };
+            state.append_char(c);
+            match (quote, c) {
+                (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+                (Some('\''), _) => (),
+                (_, '\\') => {
+                    if let Some(escaped) = self.next_char()? {
+                        state.append_char(escaped);
+                    }
+                }
+                (Some(_), _) => (),
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '[') => depth += 1,
+                (None, ']') => depth -= 1,
+                _ => (),
+            }
+        }
+        Ok(())
     }
 
     fn remove_here_end_tag(
@@ -1322,6 +1610,155 @@ impl<R: ?Sized + std::io::BufRead> Iterator for Tokenizer<'_, R> {
 
 const fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
+}
+
+/// Where the tokens of a command substitution are in the `case` commands open in it, so that the
+/// `)` ending a pattern is not taken for the one closing the substitution (bash reads the
+/// substitution as a command).
+struct CaseTracker {
+    /// For each open `case`, where its tokens are.
+    open: Vec<CaseState>,
+    /// Whether the next word starts a command, so a `case` there opens one.
+    command_start: bool,
+    /// Whether the current pattern began with its optional `(`.
+    pattern_paren: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum CaseState {
+    /// After `case WORD`, before `in`.
+    ExpectIn,
+    /// In a pattern list, before its `)`.
+    Pattern,
+    /// In the commands after a pattern list.
+    Body,
+}
+
+impl CaseTracker {
+    const fn new() -> Self {
+        Self {
+            open: vec![],
+            command_start: true,
+            pattern_paren: false,
+        }
+    }
+
+    /// Notes a token of the substitution.
+    fn note(&mut self, token: &Token) {
+        match token {
+            Token::Word(word, _) => {
+                let word = word.trim_matches(is_blank);
+                match (self.open.last(), word) {
+                    (_, "case") if self.command_start => self.open.push(CaseState::ExpectIn),
+                    (Some(CaseState::ExpectIn), "in") => {
+                        self.open.pop();
+                        self.open.push(CaseState::Pattern);
+                    }
+                    (Some(CaseState::Pattern), "esac") => {
+                        self.open.pop();
+                    }
+                    (Some(CaseState::Body), "esac") if self.command_start => {
+                        self.open.pop();
+                    }
+                    _ => (),
+                }
+                self.command_start = matches!(
+                    word,
+                    "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "{" | "!" | "time"
+                );
+            }
+            Token::Operator(operator, _) => {
+                let operator = operator.trim_matches(is_blank);
+                if matches!(operator, ";;" | ";&" | ";;&")
+                    && self.open.last() == Some(&CaseState::Body)
+                {
+                    self.open.pop();
+                    self.open.push(CaseState::Pattern);
+                }
+                if operator == "(" && self.open.last() == Some(&CaseState::Pattern) {
+                    self.pattern_paren = true;
+                }
+                self.command_start = matches!(
+                    operator,
+                    ";" | "&" | "&&" | "||" | "|" | "|&" | "(" | "\n" | ";;" | ";&" | ";;&"
+                );
+            }
+        }
+    }
+
+    /// Whether a `)` ends a case pattern rather than closing a parenthesis; it moves past the
+    /// pattern either way. A pattern's optional `(` is closed by the `)` too, so that `)` still
+    /// balances it.
+    fn closes_pattern(&mut self) -> bool {
+        if self.open.last() != Some(&CaseState::Pattern) {
+            return false;
+        }
+        self.open.pop();
+        self.open.push(CaseState::Body);
+        self.command_start = true;
+        !std::mem::take(&mut self.pattern_paren)
+    }
+}
+
+/// Whether `s` is a valid variable name.
+/// The line of the last character read, given the position after it: the line before when that
+/// character was a newline.
+const fn last_line_read(cursor: &SourcePosition) -> usize {
+    if cursor.column == 1 && cursor.line > 1 {
+        cursor.line - 1
+    } else {
+        cursor.line
+    }
+}
+
+fn is_valid_name(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether the word after a token is still among a command's first words, where it can be an
+/// assignment: after a control operator or a reserved word that starts a command, or after an
+/// assignment in that position.
+fn starts_command_words(token: &str, is_operator: bool, command_position: bool) -> bool {
+    if is_operator {
+        return matches!(
+            token,
+            ";" | "&" | "&&" | "||" | "|" | "|&" | "(" | ")" | "\n" | ";;" | ";&" | ";;&"
+        );
+    }
+    if matches!(
+        token,
+        "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "!" | "{" | "time"
+    ) {
+        return true;
+    }
+    command_position && is_assignment_word(token)
+}
+
+/// Whether `token` looks like an assignment: a name, an optional subscript, then `=` or `+=`.
+fn is_assignment_word(token: &str) -> bool {
+    let name_len = token
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(token.len());
+    let (name, mut rest) = token.split_at(name_len);
+    if !is_valid_name(name) {
+        return false;
+    }
+    if rest.starts_with('[') {
+        let mut depth = 0;
+        let Some(end) = rest.find(|c| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => (),
+            }
+            depth == 0
+        }) else {
+            return false;
+        };
+        rest = rest.get(end + 1..).unwrap_or_default();
+    }
+    rest.starts_with('=') || rest.starts_with("+=")
 }
 
 const fn does_char_newly_affect_quoting(state: &TokenParseState, c: char) -> bool {
@@ -1602,6 +2039,202 @@ HERE2
 echo after
 "
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_expansions_after_here_doc_operator() -> Result<()> {
+        // Tokens after a here tag wait for the here-document's body, but the pieces of a nested
+        // construct are not tokens of that line: `${f}` stays whole instead of losing its `f`.
+        let strs = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect())
+        };
+        assert_eq!(
+            strs("cat <<EOF > \"${f}\" $(echo x) $((1+2)) $[3]\nhello\nEOF\n")?,
+            [
+                "cat",
+                "<<",
+                "EOF",
+                "hello\n",
+                "EOF",
+                ">",
+                "\"${f}\"",
+                "$(echo x)",
+                "$((1+2))",
+                "$[3]",
+                "\n"
+            ]
+        );
+        // A substitution spanning lines ends before the pending body starts.
+        assert_eq!(
+            strs("cat <<EOF; x=$(\necho hi\n)\nbody\nEOF\n")?,
+            [
+                "cat",
+                "<<",
+                "EOF",
+                "body\n",
+                "EOF",
+                ";",
+                "x=$(\necho hi\n)",
+                "\n"
+            ]
+        );
+        // An unquoted here-document joins backslash-newline, unless the backslash is escaped;
+        // a quoted one keeps it.
+        assert_eq!(
+            strs("cat <<EOF\na \\\nb \\\\\nc\nEOF\n")?,
+            ["cat", "<<", "EOF", "a b \\\\\nc\n", "EOF", "\n"]
+        );
+        assert_eq!(
+            strs("cat <<'EOF'\na \\\nb\nEOF\n")?,
+            ["cat", "<<", "'EOF'", "a \\\nb\n", "EOF", "\n"]
+        );
+        // A here tag spelled with an expansion is the tag, literally.
+        assert_eq!(
+            strs("cat <<${x}\nbody\n${x}\n")?,
+            ["cat", "<<", "${x}", "body\n", "${x}", "\n"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_unterminated_here_documents() {
+        let open = |input: &str| -> Vec<(String, String, usize)> {
+            match tokenize_str(input) {
+                Err(TokenizerError::UnterminatedHereDocuments(documents)) => documents
+                    .into_iter()
+                    .map(|d| (d.tag, d.delimiter, d.line))
+                    .collect(),
+                other => panic!("{input:?}: {other:?}"),
+            }
+        };
+        let doc = |tag: &str, delimiter: &str, line| (tag.to_owned(), delimiter.to_owned(), line);
+        // Bash names the line read last before each body began.
+        assert_eq!(
+            open("cat <<\"A, B\" <<'C'\nhello\n"),
+            [doc("\"A, B\"", "A, B", 1), doc("'C'", "C", 2)]
+        );
+        assert_eq!(
+            open("echo\ncat <<A <<B <<C\na\nA\nb"),
+            [doc("B", "B", 4), doc("C", "C", 5)]
+        );
+        assert_eq!(open("cat <<A; x=$(\necho)\nb"), [doc("A", "A", 2)]);
+        // The input can end on the tag itself.
+        assert_eq!(open("echo a; cat <<A"), [doc("A", "A", 1)]);
+    }
+
+    #[test]
+    fn tokenize_process_substitutions_in_words() -> Result<()> {
+        let strs = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect())
+        };
+        // Inside a word, or starting an element of a compound array assignment, `<(` and `>(`
+        // are read with the word; at a word's start they are operators, and `<` before anything
+        // else still ends the word.
+        assert_eq!(
+            strs("x=<(echo a) cmd --f=>(cat; echo)z b<c <(d)")?,
+            [
+                "x=<(echo a)",
+                "cmd",
+                "--f=>(cat; echo)z",
+                "b",
+                "<",
+                "c",
+                "<",
+                "(",
+                "d",
+                ")"
+            ]
+        );
+        assert_eq!(
+            strs("a=(<(true) x >(y)) b+=(<(z)); c=( <(w))")?,
+            [
+                "a=", "(", "<(true)", "x", ">(y)", ")", "b+=", "(", "<(z)", ")", ";", "c=", "(",
+                "<(w)", ")"
+            ]
+        );
+        assert_eq!(
+            strs("f (<(x)); (( 1<(2) )); echo $(( 3>(2) ))")?,
+            [
+                "f",
+                "(",
+                "<",
+                "(",
+                "x",
+                ")",
+                ")",
+                ";",
+                "(",
+                "(",
+                "1",
+                "<",
+                "(",
+                "2",
+                ")",
+                ")",
+                ")",
+                ";",
+                "echo",
+                "$(( 3>(2) ))"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_array_element_assignments() -> Result<()> {
+        let strs = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect())
+        };
+        // In a command's first words, an element's subscript is part of the word.
+        assert_eq!(strs("b[x>2]=y")?, ["b[x>2]=y"]);
+        assert_eq!(
+            strs("a=1 b[1 + (2)]+=x c[\"]\" d]=z cmd a[1 + 1]=w")?,
+            [
+                "a=1",
+                "b[1 + (2)]+=x",
+                "c[\"]\" d]=z",
+                "cmd",
+                "a[1",
+                "+",
+                "1]=w"
+            ]
+        );
+        assert_eq!(
+            strs("if true; then e[a[1] > 0]=v; fi")?,
+            ["if", "true", ";", "then", "e[a[1] > 0]=v", ";", "fi"]
+        );
+        // A case pattern's `)` inside a substitution does not close it.
+        assert_eq!(
+            strs("x=$(case a in a) echo m;; (b|c) echo n;; esac); y=$( (echo s) )")?,
+            [
+                "x=$(case a in a) echo m;; (b|c) echo n;; esac)",
+                ";",
+                "y=$( (echo s) )"
+            ]
+        );
+        // A backslash that ends the input is an ordinary character.
+        assert_eq!(strs("echo a \\")?, ["echo", "a", "\\"]);
+        // Legacy arithmetic ends at the bracket matching its own.
+        assert_eq!(strs("echo $[a[0] < 9]")?, ["echo", "$[a[0] < 9]"]);
+        assert_eq!(
+            strs("echo $[+(a[x-4]) + b[1]]")?,
+            ["echo", "$[+(a[x-4]) + b[1]]"]
+        );
+        // In arithmetic, `#` is an operator (a base), not a comment.
+        assert_eq!(
+            strs("(( 2#1 # 2 ))")?,
+            ["(", "(", "2#1", "#", "2", ")", ")"]
+        );
         Ok(())
     }
 

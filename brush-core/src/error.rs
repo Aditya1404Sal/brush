@@ -206,9 +206,13 @@ pub enum ErrorKind {
     #[error("{}", io_message(.0))]
     IoError(#[from] std::io::Error),
 
-    /// Invalid substitution syntax.
-    #[error("bad substitution: {0}")]
+    /// Invalid substitution syntax; holds bash's message (`${v:}: bad substitution`).
+    #[error("{0}")]
     BadSubstitution(String),
+
+    /// An indirect expansion's value is not a name to expand.
+    #[error("{0}: invalid variable name")]
+    InvalidVariableName(String),
 
     /// An error occurred while creating a child process.
     #[error("failed to create child process")]
@@ -500,7 +504,13 @@ impl Error {
     /// the call's status. Only an assignment statement does this, and it reports the error
     /// where it happens; a builtin or a loop that cannot assign the variable just fails.
     pub const fn abandons_command(&self) -> bool {
-        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported
+        // A failed glob under failglob, and an indirect expansion of a value that is no name, do
+        // the same, reported where the top-level command ends.
+        (matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported)
+            || matches!(
+                self.kind,
+                ErrorKind::NoMatch(_) | ErrorKind::InvalidVariableName(_)
+            )
     }
 
     /// The reason a path could not be used, as the system words it ("No such file or

@@ -18,7 +18,7 @@ ParseResult(
                   value: "i < 10",
                 )),
                 updater: Some(UnexpandedArithmeticExpr(
-                  value: "i++",
+                  value: "i++ ",
                 )),
                 body: DoGroupCommand(
                   list: CompoundList([

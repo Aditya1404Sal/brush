@@ -38,6 +38,10 @@ pub struct ExecutionParameters {
     /// for, waiting for it to finish (see `run_pending_output_substitutions`).
     #[cfg(target_arch = "wasm32")]
     pub(crate) output_substitutions: PendingOutputSubstitutions,
+    /// Process substitutions inside the words of the command these parameters are for, set up
+    /// as its words are expanded and waiting to be given to it (see
+    /// `setup_word_process_substitution`).
+    word_process_substitutions: WordProcessSubstitutions,
     /// Policy for how to manage spawned external processes.
     pub process_group_policy: ProcessGroupPolicy,
     /// Whether `errexit` (exit on error) behavior should be
@@ -1229,8 +1233,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 // `(( ))`, `[[ ]]` and `( )` are commands in their own right: they become
                 // BASH_COMMAND, and the DEBUG trap runs before `(( ))` and `[[ ]]`, as in bash.
                 let text = match compound {
+                    // The expression as written, blanks and all (`((  1  ))`).
                     ast::CompoundCommand::Arithmetic(arithmetic) => {
-                        Some((format!("(( {} ))", arithmetic.expr.value), true))
+                        Some((arithmetic.to_string(), true))
                     }
                     ast::CompoundCommand::ExtendedTest(test) => {
                         Some((format!("[[ {test} ]]"), true))
@@ -1521,6 +1526,17 @@ impl Execute for ast::ForClauseCommand {
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
+
+        // A loop variable that is not a name fails the loop before it runs, as in bash.
+        if !valid_variable_name(&self.variable_name) {
+            writeln!(
+                params.stderr(shell),
+                "{}`{}': not a valid identifier",
+                shell.diagnostic_prefix(),
+                self.variable_name
+            )?;
+            return Ok(ExecutionExitCode::GeneralError.into());
+        }
 
         // If we were given explicit words to iterate over, then expand them all, with splitting
         // enabled.
@@ -2147,6 +2163,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         // finished.
         #[cfg(target_arch = "wasm32")]
         let pending = params.own_output_substitutions();
+        params.word_process_substitutions = WordProcessSubstitutions::default();
 
         // A pipeline stage's DEBUG trap already ran in the shell that started the stage.
         if !std::mem::take(&mut context.shell.debug_trap_ran) {
@@ -2172,6 +2189,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let status_change_count_before_expansion = context.shell.last_exit_status_change_count();
 
         for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
+            params.install_word_process_substitutions();
             match item {
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                     // Bash expands a here-document or here-string given to a program it runs in
@@ -2187,6 +2205,18 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                         setup_redirect(&mut context.shell, &mut params, redirect).await
                     };
                     if let Err(e) = result {
+                        // An expansion error that ends the shell (a bad substitution in a
+                        // file name) or abandons the top-level command (failglob) still does, as
+                        // in bash; in a here-document or here-string, or any other failed
+                        // redirection, it fails the command.
+                        if (e.is_fatal() || e.abandons_command())
+                            && !matches!(
+                                redirect,
+                                ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
+                            )
+                        {
+                            return Err(e);
+                        }
                         let _ = context
                             .shell
                             .display_error(&mut params.stderr(&context.shell), &e);
@@ -2311,6 +2341,8 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 }
             }
         }
+
+        params.install_word_process_substitutions();
 
         // If we have a command, then execute it.
         if let Some(CommandArg::String(cmd_name)) = args.first() {
@@ -2498,7 +2530,9 @@ async fn execute_command<T: Into<String>>(
         .await
         {
             // A readonly variable keeps its value: bash reports it and still runs the command.
-            Err(error) if error.abandons_command() => (),
+            Err(error)
+                if error.abandons_command()
+                    && matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) => {}
             result => result?,
         }
     }
@@ -3057,8 +3091,10 @@ pub(crate) async fn setup_redirect(
                         )
                         .into());
                     }
-                    let expanded_file_path: PathBuf =
-                        shell.absolute_path(Path::new(written_path.as_str()));
+                    // The name's bytes, including any that are not UTF-8 (see `rawbytes`).
+                    let expanded_file_path: PathBuf = shell.absolute_path(Path::new(
+                        &crate::rawbytes::to_os_string(written_path.as_str()),
+                    ));
 
                     let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
                     match kind {
@@ -3294,7 +3330,9 @@ fn setup_redirect_output_and_error_to(
         )
         .into());
     }
-    let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
+    // The name's bytes, including any that are not UTF-8 (see `rawbytes`).
+    let abs_file_path: PathBuf =
+        shell.absolute_path(Path::new(&crate::rawbytes::to_os_string(file_path)));
 
     // `set -C` guards `&>` and `>&word` as it guards `>`: an existing regular file is refused.
     let noclobber = !append
@@ -3473,6 +3511,74 @@ async fn setup_process_substitution(
         }
     };
     Ok((fd, target_file))
+}
+
+/// Sets up a process substitution found inside a word (`--file=<(list)`, `x=<(list)`) and
+/// returns the `/dev/fd/N` path that takes its place, as bash does. The descriptor waits in
+/// `params` until the command whose words are being expanded is given it, so it is open for that
+/// command alone; a word expanded for anything else (an assignment by itself, a `for` list) gets
+/// only the path.
+pub(crate) async fn setup_word_process_substitution(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    kind: &ast::ProcessSubstitutionKind,
+    command: &str,
+) -> Result<String, error::Error> {
+    let program = shell.parse_string(command).map_err(|e| {
+        error::Error::from(error::ErrorKind::ParseError(
+            e,
+            crate::SourceInfo::from("main"),
+        ))
+    })?;
+    let subshell = ast::SubshellCommand {
+        list: ast::CompoundList(
+            program
+                .complete_commands
+                .into_iter()
+                .flat_map(|list| list.0)
+                .collect(),
+        ),
+        loc: brush_parser::SourceSpan::default(),
+    };
+    let (_, file) = setup_process_substitution(shell, params, kind, &subshell).await?;
+
+    // As bash does, count down from 63 for a descriptor free in the command and among the
+    // substitutions already waiting for it.
+    let mut waiting = params
+        .word_process_substitutions
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fd = (1..=63)
+        .rev()
+        .find(|fd| {
+            !params.open_files.contains_fd(*fd) && waiting.iter().all(|(other, _)| other != fd)
+        })
+        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
+    waiting.push((fd, file));
+    Ok(std::format!("/dev/fd/{fd}"))
+}
+
+/// The descriptors of the process substitutions inside one command's words, shared by the
+/// clones of its parameters.
+#[derive(Clone, Default)]
+struct WordProcessSubstitutions(std::sync::Arc<std::sync::Mutex<Vec<(ShellFd, OpenFile)>>>);
+
+impl ExecutionParameters {
+    /// Gives the command these parameters are for the descriptors of the process
+    /// substitutions set up while its words were expanded.
+    fn install_word_process_substitutions(&mut self) {
+        let waiting = std::mem::take(
+            &mut *self
+                .word_process_substitutions
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (fd, file) in waiting {
+            self.open_files.set_fd(fd, file);
+        }
+    }
 }
 
 /// A process substitution's buffered output as input: when it was cut off at the limit, a read
@@ -3691,7 +3797,9 @@ fn spawn_command_task(
     )
 )]
 fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
-    let bytes = contents.as_bytes();
+    // The body's bytes, including any that are not UTF-8 (see `rawbytes`).
+    let bytes = crate::rawbytes::encode(contents);
+    let bytes = bytes.as_ref();
 
     // wasm32-wasip2 has no OS pipes (`std::io::pipe()` errors "operation not supported on this
     // platform"). A here-document / here-string body is fully known up front, so stage it through the
