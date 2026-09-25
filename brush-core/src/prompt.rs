@@ -92,6 +92,7 @@ async fn expand_prompt_text(
 
         // A command substitution whose command does not parse ends the prompt, as in bash, which
         // then runs what it took for its command (see [`run_broken_substitution`]).
+        let written = formatted_prompt.clone();
         let broken = broken_substitution(&formatted_prompt, &shell.parser_options())
             .map(|start| formatted_prompt.split_off(start).split_off(2));
 
@@ -105,9 +106,34 @@ async fn expand_prompt_text(
             unquoted_backslash_handling: expansion::UnquotedBackslashHandling::DoubleQuoted,
             ..Default::default()
         };
-        formatted_prompt =
-            expansion::basic_expand_word_with_options(shell, params, &formatted_prompt, &options)
-                .await?;
+        formatted_prompt = match expansion::basic_expand_word_with_options(
+            shell,
+            params,
+            &formatted_prompt,
+            &options,
+        )
+        .await
+        {
+            Ok(expanded) => expanded,
+            // A prompt whose expansion fails (an arithmetic error, a bad substitution, an unset
+            // variable under `set -u`) is reported and used as it reads, as in bash: the command
+            // using it goes on, and the shell does not exit.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    error::ErrorKind::ExpandingUnsetVariable(_)
+                        | error::ErrorKind::CheckedExpansionError(_)
+                        | error::ErrorKind::BadSubstitution(_)
+                ) || !error.is_fatal()
+                    && !matches!(error.kind(), error::ErrorKind::PromptRefused(_)) =>
+            {
+                if !error.is_reported() {
+                    let _ = shell.display_error(&mut params.stderr(shell), &error);
+                }
+                return Ok(written);
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(rest) = broken {
             let output = run_broken_substitution(shell, params, rest).await?;
             formatted_prompt.push_str(&output);
