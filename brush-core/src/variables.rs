@@ -350,7 +350,7 @@ impl ShellVariable {
                 Err(error::ErrorKind::ConvertingIndexedArrayToAssociativeArray.into())
             }
             _ => {
-                let mut new_values: BTreeMap<String, String> = BTreeMap::new();
+                let mut new_values = AssociativeValues::default();
                 new_values.insert(
                     String::from("0"),
                     self.value.to_cow_str_without_dynamic_support().to_string(),
@@ -722,6 +722,124 @@ impl ShellVariable {
     }
 }
 
+/// An associative array's elements, listed in the order bash's hash table lists them.
+///
+/// That is by bucket of the key's FNV-1 hash, and within a bucket most recently added first. The
+/// table starts with 1024 buckets and grows fourfold, rehashing, once it holds twice as many
+/// elements as buckets; removing elements never shrinks it.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AssociativeValues {
+    values: std::collections::HashMap<String, String>,
+    /// The keys in each non-empty bucket, head of the bucket's list first.
+    buckets: BTreeMap<u32, Vec<String>>,
+    bucket_count: u32,
+}
+
+impl Default for AssociativeValues {
+    fn default() -> Self {
+        Self {
+            values: std::collections::HashMap::new(),
+            buckets: BTreeMap::new(),
+            bucket_count: 1024,
+        }
+    }
+}
+
+impl AssociativeValues {
+    /// Bash's `hash_string`: 32-bit FNV-1 over the key's bytes.
+    fn hash(key: &str) -> u32 {
+        key.bytes().fold(2_166_136_261_u32, |hash, byte| {
+            hash.wrapping_mul(16_777_619) ^ u32::from(byte)
+        })
+    }
+
+    fn bucket(&self, key: &str) -> u32 {
+        Self::hash(key) & (self.bucket_count - 1)
+    }
+
+    /// Returns the value of `key`, if present.
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.values.get(key)
+    }
+
+    /// Sets `key` to `value`, returning its previous value. A new key goes to the head of its
+    /// bucket; an existing one keeps its place.
+    pub fn insert(&mut self, key: String, value: String) -> Option<String> {
+        if let Some(existing) = self.values.get_mut(&key) {
+            return Some(std::mem::replace(existing, value));
+        }
+        if self.values.len() >= self.bucket_count as usize * 2 {
+            self.rehash(self.bucket_count.saturating_mul(4));
+        }
+        let bucket = self.bucket(&key);
+        self.buckets
+            .entry(bucket)
+            .or_default()
+            .insert(0, key.clone());
+        self.values.insert(key, value)
+    }
+
+    /// Removes `key`, returning its value.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        let value = self.values.remove(key)?;
+        let bucket = self.bucket(key);
+        if let Some(keys) = self.buckets.get_mut(&bucket) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.buckets.remove(&bucket);
+            }
+        }
+        Some(value)
+    }
+
+    /// Moves every key to a table of `bucket_count` buckets as bash does: bucket by bucket, each
+    /// key going to the head of its new bucket.
+    fn rehash(&mut self, bucket_count: u32) {
+        let old = std::mem::take(&mut self.buckets);
+        self.bucket_count = bucket_count;
+        for key in old.into_values().flatten() {
+            let bucket = self.bucket(&key);
+            self.buckets.entry(bucket).or_default().insert(0, key);
+        }
+    }
+
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether there are no elements.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// The keys, in bash's order.
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.buckets.values().flatten()
+    }
+
+    /// The values, in bash's order.
+    pub fn values(&self) -> impl Iterator<Item = &String> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    /// The keys and values, in bash's order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.keys()
+            .filter_map(|key| self.values.get(key).map(|value| (key, value)))
+    }
+}
+
+impl<'a> IntoIterator for &'a AssociativeValues {
+    type Item = (&'a String, &'a String);
+    type IntoIter = Box<dyn Iterator<Item = (&'a String, &'a String)> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
 type DynamicValueGetter = fn(&dyn ShellState) -> ShellValue;
 type DynamicValueSetter = fn(&dyn ShellState) -> ();
 
@@ -734,7 +852,7 @@ pub enum ShellValue {
     /// A string.
     String(String),
     /// An associative array.
-    AssociativeArray(BTreeMap<String, String>),
+    AssociativeArray(AssociativeValues),
     /// An indexed array.
     IndexedArray(BTreeMap<u64, String>),
     /// A value that is dynamically computed.
@@ -951,14 +1069,14 @@ impl ShellValue {
     ///
     /// * `literals` - The literals to construct the associative array from.
     pub fn associative_array_from_literals(literals: ArrayLiteral) -> Result<Self, error::Error> {
-        let mut values = BTreeMap::new();
+        let mut values = AssociativeValues::default();
         Self::update_associative_array_from_literals(&mut values, literals)?;
 
         Ok(Self::AssociativeArray(values))
     }
 
     fn update_associative_array_from_literals(
-        existing_values: &mut BTreeMap<String, String>,
+        existing_values: &mut AssociativeValues,
         literal_values: ArrayLiteral,
     ) -> Result<(), error::Error> {
         let mut current_key = None;
@@ -1232,5 +1350,43 @@ impl From<Vec<String>> for ShellValue {
 impl From<Vec<&str>> for ShellValue {
     fn from(values: Vec<&str>) -> Self {
         Self::indexed_array_from_strs(values.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(values: &AssociativeValues) -> Vec<&str> {
+        values.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn associative_values_are_listed_in_bash_order() {
+        let mut values = AssociativeValues::default();
+        for key in ["web", "db", "cache", "api"] {
+            values.insert(key.to_owned(), String::new());
+        }
+        // Bash 5: `declare -A port=([web]=80 [db]=5432 [cache]=6379 [api]=8080)`.
+        assert_eq!(keys(&values), ["db", "api", "web", "cache"]);
+
+        // A key removed and added again goes to the head of its bucket; updating keeps its place.
+        values.remove("db");
+        values.insert("db".to_owned(), String::new());
+        values.insert("zz".to_owned(), String::new());
+        values.insert("web".to_owned(), "x".to_owned());
+        assert_eq!(keys(&values), ["db", "api", "zz", "web", "cache"]);
+        assert_eq!(values.get("web").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn associative_values_grow_and_keep_every_key() {
+        let mut values = AssociativeValues::default();
+        for i in 0..3000 {
+            values.insert(format!("k{i}"), i.to_string());
+        }
+        assert_eq!(values.len(), 3000);
+        assert_eq!(values.keys().count(), 3000);
+        assert_eq!(values.get("k2999").map(String::as_str), Some("2999"));
     }
 }
