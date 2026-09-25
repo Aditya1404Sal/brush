@@ -253,6 +253,7 @@ async fn execute_program(
         let (program, interrupted) = shell.begin_program();
         let input = shell.pending_input.take();
         let mut next_input_line = 1;
+        let mut quiet_lines: Option<std::collections::HashSet<usize>> = None;
 
         for (index, command) in program_ast.complete_commands.iter().enumerate() {
             shell.begin_command_unit(program, index);
@@ -261,13 +262,19 @@ async fn execute_program(
                 let end = ast::SourceLocation::location(command)
                     .map_or(next_input_line, |span| span.end.line);
                 if shell.options().print_shell_input_lines && end >= next_input_line {
+                    let quiet = quiet_lines.get_or_insert_with(|| {
+                        lines_inside_substitutions(input, &shell.parser_options())
+                    });
                     let mut stderr = params.stderr(shell);
-                    for line in input
+                    for (number, line) in input
                         .lines()
+                        .enumerate()
                         .skip(next_input_line - 1)
                         .take(end + 1 - next_input_line)
                     {
-                        let _ = writeln!(stderr, "{line}");
+                        if !quiet.contains(&(number + 1)) {
+                            let _ = writeln!(stderr, "{line}");
+                        }
                     }
                 }
                 next_input_line = next_input_line.max(end + 1);
@@ -2481,6 +2488,57 @@ async fn setup_command_redirects(
     }
     params.install_word_process_substitutions();
     Ok(true)
+}
+
+/// The input lines `set -v` does not echo: bash reads the lines after the first of a multi-line
+/// `$( )` while it parses the substitution, and echoes none of them.
+fn lines_inside_substitutions(
+    input: &str,
+    options: &brush_parser::ParserOptions,
+) -> std::collections::HashSet<usize> {
+    fn substitutions(
+        pieces: &[brush_parser::word::WordPieceWithSource],
+        found: &mut Vec<(usize, usize)>,
+    ) {
+        for piece in pieces {
+            match &piece.piece {
+                brush_parser::word::WordPiece::CommandSubstitution(_) => {
+                    found.push((piece.start_index, piece.end_index));
+                }
+                brush_parser::word::WordPiece::DoubleQuotedSequence(inner)
+                | brush_parser::word::WordPiece::GettextDoubleQuotedSequence(inner) => {
+                    substitutions(inner, found);
+                }
+                _ => (),
+            }
+        }
+    }
+
+    let mut lines = std::collections::HashSet::new();
+    let Ok(tokens) = brush_parser::tokenize_str(input) else {
+        return lines;
+    };
+    for token in tokens {
+        let brush_parser::Token::Word(text, span) = token else {
+            continue;
+        };
+        if !text.contains('\n') {
+            continue;
+        }
+        let Ok(pieces) = brush_parser::word::parse(&text, options) else {
+            continue;
+        };
+        let mut found = vec![];
+        substitutions(&pieces, &mut found);
+        for (start, end) in found {
+            let (Some(before), Some(inside)) = (text.get(..start), text.get(start..end)) else {
+                continue;
+            };
+            let first_line = span.start.line + before.matches('\n').count();
+            lines.extend(first_line + 1..=first_line + inside.matches('\n').count());
+        }
+    }
+    lines
 }
 
 /// What happens before a simple command's words are expanded: its text becomes `BASH_COMMAND`
