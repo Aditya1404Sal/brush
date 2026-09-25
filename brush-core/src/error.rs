@@ -329,6 +329,11 @@ pub enum ErrorKind {
     #[error("{0}: bad array subscript")]
     BadArraySubscript(String),
 
+    /// An element without a subscript in a compound assignment to an associative array whose
+    /// elements have them; bash names no builtin for it.
+    #[error("{0}: {1}: must use subscript when assigning associative array")]
+    AssocSubscriptRequired(String, String),
+
     /// A subscript of a compound array assignment that does not evaluate; bash names no builtin
     /// for it, even in `declare` or `local`.
     #[error("{0}")]

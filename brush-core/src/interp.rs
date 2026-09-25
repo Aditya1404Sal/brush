@@ -2478,12 +2478,39 @@ async fn execute_command<T: Into<String>>(
     }
 
     if guard.shell().options().print_commands_and_arguments {
+        // Bash traces a declaration builtin's compound assignments first, each on its own line
+        // with every word quoted, then the command with only their names.
+        for (assignment, elements) in args.iter().filter_map(compound_arg) {
+            let op = if assignment.append { "+=" } else { "=" };
+            let quoted = elements
+                .iter()
+                .map(|(key, value)| match key {
+                    Some(key) => std::format!(
+                        "[{}]={}",
+                        sh_single_quote(&key.value),
+                        sh_single_quote(&value.value)
+                    ),
+                    None => sh_single_quote(&value.value),
+                })
+                .join(" ");
+            guard
+                .shell()
+                .trace_command(
+                    trace_params.unwrap_or(&params),
+                    std::format!("{}{op}({quoted})", assignment.name),
+                )
+                .await;
+        }
+        let line = args
+            .iter()
+            .map(|arg| match compound_arg(arg) {
+                Some((assignment, _)) => Cow::Owned(assignment.name.to_string()),
+                None => arg.quote_for_tracing(),
+            })
+            .join(" ");
         guard
             .shell()
-            .trace_command(
-                trace_params.unwrap_or(&params),
-                args.iter().map(|arg| arg.quote_for_tracing()).join(" "),
-            )
+            .trace_command(trace_params.unwrap_or(&params), line)
             .await;
     }
 
@@ -2739,6 +2766,43 @@ async fn apply_assignment_unchecked(
     }
     let variable_name = &resolved_name;
 
+    let associative = shell.env().get(variable_name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            ShellValue::AssociativeArray(_)
+                | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+        )
+    });
+    if let ast::AssignmentValue::Array(elements) = &assignment.value {
+        // Bash traces a compound assignment as written, before expanding its elements.
+        if shell.options().print_commands_and_arguments {
+            let op = if assignment.append { "+=" } else { "=" };
+            let written = elements
+                .iter()
+                .map(|(key, value)| match key {
+                    Some(key) => std::format!("[{}]={}", key.value, value.value),
+                    None => value.value.clone(),
+                })
+                .join(" ");
+            shell
+                .trace_command(
+                    trace_params,
+                    std::format!("{}{op}({written})", assignment.name),
+                )
+                .await;
+        }
+        // Once an associative array's first element has a subscript, every element needs one.
+        if associative && elements.first().is_some_and(|(key, _)| key.is_some()) {
+            if let Some((_, word)) = elements.iter().find(|(key, _)| key.is_none()) {
+                let kind = error::ErrorKind::AssocSubscriptRequired(
+                    variable_name.clone(),
+                    word.value.clone(),
+                );
+                return Err(error::Error::from(kind).into_fatal());
+            }
+        }
+    }
+
     // Expand the values.
     let new_value = match &assignment.value {
         ast::AssignmentValue::Scalar(unexpanded_value) => {
@@ -2794,12 +2858,15 @@ async fn apply_assignment_unchecked(
         new_value
     };
 
-    if shell.options().print_commands_and_arguments {
+    if shell.options().print_commands_and_arguments
+        && let ShellValueLiteral::Scalar(value) = &new_value
+    {
         let op = if assignment.append { "+=" } else { "=" };
         // Bash prints an empty value as nothing: `a=`.
-        let traced = match &new_value {
-            ShellValueLiteral::Scalar(value) if value.is_empty() => String::new(),
-            value => value.to_string(),
+        let traced = if value.is_empty() {
+            String::new()
+        } else {
+            new_value.to_string()
         };
         shell
             .trace_command(
@@ -2809,29 +2876,19 @@ async fn apply_assignment_unchecked(
             .await;
     }
 
-    // A compound assignment to an indexed array evaluates its subscripts arithmetically, after
-    // the assignment is traced as written; an associative array's are words.
+    // A compound assignment to an indexed array evaluates its subscripts arithmetically; an
+    // associative array's are words.
     let new_value = match new_value {
-        ShellValueLiteral::Array(literal)
-            if !shell.env().get(variable_name).is_some_and(|(_, var)| {
-                matches!(
-                    var.value(),
-                    ShellValue::AssociativeArray(_)
-                        | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
-                )
-            }) =>
-        {
-            ShellValueLiteral::Array(
-                arithmetic::resolve_indexed_array_literal(
-                    shell,
-                    params,
-                    variable_name,
-                    assignment.append,
-                    literal,
-                )
-                .await?,
+        ShellValueLiteral::Array(literal) if !associative => ShellValueLiteral::Array(
+            arithmetic::resolve_indexed_array_literal(
+                shell,
+                params,
+                variable_name,
+                assignment.append,
+                literal,
             )
-        }
+            .await?,
+        ),
         value => value,
     };
 
@@ -3742,6 +3799,25 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
         drop(writer);
 
         Ok(reader.into())
+    }
+}
+
+/// The elements of a compound array assignment, each with its subscript, if any.
+type ArrayElements = [(Option<ast::Word>, ast::Word)];
+
+/// Bash's `sh_single_quote`: the text in single quotes, each `'` as `'\''`.
+fn sh_single_quote(text: &str) -> String {
+    std::format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// A command argument that is a compound array assignment, with its elements.
+fn compound_arg(arg: &CommandArg) -> Option<(&ast::Assignment, &ArrayElements)> {
+    match arg {
+        CommandArg::Assignment(a) => match &a.value {
+            ast::AssignmentValue::Array(elements) => Some((a, elements)),
+            ast::AssignmentValue::Scalar(_) => None,
+        },
+        CommandArg::String(_) => None,
     }
 }
 

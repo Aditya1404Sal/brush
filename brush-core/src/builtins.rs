@@ -743,6 +743,10 @@ async fn call_builtin(
                     return error::Error::from(error::ErrorKind::SubscriptEvalError(text.clone()))
                         .into_fatal();
                 }
+                error::ErrorKind::AssocSubscriptRequired(name, word) if inner.is_fatal() => {
+                    let kind = error::ErrorKind::AssocSubscriptRequired(name.clone(), word.clone());
+                    return error::Error::from(kind).into_fatal();
+                }
                 error::ErrorKind::BadArraySubscript(text) if inner.is_fatal() => {
                     return error::Error::from(error::ErrorKind::BadArraySubscript(text.clone()))
                         .into_fatal();

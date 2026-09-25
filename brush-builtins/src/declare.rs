@@ -382,6 +382,20 @@ impl DeclareCommand {
                     )?,
                 ))
             }
+            // Once an associative array's first element has a subscript, every element needs one.
+            Some(ShellValueLiteral::Array(ArrayLiteral(elements)))
+                if assigned_index.is_none()
+                    && elements.first().is_some_and(|(key, _)| key.is_some())
+                    && elements.iter().any(|(key, _)| key.is_none()) =>
+            {
+                let word = elements
+                    .iter()
+                    .find(|(key, _)| key.is_none())
+                    .map(|(_, word)| std::format!("'{}'", word.replace('\'', "'\\''")))
+                    .unwrap_or_default();
+                let kind = ErrorKind::AssocSubscriptRequired(name.clone(), word);
+                return Err(brush_core::Error::from(kind).into_fatal());
+            }
             value => value,
         };
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
