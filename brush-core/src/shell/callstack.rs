@@ -2,6 +2,22 @@
 
 use crate::{ExecutionParameters, callstack, env, error, functions, trace_categories};
 
+/// How many programs and lists may nest (see `Shell::nesting`). Each level costs up to about
+/// 2.3 KiB of Wasmtime's 512 KiB native stack, which the component cannot observe, so this count
+/// is what keeps that stack from running out; 160 leaves room for the commands the innermost
+/// list runs.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const MAX_NESTING: usize = 160;
+
+/// Shadow stack a function call leaves for everything below it: the deepest command it may run
+/// without calling further. Above [`STACK_RESERVE`], so a recursing function reports the function.
+#[cfg(target_arch = "wasm32")]
+const FUNCTION_STACK_RESERVE: usize = 320 * 1024;
+
+/// Shadow stack any nested execution leaves for the commands it runs (see `sys::wasm::stack`).
+#[cfg(target_arch = "wasm32")]
+pub(crate) const STACK_RESERVE: usize = 256 * 1024;
+
 #[cfg(any(target_arch = "wasm32", test))]
 type FrameCleanup<SE> = fn(&mut crate::Shell<SE>) -> Result<(), error::Error>;
 
@@ -151,10 +167,30 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         args: impl IntoIterator<Item = String>,
         _params: &ExecutionParameters,
     ) -> Result<(), error::Error> {
-        if let Some(max_call_depth) = self.options.max_function_call_depth
-            && self.call_stack.function_call_depth() >= max_call_depth
+        // As bash: `FUNCNEST`, when a positive number, limits the nesting, and exceeding it ends
+        // a non-interactive shell.
+        let depth = self.call_stack.function_call_depth();
+        let funcnest = self
+            .env
+            .get_str("FUNCNEST", self)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0);
+        if let Some(max_call_depth) = funcnest.or(self.options.max_function_call_depth)
+            && depth >= max_call_depth
         {
-            return Err(error::ErrorKind::MaxFunctionCallDepthExceeded.into());
+            let kind = error::ErrorKind::MaxFunctionCallDepthExceeded(name.to_owned(), depth);
+            return Err(error::Error::from(kind).into_fatal());
+        }
+        // A call the stack cannot hold ends the shell the same way, rather than trapping.
+        // A few lists short of the limit, so a recursing function is reported by name before its
+        // body's compound commands reach it.
+        #[cfg(target_arch = "wasm32")]
+        if self.nesting + 8 >= MAX_NESTING
+            || crate::sys::wasm::stack::remaining() < FUNCTION_STACK_RESERVE
+        {
+            let kind = error::ErrorKind::FunctionNestingTooDeep(name.to_owned(), depth);
+            return Err(error::Error::from(kind).into_fatal());
         }
 
         if tracing::enabled!(target: trace_categories::FUNCTIONS, tracing::Level::DEBUG) {

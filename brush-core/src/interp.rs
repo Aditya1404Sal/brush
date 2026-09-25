@@ -217,10 +217,31 @@ impl Execute for ast::Program {
         shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
+        // A parsed program (`eval`, `source`, a substitution, `sh -c`, a trap handler) costs more
+        // stack than a list, so it counts as one more level of nesting (see `MAX_NESTING`).
+        #[cfg(target_arch = "wasm32")]
+        {
+            shell.nesting += 1;
+            let mut frame = crate::shell::FrameGuard::new(shell, leave_list, None);
+            let result = execute_program(self, frame.shell(), params).await;
+            frame.finish()?;
+            result
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        execute_program(self, shell, params).await
+    }
+}
+
+async fn execute_program(
+    program_ast: &ast::Program,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Result<ExecutionResult, error::Error> {
+    {
         let mut result = ExecutionResult::success();
         let (program, interrupted) = shell.begin_program();
 
-        for (index, command) in self.complete_commands.iter().enumerate() {
+        for (index, command) in program_ast.complete_commands.iter().enumerate() {
             shell.begin_command_unit(program, index);
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
@@ -256,9 +277,48 @@ impl Execute for ast::CompoundList {
         shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
+        // Every nested execution (a function body, a subshell, a substitution, `eval`, `source`)
+        // runs a list; one the stack cannot hold ends the shell rather than trapping.
+        #[cfg(target_arch = "wasm32")]
+        {
+            if shell.nesting >= crate::shell::MAX_NESTING
+                || crate::sys::wasm::stack::remaining() < crate::shell::STACK_RESERVE
+            {
+                return Err(error::Error::from(error::ErrorKind::NestingTooDeep).into_fatal());
+            }
+            shell.nesting += 1;
+            let mut frame = crate::shell::FrameGuard::new(shell, leave_list, None);
+            let result = execute_list(self, frame.shell(), params).await;
+            frame.finish()?;
+            result
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        execute_list(self, shell, params).await
+    }
+}
+
+/// Leaves a program or list entered by its `execute`.
+#[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "a frame guard's cleanup is fallible"
+)]
+const fn leave_list(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+) -> Result<(), error::Error> {
+    shell.nesting = shell.nesting.saturating_sub(1);
+    Ok(())
+}
+
+async fn execute_list(
+    list: &ast::CompoundList,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Result<ExecutionResult, error::Error> {
+    {
         let mut result = ExecutionResult::success();
 
-        for ast::CompoundListItem(ao_list, sep) in &self.0 {
+        for ast::CompoundListItem(ao_list, sep) in &list.0 {
             let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
             if run_async {

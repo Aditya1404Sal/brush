@@ -275,9 +275,21 @@ pub enum ErrorKind {
     #[error("interrupted")]
     Interrupted,
 
-    /// Maximum function call depth was exceeded.
-    #[error("maximum function call depth exceeded")]
-    MaxFunctionCallDepthExceeded,
+    /// A function call would nest deeper than `FUNCNEST` (or the embedder's limit) allows: the
+    /// function's name and the nesting level reached.
+    #[error("{0}: maximum function nesting level exceeded ({1})")]
+    MaxFunctionCallDepthExceeded(String, usize),
+
+    /// A function call would nest deeper than the stack can hold: the function's name and the
+    /// nesting level reached.
+    #[error(
+        "{0}: maximum function nesting level exceeded ({1}): deeper nesting is unsupported in bash-tool"
+    )]
+    FunctionNestingTooDeep(String, usize),
+
+    /// Execution would nest deeper than the stack can hold.
+    #[error("maximum nesting level exceeded: deeper nesting is unsupported in bash-tool")]
+    NestingTooDeep,
 
     /// System time error.
     #[error("system time error: {0}")]

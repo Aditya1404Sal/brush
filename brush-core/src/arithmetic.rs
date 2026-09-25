@@ -6,8 +6,13 @@ use crate::{ExecutionParameters, Shell, env, expansion, extensions, variables};
 use brush_parser::ast;
 
 /// Maximum recursion depth for arithmetic variable dereference chains
-/// (e.g., a=b, b=c, c=a would cycle through variable dereferences).
+/// (e.g., a=b, b=c, c=a would cycle through variable dereferences). Bash allows 1024; on WASM
+/// each level costs about half a KiB of Wasmtime's 512 KiB native stack, which deeply nested
+/// shell code may already have used most of, so the limit there is 200.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
+#[cfg(target_arch = "wasm32")]
+const MAX_VARIABLE_DEREF_DEPTH: u32 = 200;
 
 /// Represents an error that occurs during evaluation of an arithmetic expression.
 #[derive(Debug, thiserror::Error)]
@@ -118,8 +123,11 @@ pub(crate) async fn expand_and_eval(
     }
 
     // Now evaluate.
-    expr.eval(shell)
-        .map_err(|error| EvalError::InExpression(expanded_self.clone(), Box::new(error)))
+    expr.eval(shell).map_err(|error| match error {
+        // Already names the expression it failed in.
+        EvalError::InExpression(..) => error,
+        error => EvalError::InExpression(expanded_self.clone(), Box::new(error)),
+    })
 }
 
 /// Bash's wording for an arithmetic error: `EXPR: message (error token is "TOKEN")`, where the
@@ -133,6 +141,7 @@ fn in_expression_message(expr: &str, error: &EvalError) -> String {
             .rsplit_once("**")
             .map(|(_, rest)| rest.trim().trim_start_matches('-').to_owned()),
         EvalError::ParseError(_) => expr.trim_end().chars().last().map(String::from),
+        EvalError::RecursionLimitExceeded => Some(expr.to_owned()),
         _ => None,
     };
     match (error, token) {
@@ -313,7 +322,11 @@ fn deref_lvalue(
 
     let new_depth = depth + 1;
     if new_depth > MAX_VARIABLE_DEREF_DEPTH {
-        return Err(EvalError::RecursionLimitExceeded);
+        // Bash names the expression it was about to evaluate, and all of it as the token.
+        return Err(EvalError::InExpression(
+            value_str.to_string(),
+            Box::new(EvalError::RecursionLimitExceeded),
+        ));
     }
 
     eval_expr_impl(&parsed_value, shell, new_depth)
