@@ -451,25 +451,37 @@ pub(crate) fn init_well_known_vars(
         getter: get_random_value,
         setter: |_| (),
     });
-    random_var.treat_as_integer();
+    random_var
+        .treat_as_integer()
+        .set_dynamic_state(variables::DynamicState::Random(
+            variables::RandomGenerator::new(rand::rng().random()),
+        ));
     shell.env_mut().set_global("RANDOM", random_var)?;
 
     // SECONDS
-    shell.env_mut().set_global(
-        "SECONDS",
-        ShellVariable::new(ShellValue::Dynamic {
-            getter: |shell| {
-                let now = std::time::SystemTime::now();
-                let since_last = now
-                    .duration_since(shell.last_stopwatch_time())
-                    .unwrap_or_default();
-                let total_seconds = since_last.as_secs() + u64::from(shell.last_stopwatch_offset());
-                total_seconds.to_string().into()
-            },
-            // TODO(vars): implement updating SECONDS
-            setter: |_| (),
-        }),
-    )?;
+    let mut seconds_var = ShellVariable::new(ShellValue::Dynamic {
+        getter: |shell| {
+            // Assigning SECONDS restarts the count from the assigned value.
+            if let Some(seconds) = shell
+                .env()
+                .get_raw("SECONDS")
+                .and_then(|(_, var)| var.dynamic_state().assigned_seconds())
+            {
+                return seconds.to_string().into();
+            }
+            let now = std::time::SystemTime::now();
+            let since_last = now
+                .duration_since(shell.last_stopwatch_time())
+                .unwrap_or_default();
+            let total_seconds = since_last.as_secs() + u64::from(shell.last_stopwatch_offset());
+            total_seconds.to_string().into()
+        },
+        setter: |_| (),
+    });
+    seconds_var
+        .treat_as_integer()
+        .set_dynamic_state(variables::DynamicState::Seconds(None));
+    shell.env_mut().set_global("SECONDS", seconds_var)?;
 
     // SHELL (if not already set)
     if !shell.env().is_set("SHELL") {
@@ -568,9 +580,13 @@ fn get_current_user_gids() -> Vec<u32> {
     groups
 }
 
-fn get_random_value(_shell: &dyn ShellState) -> ShellValue {
-    let mut rng = rand::rng();
-    let num = rng.random_range(0..32768);
+fn get_random_value(shell: &dyn ShellState) -> ShellValue {
+    // RANDOM's own generator, which an assignment seeds.
+    let num = shell
+        .env()
+        .get_raw("RANDOM")
+        .and_then(|(_, var)| var.dynamic_state().next_random())
+        .unwrap_or_else(|| rand::rng().random_range(0..32768));
     let str = num.to_string();
     str.into()
 }

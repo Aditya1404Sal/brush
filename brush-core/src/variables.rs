@@ -28,6 +28,130 @@ pub struct ShellVariable {
     treat_as_integer: bool,
     /// Whether or not the variable should be treated as a name reference.
     treat_as_nameref: bool,
+    /// What a dynamic variable keeps between reads and assignments.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dynamic_state: DynamicState,
+}
+
+/// What a dynamic variable keeps between reads and assignments: `RANDOM`'s generator, and the
+/// count `SECONDS` was last assigned.
+#[derive(Debug, Default)]
+pub(crate) enum DynamicState {
+    /// Nothing is kept.
+    #[default]
+    None,
+    /// `RANDOM`'s generator.
+    Random(RandomGenerator),
+    /// The value `SECONDS` was last assigned, and when, in whole seconds since the epoch.
+    Seconds(Option<(i64, i64)>),
+}
+
+impl Clone for DynamicState {
+    fn clone(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Random(generator) => Self::Random(generator.clone()),
+            Self::Seconds(assigned) => Self::Seconds(*assigned),
+        }
+    }
+}
+
+impl DynamicState {
+    /// Applies an assignment of `value` (already evaluated, as the variables are integers).
+    fn assign(&mut self, value: &str) {
+        let value = value.trim().parse::<i64>().unwrap_or(0);
+        match self {
+            Self::None => (),
+            Self::Random(generator) => generator.seed(value),
+            Self::Seconds(assigned) => *assigned = Some((value, epoch_seconds())),
+        }
+    }
+
+    /// The next value of `RANDOM`, if this is its generator.
+    pub(crate) fn next_random(&self) -> Option<u32> {
+        match self {
+            Self::Random(generator) => Some(generator.next()),
+            _ => None,
+        }
+    }
+
+    /// The value of `SECONDS`, if it was assigned one.
+    pub(crate) fn assigned_seconds(&self) -> Option<i64> {
+        match self {
+            Self::Seconds(Some((value, since))) => {
+                Some(value.wrapping_add(epoch_seconds().saturating_sub(*since)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The current time in whole seconds since the epoch.
+pub(crate) fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Bash's generator for `RANDOM`: the Park-Miller minimal standard generator, folded to 15 bits,
+/// never giving the same value twice in a row. Assigning `RANDOM` seeds it, so a seeded sequence
+/// repeats exactly as bash's does.
+#[derive(Debug)]
+pub(crate) struct RandomGenerator {
+    state: std::sync::atomic::AtomicU32,
+    last: std::sync::atomic::AtomicU32,
+}
+
+impl RandomGenerator {
+    /// A generator with the given seed.
+    pub(crate) const fn new(seed: u32) -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU32::new(seed),
+            last: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn seed(&self, seed: i64) {
+        // Bash keeps the low 32 bits of the seed.
+        self.state
+            .store(seed as u32, std::sync::atomic::Ordering::Relaxed);
+        self.last.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn next(&self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.last.load(Relaxed);
+        let mut state = self.state.load(Relaxed);
+        let value = loop {
+            // x' = 16807 x mod (2^31 - 1), split so that nothing overflows; 0 cannot seed it.
+            let x = i64::from(if state == 0 { 123_459_876 } else { state });
+            let (high, low) = (x / 127_773, x % 127_773);
+            let t = 16807 * low - 2836 * high;
+            state = (if t < 0 { t + 0x7fff_ffff } else { t }) as u32;
+            let value = ((state >> 16) ^ (state & 0xffff)) & 0x7fff;
+            if value != last {
+                break value;
+            }
+        };
+        self.state.store(state, Relaxed);
+        self.last.store(value, Relaxed);
+        value
+    }
+}
+
+impl Clone for RandomGenerator {
+    fn clone(&self) -> Self {
+        let generator = Self::new(self.state.load(std::sync::atomic::Ordering::Relaxed));
+        generator.last.store(
+            self.last.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        generator
+    }
 }
 
 /// Kind of transformation to apply to a variable's value when it is updated.
@@ -55,6 +179,7 @@ impl Default for ShellVariable {
             trace: false,
             treat_as_integer: false,
             treat_as_nameref: false,
+            dynamic_state: DynamicState::None,
         }
     }
 }
@@ -75,6 +200,17 @@ impl ShellVariable {
     /// Returns the value associated with the variable.
     pub const fn value(&self) -> &ShellValue {
         &self.value
+    }
+
+    /// What the dynamic variable keeps between reads and assignments.
+    pub(crate) const fn dynamic_state(&self) -> &DynamicState {
+        &self.dynamic_state
+    }
+
+    /// Gives the dynamic variable state to keep between reads and assignments.
+    pub(crate) const fn set_dynamic_state(&mut self, state: DynamicState) -> &mut Self {
+        self.dynamic_state = state;
+        self
     }
 
     /// Returns whether or not the variable is exported to child processes.
@@ -352,9 +488,12 @@ impl ShellVariable {
                     Ok(())
                 }
 
-                // Handle updates to dynamic values; for now we just drop them.
-                // TODO(dynamic): Allow updates to dynamic values
-                (ShellValue::Dynamic { .. }, _) => Ok(()),
+                // An assignment seeds `RANDOM` and restarts `SECONDS`; other dynamic values
+                // ignore it.
+                (ShellValue::Dynamic { .. }, ShellValueLiteral::Scalar(s)) => {
+                    self.dynamic_state.assign(&s);
+                    Ok(())
+                }
 
                 // Assign a scalar value to a scalar or unset (and untyped) variable.
                 (ShellValue::String(_) | ShellValue::Unset(_), ShellValueLiteral::Scalar(s)) => {
