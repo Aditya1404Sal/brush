@@ -284,6 +284,16 @@ impl ShellEnvironment {
         resolved
     }
 
+    /// The array element a nameref names (`declare -n ref='arr[1]'`), as the array's name and the
+    /// subscript as written, or `None` when `name` does not resolve to an element.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to resolve.
+    pub fn resolve_nameref_element(&self, name: &str) -> Option<(String, String)> {
+        split_element_name(self.resolve_nameref(name).as_ref())
+    }
+
     /// Tries to retrieve a mutable reference to the variable with the given name
     /// in the environment.
     ///
@@ -564,6 +574,22 @@ impl ShellEnvironment {
         // Assigning through a nameref assigns to (and if need be creates) the variable it names.
         let name = self.resolve_nameref(&name.into()).into_owned();
 
+        // An array element, named directly (`read 'arr[1]'`) or through a nameref, is assigned as
+        // `arr[1]=value` is: bash has no variable whose name holds a subscript.
+        let value = match (split_element_name(&name), value) {
+            (Some((array, index)), variables::ShellValueLiteral::Scalar(value)) => {
+                return self.update_or_add_array_element(
+                    array,
+                    index,
+                    value,
+                    updater,
+                    lookup_policy,
+                    scope_if_creating,
+                );
+            }
+            (_, value) => value,
+        };
+
         let auto_export = self.export_variables_on_modification;
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
             var.assign(value, false)?;
@@ -739,6 +765,14 @@ pub fn valid_variable_name(s: &str) -> bool {
     }
 }
 
+/// Splits an array element's name (`arr[subscript]`) into the array's name and the subscript as
+/// written, or `None` for any other name.
+fn split_element_name(name: &str) -> Option<(String, String)> {
+    let (array, rest) = name.split_once('[')?;
+    let index = rest.strip_suffix(']')?;
+    valid_variable_name(array).then(|| (array.to_owned(), index.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +792,51 @@ mod tests {
         assert!(valid_variable_name("A"));
         assert!(valid_variable_name("a1"));
         assert!(valid_variable_name("A1"));
+    }
+
+    #[test]
+    fn element_names_split_into_array_and_subscript() {
+        let split = |name| split_element_name(name);
+        assert_eq!(split("a[1]"), Some(("a".into(), "1".into())));
+        assert_eq!(split("m[some key]"), Some(("m".into(), "some key".into())));
+        assert_eq!(split("a[$i+1]"), Some(("a".into(), "$i+1".into())));
+        assert_eq!(split("a"), None);
+        assert_eq!(split("1a[0]"), None);
+        assert_eq!(split("a[0"), None);
+    }
+
+    #[test]
+    fn assigning_an_element_name_or_a_nameref_to_one_sets_the_element() -> Result<(), error::Error>
+    {
+        let mut env = ShellEnvironment::new();
+        let set = |env: &mut ShellEnvironment, name: &str, value: &str| {
+            env.update_or_add(
+                name,
+                variables::ShellValueLiteral::Scalar(value.into()),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )
+        };
+        set(&mut env, "a[1]", "x")?;
+        env.add(
+            "r",
+            ShellVariable::new(ShellValue::String("a[2]".into())),
+            EnvironmentScope::Global,
+        )?;
+        if let Some(r) = env.get_mut_using_policy_raw("r", EnvironmentLookup::Anywhere) {
+            r.treat_as_nameref();
+        }
+        set(&mut env, "r", "y")?;
+
+        // Both land in `a`; nothing named `a[1]` or `a[2]` comes into being.
+        assert!(env.get_raw("a[1]").is_none() && env.get_raw("a[2]").is_none());
+        let a = env.get("a").map(|(_, var)| format!("{:?}", var.value()));
+        assert!(
+            a.as_deref()
+                .is_some_and(|a| a.contains("\"x\"") && a.contains("\"y\"")),
+            "{a:?}"
+        );
+        Ok(())
     }
 }

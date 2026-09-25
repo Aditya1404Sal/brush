@@ -2031,6 +2031,20 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         parameter: &brush_parser::word::Parameter,
         allow_unset_vars: bool,
     ) -> Result<Expansion, error::Error> {
+        // A nameref to an array element (`declare -n ref='arr[1]'`) expands as that element.
+        let element;
+        let parameter = match parameter {
+            brush_parser::word::Parameter::Named(n) => {
+                match self.shell.env().resolve_nameref_element(n) {
+                    Some((name, index)) => {
+                        element = brush_parser::word::Parameter::NamedWithIndex { name, index };
+                        &element
+                    }
+                    None => parameter,
+                }
+            }
+            _ => parameter,
+        };
         match parameter {
             brush_parser::word::Parameter::Positional(p) => {
                 if *p == 0 {

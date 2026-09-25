@@ -2075,11 +2075,18 @@ async fn apply_assignment_unchecked(
             name
         }
     };
-    // Assigning through a nameref assigns to the variable it names.
-    let resolved_name = shell
+    // Assigning through a nameref assigns to the variable it names, and a nameref to an array
+    // element (`declare -n ref='arr[1]'`) to that element, just as `arr[1]=value` would.
+    let mut resolved_name = shell
         .env()
         .resolve_nameref(variable_name.as_str())
         .into_owned();
+    if array_index.is_none()
+        && let Some((array, index)) = shell.env().resolve_nameref_element(variable_name.as_str())
+    {
+        resolved_name = array;
+        array_index = Some(index);
+    }
     let variable_name = &resolved_name;
 
     // Expand the values.
