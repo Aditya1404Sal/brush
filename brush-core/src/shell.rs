@@ -91,8 +91,8 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     jobs: jobs::JobManager,
 
-    /// Shell aliases.
-    aliases: HashMap<String, String>,
+    /// Shell aliases, shared with the shell's clones until one of them changes them.
+    aliases: std::sync::Arc<HashMap<String, String>>,
 
     /// The status of the last completed command.
     last_exit_status: u8,
@@ -129,6 +129,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) exit_trace_level: usize,
 
+    /// Whether the shell that started this pipeline stage already ran its simple command's DEBUG
+    /// trap, as bash does before it forks the stage.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) debug_trap_ran: bool,
+
     /// Checks the text a prompt string (`PS4`, `${x@P}`) expands before any of its expansions
     /// run (see [`Self::set_prompt_guard`]).
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -140,11 +145,44 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) pending_input: Option<std::sync::Arc<str>>,
 
+    /// Bash's `SUBSHELL_PAREN`: this shell is a `( list )` subshell, and not a pipeline stage or
+    /// background command started inside one. `exec` there leaves `SHLVL` as it is.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) paren_subshell: bool,
+
+    /// Bash's `SUBSHELL_PIPE`: this shell is a pipeline stage, and not a `( list )` subshell or
+    /// background command started inside one. A command substitution there runs its last command
+    /// in a process of its own, so `SHLVL` stays as it is.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) stage_subshell: bool,
+
+    /// The simple command bash would run without forking, as `exec` does (see
+    /// [`crate::interp::NoFork`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) no_fork: crate::interp::NoFork,
+
+    /// Whether the next program is a command string whose last command bash runs without
+    /// forking (see [`Self::exec_last_command`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) exec_last: Option<crate::interp::CommandString>,
+
+    /// The warnings a circular name reference gets from an arithmetic expression being evaluated
+    /// (see [`Self::note_circular_nameref`]), held until the expression is done; `None` when no
+    /// evaluation collects them.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) nameref_warnings: Option<String>,
+
+    /// Whether the function about to be called runs its last command without forking, as the
+    /// call itself would have been (see [`crate::interp::NoFork`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) no_fork_call: bool,
+
     /// Shell name
     name: Option<String>,
 
-    /// Positional shell arguments (not including shell name).
-    args: Vec<String>,
+    /// Positional shell arguments (not including shell name), shared with the shell's clones
+    /// until one of them changes them.
+    args: std::sync::Arc<Vec<String>>,
 
     /// Shell version
     version: Option<String>,
@@ -184,6 +222,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// refused (see `interp`).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) nesting: usize,
+
+    /// Builtins that stand for programs a Linux system has as files in `/bin` and `/usr/bin`
+    /// (see `builtin_registry`): the embedder runs such a program in-process.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    programs: std::sync::Arc<HashMap<String, builtins::ProgramKind>>,
 
     /// The top-level command running now, as (program, index): an alias defined while it runs
     /// is not expanded until a later one, as bash reads a whole command before running any of it.
@@ -246,7 +289,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
-        Self {
+        let shell = Self {
             execution_services: self.execution_services,
             error_formatter: self.error_formatter.clone(),
             traps: self.traps.clone(),
@@ -280,6 +323,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             last_stopwatch_offset: self.last_stopwatch_offset,
             loop_depth: self.loop_depth,
             nesting: self.nesting,
+            programs: self.programs.clone(),
             command_unit: self.command_unit,
             alias_units: self.alias_units.clone(),
             programs_started: self.programs_started,
@@ -295,14 +339,26 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             trace_level: self.trace_level,
             exit_trace_level: self.trace_level + 1,
             pending_input: None,
+            debug_trap_ran: false,
             prompt_guard: self.prompt_guard,
+            paren_subshell: self.paren_subshell,
+            stage_subshell: self.stage_subshell,
+            no_fork: self.no_fork,
+            exec_last: None,
+            nameref_warnings: None,
+            no_fork_call: false,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             started_pid: self.started_pid,
             last_background_pid: self.last_background_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
+        };
+        // A subshell reseeds RANDOM before its first value, as bash does.
+        if let Some((_, random)) = shell.env.get_raw("RANDOM") {
+            random.dynamic_state().enter_subshell();
         }
+        shell
     }
 }
 
@@ -397,7 +453,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
-            args: options.shell_args.unwrap_or_default(),
+            args: std::sync::Arc::new(options.shell_args.unwrap_or_default()),
             version: options.shell_version,
             product_display_str: options.shell_product_display_str,
             working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
@@ -495,6 +551,37 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     pub fn set_current_cmd(&mut self, cmd: &impl brush_parser::ast::Node) {
         self.call_stack
             .set_current_pos(cmd.location().map(|span| span.start));
+    }
+
+    /// Shifts the line numbers of the current frame by `delta` (see
+    /// [`crate::callstack::Frame::line_shift`]).
+    pub(crate) fn shift_lines(&mut self, delta: isize) {
+        self.call_stack.shift_lines(delta);
+    }
+
+    /// The position the current command is numbered by (see [`Self::set_current_position`]).
+    pub(crate) fn current_position(&self) -> Option<std::sync::Arc<crate::SourcePosition>> {
+        self.call_stack
+            .current_frame()
+            .and_then(|frame| frame.current.clone())
+    }
+
+    /// Whether this shell is a subshell, a pipeline stage, a substitution or a background job of
+    /// the shell process it belongs to (bash's `subshell_environment`), and not that process
+    /// itself (a `bash -c` child is a process of its own).
+    pub const fn in_subshell_environment(&self) -> bool {
+        self.depth > self.process_depth
+    }
+
+    /// Numbers the current command by `position` (its `LINENO`, and the line its diagnostics
+    /// name), when known.
+    pub(crate) fn set_current_position(
+        &mut self,
+        position: Option<std::sync::Arc<crate::SourcePosition>>,
+    ) {
+        if position.is_some() {
+            self.call_stack.set_current_pos(position);
+        }
     }
 
     /// Updates the `$_` shell variable (last-argument of the previous simple
@@ -633,7 +720,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             Some(unit) => self.alias_units.insert(name.clone(), unit),
             None => self.alias_units.remove(&name),
         };
-        self.aliases.insert(name, value);
+        std::sync::Arc::make_mut(&mut self.aliases).insert(name, value);
     }
 
     /// Whether the alias `name` may be expanded in the command running now.
@@ -733,13 +820,24 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     }
 
     /// The name diagnostics start with: the shell's name (`$0`), as bash uses -- except while
-    /// sourcing a file, where bash names the file being sourced instead. `source`/`.` does not
-    /// itself change `$0` (see [`Self::current_shell_name`]), but bash's own diagnostics from
-    /// within a sourced file are still that file's name, not `$0`.
+    /// sourcing a file, where bash names the file being sourced instead, and in a function, where
+    /// it names the file the function came from (`environment` for one imported from the
+    /// environment). `source`/`.` does not itself change `$0` (see
+    /// [`Self::current_shell_name`]), but bash's own diagnostics from within a sourced file are
+    /// still that file's name, not `$0`.
     pub fn diagnostic_name(&self) -> String {
+        // As bash's: `BASH_SOURCE[0]`, the source of the running function or script, else `$0`.
         for frame in self.call_stack.iter() {
-            if frame.frame_type.is_run_script() || frame.frame_type.is_sourced_script() {
-                return frame.frame_type.name().into_owned();
+            match &frame.frame_type {
+                crate::callstack::FrameType::Function(call)
+                    if !call.function.source().source.is_empty() =>
+                {
+                    return call.function.source().source.clone();
+                }
+                frame_type if frame_type.is_run_script() || frame_type.is_sourced_script() => {
+                    return frame_type.name().into_owned();
+                }
+                _ => (),
             }
         }
         self.name.clone().unwrap_or_else(|| "bash".to_owned())
@@ -827,7 +925,7 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 
     /// Returns a mutable reference to the shell's aliases.
     pub fn aliases_mut(&mut self) -> &mut HashMap<String, String> {
-        &mut self.aliases
+        std::sync::Arc::make_mut(&mut self.aliases)
     }
 
     /// Returns the shell's job manager.
@@ -936,6 +1034,19 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns a mutable reference to the shell's history, if it exists.
     pub fn history_mut(&mut self) -> Option<&mut crate::history::History> {
         self.history.as_mut()
+    }
+
+    /// Returns a mutable reference to the shell's history, creating an empty one first if none
+    /// exists yet. The `history` *builtin* works on the list regardless of the `history` -o
+    /// option's state in real bash -- the option only gates automatic recording (each executed
+    /// command becoming an entry, which happens entirely in the interactive layer and is
+    /// unaffected by this): `history -s foo; history` prints the entry it just added under
+    /// `bash -c` even though `set -o history` there reports off. This is what gives the builtin
+    /// that same always-available list without flipping the option (and so without the
+    /// `SHELLOPTS`/`set -o`/`$-` divergence flipping it would cause).
+    pub fn history_or_init_mut(&mut self) -> &mut crate::history::History {
+        self.history
+            .get_or_insert_with(crate::history::History::default)
     }
 
     /// Returns the shell's official version string (if available).

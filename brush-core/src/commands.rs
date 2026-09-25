@@ -120,7 +120,13 @@ impl CommandArg {
         match self {
             Self::String(s) => escape::quote_if_needed(s, escape::QuoteMode::SingleQuote),
             // Bash prints the word `name=value` as it prints any word, quoted whole when it
-            // needs to be: `e=`, `'a=x y'`.
+            // needs to be: `e=`, `'a=x y'`. A compound array assignment was traced on its own as
+            // it was expanded, and the command shows only its name.
+            Self::Assignment(a)
+                if matches!(a.value, brush_parser::ast::AssignmentValue::Array(_)) =>
+            {
+                a.name.to_string().into()
+            }
             Self::Assignment(a) => {
                 let op = if a.append { "+=" } else { "=" };
                 escape::quote_if_needed(
@@ -342,6 +348,12 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         reason = "these unwrap calls should not panic"
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
+        // A program's path (`/bin/cat`) runs the builtin that stands for it, under its own name.
+        let named_by_path = sys::fs::contains_path_separator(&self.command_name);
+        if named_by_path && let Some(name) = self.shell.program_builtin(&self.command_name) {
+            self.command_name = name.to_owned();
+        }
+
         // First see if it's the name of a builtin.
         let builtin = self.shell.builtins().get(&self.command_name).cloned();
 
@@ -371,6 +383,20 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // then invoke it.
         if let Some(builtin) = builtin {
             if !builtin.disabled {
+                // A program run by name is hashed at its file, as bash hashes a command it finds
+                // on `PATH`.
+                if !named_by_path
+                    && self.shell.options().remember_command_locations
+                    && self
+                        .shell
+                        .program_location_cache()
+                        .get(&self.command_name)
+                        .is_none()
+                    && let Some(path) = self.shell.program_file(&self.command_name)
+                {
+                    let name = self.command_name.clone();
+                    self.shell.program_location_cache_mut().set(name, path);
+                }
                 return self.execute_via_builtin(builtin).await;
             }
         }
@@ -784,6 +810,8 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
 ) -> Result<ExecutionResult, error::Error> {
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
+    let interactive = context.shell.options().interactive;
+    let command_name = context.command_name.clone();
     #[cfg(target_arch = "wasm32")]
     let services = context.shell.execution_services();
 
@@ -795,7 +823,12 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     (services.yield_now)().await;
 
     match result {
-        Ok(result) => Ok(result),
+        Ok(mut result) => {
+            if mark_errors_fatal && !interactive && special_builtin_failed(&command_name, &result) {
+                result.next_control_flow = crate::results::ExecutionControlFlow::ExitShell;
+            }
+            Ok(result)
+        }
         Err(e) => {
             // Broken pipe errors should silently return the appropriate exit code
             if let Some(io_err) = e.as_io_error() {
@@ -923,6 +956,13 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
             return Ok(outcome);
         }
     }
+    if mark_errors_fatal
+        && !shell.options().interactive
+        && let Ok(result) = &mut result
+        && special_builtin_failed(&command_name, result)
+    {
+        result.next_control_flow = crate::results::ExecutionControlFlow::ExitShell;
+    }
     result.map_err(|error| {
         if mark_errors_fatal {
             error.into_fatal()
@@ -930,6 +970,27 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
             error
         }
     })
+}
+
+/// Whether a special builtin failed in a way that ends a non-interactive POSIX-mode shell, as in
+/// bash: a usage error, an invalid name or a readonly variable, but not an operational failure
+/// (`shift` past the end, `trap` of an unknown signal).
+fn special_builtin_failed(name: &str, result: &ExecutionResult) -> bool {
+    let status = u8::from(result.exit_code);
+    if status == 0
+        || !matches!(
+            result.next_control_flow,
+            crate::results::ExecutionControlFlow::Normal
+        )
+    {
+        return false;
+    }
+    match name {
+        "set" | "unset" | "export" | "readonly" | "times" => true,
+        // `return` outside a function, and `exit` with a status that is not a number.
+        "shift" | "trap" | "return" | "exit" => status == 2,
+        _ => false,
+    }
 }
 
 /// Runs handlers for caught signals that arrived while the current command ran. Returns the
@@ -963,12 +1024,20 @@ pub(crate) async fn invoke_shell_function(
     args: &[CommandArg],
 ) -> Result<ExecutionSpawnResult, error::Error> {
     let ast::FunctionBody(body, redirects) = &function.definition().body;
+    // A call bash would have run without forking runs the body's last command that way.
+    let no_fork_call = std::mem::take(&mut context.shell.no_fork_call);
 
-    // Apply any redirects specified at function definition-time.
+    // Apply any redirects specified at function definition-time. Bash names the line the body
+    // starts on when one fails.
     if let Some(redirects) = redirects {
+        let position = context.shell.current_position();
+        context
+            .shell
+            .set_current_position(ast::SourceLocation::location(body).map(|span| span.start));
         for redirect in &redirects.0 {
             interp::setup_redirect(context.shell, &mut context.params, redirect).await?;
         }
+        context.shell.set_current_position(position);
         if redirects.0.iter().any(interp::redirects_stdin) {
             context.params.stdin_redirected = true;
         }
@@ -1000,19 +1069,26 @@ pub(crate) async fn invoke_shell_function(
     let option_saves = context.shell.local_option_saves.len();
     // The body expands the aliases in effect where the function was defined.
     let caller_aliases = context.shell.alias_scope.replace(function.aliases());
+    let outer_no_fork = context.shell.no_fork;
+    if no_fork_call {
+        context.shell.no_fork = interp::NoFork::for_function(body);
+    }
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
         let result = body.execute(frame.shell(), &context.params).await;
+        let result = report_in_function(frame.shell(), &context.params, result);
         frame.finish()?;
         result
     };
     #[cfg(not(any(target_arch = "wasm32", test)))]
     let result = {
         let result = body.execute(context.shell, &context.params).await;
+        let result = report_in_function(context.shell, &context.params, result);
         context.shell.leave_function()?;
         result
     };
+    context.shell.no_fork = outer_no_fork;
     context.shell.alias_scope = caller_aliases;
     context.shell.loop_depth = caller_loop_depth;
     context.shell.restore_local_options(option_saves);
@@ -1053,10 +1129,28 @@ pub(crate) async fn invoke_shell_function(
     Ok(result.into())
 }
 
+/// Reports an error that leaves a function body while the body's line is still current, as bash
+/// reports it where it happens (an arithmetic error in `$(( ))` abandons the whole command, but
+/// names the body's line, not the call's).
+fn report_in_function(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    result: Result<ExecutionResult, error::Error>,
+) -> Result<ExecutionResult, error::Error> {
+    match result {
+        Err(error) if !error.is_reported() => {
+            let _ = shell.display_error(&mut params.stderr(shell), &error);
+            Err(error.into_reported())
+        }
+        result => result,
+    }
+}
+
 pub(crate) async fn invoke_command_in_subshell_and_get_output(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
     s: String,
+    backquoted: bool,
 ) -> Result<String, error::Error> {
     // Instantiate a subshell to run the command in.
     let mut subshell = shell.clone();
@@ -1093,7 +1187,9 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
             let completed = std::cell::Cell::new(false);
             let result = numbered
                 .run(async {
-                    let result = run_wasm_substitution_command(&mut subshell, &mut params, s).await;
+                    let result =
+                        run_wasm_substitution_command(&mut subshell, &mut params, s, backquoted)
+                            .await;
                     let result = subshell.exit_with_trap_in(result, &params).await;
                     completed.set(true);
                     result
@@ -1142,7 +1238,8 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
         let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
 
-        let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
+        let cmd_join_handle =
+            tokio::spawn(run_substitution_command(subshell, params, s, backquoted));
 
         let output_str = async_reader.read_to_string().await?;
 
@@ -1267,8 +1364,9 @@ async fn run_wasm_substitution_command(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &mut ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    run_substitution_command_in(shell, params, command).await
+    run_substitution_command_in(shell, params, command, backquoted).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1276,16 +1374,25 @@ async fn run_substitution_command(
     mut shell: Shell<impl extensions::ShellExtensions>,
     mut params: ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    run_substitution_command_in(&mut shell, &mut params, command).await
+    run_substitution_command_in(&mut shell, &mut params, command, backquoted).await
 }
 
 async fn run_substitution_command_in(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &mut ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    // Parse the string into a whole shell program.
+    // Parse the string into a whole shell program. Bash runs a `$( )` from its command printed
+    // back (see `brush_parser::print_comsub`), so its lines are numbered as that text has them;
+    // backquotes run as written.
+    let command = if backquoted {
+        command
+    } else {
+        brush_parser::reprint_comsub_text(&command, &shell.parser_options()).unwrap_or(command)
+    };
     let parse_result = shell.parse_string(command.as_str());
 
     // Check for a command that is only an input redirection ("< file").
@@ -1313,10 +1420,32 @@ async fn run_substitution_command_in(
     // The substitution's lines are numbered on from the command it is part of.
     shell.begin_nested_code();
 
+    // `set -v` echoes the here-documents of a `$( )` each time it runs, as bash reads them
+    // again from the command printed back.
+    if !backquoted && shell.options().print_shell_input_lines {
+        use std::io::Write as _;
+        let lines: Vec<&str> = command.lines().collect();
+        let mut stderr = params.stderr(shell);
+        for (first, last) in interp::here_document_lines(&command) {
+            for line in lines.get(first - 1..last).unwrap_or_default() {
+                let _ = writeln!(stderr, "{line}");
+            }
+        }
+    }
+
+    // Its last command may run in place of the substitution's process, as bash's does.
+    shell.exec_last = Some(if backquoted {
+        interp::CommandString::Backquoted
+    } else {
+        interp::CommandString::Substitution
+    });
+
     // Handle the parse result using default shell behavior.
-    shell
+    let result = shell
         .run_parsed_result(parse_result, Some(&command), &source_info, params)
-        .await
+        .await;
+    shell.exec_last = None;
+    result
 }
 
 // Detects a subshell command that consists solely of a single input redirection

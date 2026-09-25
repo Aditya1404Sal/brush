@@ -611,8 +611,14 @@ fn push_command(text: &mut String, command: &brush_parser::ast::Command) {
                     text.push(' ');
                 }
             }
-            brush_parser::ast::SeparatorOperator::Sequence if !last => text.push_str("; "),
-            brush_parser::ast::SeparatorOperator::Sequence => {}
+            brush_parser::ast::SeparatorOperator::Sequence
+            | brush_parser::ast::SeparatorOperator::Newline
+                if !last =>
+            {
+                text.push_str("; ");
+            }
+            brush_parser::ast::SeparatorOperator::Sequence
+            | brush_parser::ast::SeparatorOperator::Newline => {}
         }
     }
     // A group ends its list with `;`, unless its last command runs in the background.

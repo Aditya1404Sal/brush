@@ -146,7 +146,10 @@ impl builtins::Command for DeclareCommand {
                         result = ExecutionResult::general_error();
                     }
                 } else {
-                    match self.process_declaration(&mut context, declaration, verb) {
+                    match self
+                        .process_declaration(&mut context, declaration, verb)
+                        .await
+                    {
                         Ok(true) => (),
                         Ok(false) => result = ExecutionResult::general_error(),
                         // Bash names the readonly variable a declaration could not change;
@@ -302,7 +305,7 @@ impl DeclareCommand {
         true
     }
 
-    fn process_declaration(
+    async fn process_declaration(
         &self,
         context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         declaration: &brush_core::CommandArg,
@@ -327,8 +330,44 @@ impl DeclareCommand {
         }
 
         // Extract the variable name and the initial value being assigned (if any).
-        let (name, assigned_index, initial_value, name_is_array, append) =
+        let (mut name, assigned_index, initial_value, name_is_array, append) =
             Self::declaration_to_name_and_value(declaration)?;
+
+        // `local r=value` for a name reference already local here declares the variable it
+        // refers to (`local -n r=x; local r=2` makes a local `x`), as bash does; one that comes
+        // back to itself takes the value as the name it should refer to, which is refused.
+        if create_var_local
+            && self.make_nameref.to_bool().is_none()
+            && assigned_index.is_none()
+            && context
+                .shell
+                .env()
+                .get_using_policy_raw(&name, EnvironmentLookup::OnlyInCurrentLocal)
+                .is_some_and(ShellVariable::is_treated_as_nameref)
+            && let Some(value) = &initial_value
+        {
+            if context.shell.env().circular_nameref(&name).is_some() {
+                context
+                    .shell
+                    .warn_circular_nameref(&context.params, &name, 2, false);
+                if let ShellValueLiteral::Scalar(value) = value {
+                    context.report(format_args!(
+                        "`{value}': invalid variable name for name reference"
+                    ))?;
+                }
+                return Ok(false);
+            }
+            let target = context.shell.env().resolve_nameref(&name).into_owned();
+            if env::valid_variable_name(&target) {
+                name = target;
+            }
+        }
+
+        // `readonly` takes names, not array elements, as in bash.
+        if let (DeclareVerb::Readonly, Some(index)) = (verb, &assigned_index) {
+            context.report(format_args!("`{name}[{index}]': not a valid identifier"))?;
+            return Ok(false);
+        }
 
         // A readonly variable is refused before its new value is evaluated, and an array cannot
         // lose its array attribute (`declare +a`), as in bash.
@@ -351,36 +390,28 @@ impl DeclareCommand {
             }
         }
 
-        // A compound assignment to an indexed array evaluates its subscripts arithmetically;
-        // an associative array's are words.
+        // An indexed array's subscripts, in a compound assignment or an element's
+        // (`declare 'a[i+1]=v'`), are evaluated arithmetically (an associative array's are
+        // words); one that is empty or counts back past the start fails the declaration once the
+        // elements before it are assigned, as in bash.
+        let mut outcome = Ok(true);
         let initial_value = match initial_value {
-            Some(ShellValueLiteral::Array(ArrayLiteral(elements)))
-                if assigned_index.is_none()
-                    && !self.assigns_associative(context, &name, current_lookup) =>
+            Some(ShellValueLiteral::Array(literal))
+                if !self.assigns_associative(context, &name, current_lookup) =>
             {
-                let mut evaluated = Vec::with_capacity(elements.len());
-                for (key, value) in elements {
-                    let key = match key {
-                        Some(key) => Some((
-                            brush_core::arithmetic::eval_indexed_array_subscript(
-                                context.shell,
-                                &key,
-                                &value,
-                            )?,
-                            key,
-                        )),
-                        None => None,
-                    };
-                    evaluated.push((key, value));
+                let existing = context.shell.env().get(&name).map(|(_, var)| var.value());
+                let keys = brush_core::variables::IndexedLiteralKeys::new(existing, append);
+                let (literal, failed) = brush_core::arithmetic::resolve_indexed_array_literal(
+                    context.shell,
+                    &context.params,
+                    keys,
+                    literal,
+                )
+                .await?;
+                if let Some(failed) = failed {
+                    outcome = Err(failed);
                 }
-                Some(ShellValueLiteral::Array(
-                    brush_core::arithmetic::place_indexed_array_literal(
-                        context.shell,
-                        &name,
-                        append,
-                        evaluated,
-                    )?,
-                ))
+                Some(ShellValueLiteral::Array(literal))
             }
             // Once an associative array's first element has a subscript, every element needs one.
             Some(ShellValueLiteral::Array(ArrayLiteral(elements)))
@@ -410,6 +441,42 @@ impl DeclareCommand {
         if !env::valid_variable_name(name.as_str()) {
             context.report(format_args!("`{name}': not a valid identifier"))?;
             return Ok(false);
+        }
+
+        // `declare -r 'a[i]=v'`: bash makes the array readonly before it assigns the element, so
+        // the assignment fails ("a: readonly variable") and the declaration still succeeds: the
+        // array keeps what it held, or is a new empty one (declared but unset for a local).
+        if assigned_index.is_some()
+            && initial_value.is_some()
+            && self.make_readonly.to_bool() == Some(true)
+        {
+            writeln!(
+                context.stderr(),
+                "{}{name}: readonly variable",
+                context.shell.diagnostic_prefix()
+            )?;
+            if let Some(var) = self.existing_variable(context.shell, name.as_str(), current_lookup)
+            {
+                self.apply_attributes_before_update(var)?;
+                self.apply_attributes_after_update(var, verb)?;
+            } else {
+                let (value, scope) = if create_var_local {
+                    (
+                        ShellValue::Unset(ShellValueUnsetType::IndexedArray),
+                        EnvironmentScope::Local,
+                    )
+                } else {
+                    (
+                        ShellValue::indexed_array_from_literals(ArrayLiteral(vec![])),
+                        EnvironmentScope::Global,
+                    )
+                };
+                let mut var = ShellVariable::new(value);
+                self.apply_attributes_before_update(&mut var)?;
+                self.apply_attributes_after_update(&mut var, verb)?;
+                context.shell.env_mut().add(name, var, scope)?;
+            }
+            return Ok(true);
         }
 
         // A nameref must name a variable or an element of one.
@@ -484,7 +551,7 @@ impl DeclareCommand {
                     .shell
                     .env_mut()
                     .add(name, var, EnvironmentScope::Local)?;
-                return Ok(true);
+                return outcome;
             }
         }
 
@@ -500,6 +567,19 @@ impl DeclareCommand {
                 .is_some_and(ShellVariable::is_readonly)
         {
             return Err(ErrorKind::ReadonlyVariable.into());
+        }
+
+        // Bash looks a name given no value up once for `readonly` and twice for `declare -x`; a
+        // circular name reference warns at each.
+        if initial_value.is_none() {
+            let lookups = match verb {
+                DeclareVerb::Readonly => 1,
+                _ if self.make_exported.to_bool() == Some(true) => 2,
+                _ => 0,
+            };
+            context
+                .shell
+                .warn_circular_nameref(&context.params, &name, lookups, false);
         }
 
         // Look up the variable.
@@ -559,7 +639,7 @@ impl DeclareCommand {
             context.shell.env_mut().add(name, var, scope)?;
         }
 
-        Ok(true)
+        outcome
     }
 
     /// Whether the declaration changes what the variable holds (`-aAilu` and `-c`, or their `+`

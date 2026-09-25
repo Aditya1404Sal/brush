@@ -9,6 +9,10 @@ pub(crate) struct BreakCommand {
     /// If specified, indicates which enclosing loop to break out of.
     #[arg(allow_hyphen_values = true)]
     which_loop: Option<String>,
+
+    /// Operands after the first: too many, which ends the shell, as in bash.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for BreakCommand {
@@ -27,6 +31,13 @@ impl builtins::Command for BreakCommand {
                 "{prefix}{name}: only meaningful in a `for', `while', or `until' loop"
             )?;
             return Ok(ExecutionResult::success());
+        }
+        // More than one operand ends the shell, as bash's special builtins do.
+        if !self.extra.is_empty() {
+            context.report("too many arguments")?;
+            let mut result = ExecutionResult::general_error();
+            result.next_control_flow = ExecutionControlFlow::ExitShell;
+            return Ok(result);
         }
         let mut result = ExecutionResult::success();
         let levels = match self.which_loop.as_deref().map(str::parse::<i64>) {

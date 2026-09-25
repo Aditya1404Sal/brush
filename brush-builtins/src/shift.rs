@@ -9,6 +9,10 @@ pub(crate) struct ShiftCommand {
     /// Number of positions to shift the arguments by (defaults to 1).
     #[arg(allow_hyphen_values = true)]
     n: Option<i32>,
+
+    /// Operands after the first: too many, which ends the shell, as in bash.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for ShiftCommand {
@@ -18,6 +22,13 @@ impl builtins::Command for ShiftCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        // More than one operand ends the shell, as bash's special builtins do.
+        if !self.extra.is_empty() {
+            context.report("too many arguments")?;
+            let mut result = ExecutionResult::general_error();
+            result.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
+            return Ok(result);
+        }
         let n = self.n.unwrap_or(1);
 
         if n < 0 {

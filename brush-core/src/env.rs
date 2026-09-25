@@ -141,6 +141,37 @@ impl ShellEnvironment {
         }
     }
 
+    /// Takes the innermost scope, which must be of the given type, out of the environment for a
+    /// while; [`Self::restore_scope`] puts it back.
+    pub(crate) fn take_scope(
+        &mut self,
+        expected_scope_type: EnvironmentScope,
+    ) -> Result<ShellVariableMap, error::Error> {
+        match self.scopes.pop() {
+            Some((actual_scope_type, variables)) if actual_scope_type == expected_scope_type => {
+                Ok(variables)
+            }
+            Some((actual_scope_type, variables)) => {
+                self.scopes.push((actual_scope_type, variables));
+                Err(error::ErrorKind::UnexpectedScopeType {
+                    expected: expected_scope_type,
+                    actual: actual_scope_type,
+                }
+                .into())
+            }
+            None => Err(error::ErrorKind::MissingScope.into()),
+        }
+    }
+
+    /// Puts back a scope taken with [`Self::take_scope`].
+    pub(crate) fn restore_scope(
+        &mut self,
+        scope_type: EnvironmentScope,
+        variables: ShellVariableMap,
+    ) {
+        self.scopes.push((scope_type, variables));
+    }
+
     //
     // Iterators/Getters
     //
@@ -233,8 +264,28 @@ impl ShellEnvironment {
     ///
     /// * `name` - The name of the variable to retrieve.
     pub fn get<S: AsRef<str>>(&self, name: S) -> Option<(EnvironmentScope, &ShellVariable)> {
+        if let Some(global) = self.circular_global(name.as_ref()) {
+            return self
+                .get_using_policy_raw(&global, EnvironmentLookup::OnlyInGlobal)
+                .map(|var| (EnvironmentScope::Global, var));
+        }
         let name = self.resolve_nameref(name.as_ref());
         self.get_raw(name.as_ref())
+    }
+
+    /// The global variable bash reads and assigns in place of `name` when `name` is a function's
+    /// local nameref that comes back to itself (see [`Self::circular_nameref`]).
+    fn circular_global(&self, name: &str) -> Option<String> {
+        if !self
+            .get_raw(name)
+            .is_some_and(|(_, var)| var.is_treated_as_nameref())
+        {
+            return None;
+        }
+        match self.circular_nameref(name) {
+            Some((closing, true)) => Some(closing),
+            _ => None,
+        }
     }
 
     /// Like [`Self::get`], but a nameref is returned itself rather than the variable it names.
@@ -282,6 +333,43 @@ impl ShellEnvironment {
             resolved = Cow::Owned(next);
         }
         resolved
+    }
+
+    /// A nameref that comes back to itself or to the nameref it just followed (`local -n v=v`,
+    /// `declare -n a=b b=a`), as bash's `find_variable_nameref` detects a circular name
+    /// reference: the name of the variable that closes it, and whether bash then reads and
+    /// assigns the global variable of that name, without namerefs, in its place (the closing
+    /// variable is a function's local and a function is running). `None` for anything else.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to resolve.
+    pub fn circular_nameref(&self, name: &str) -> Option<(String, bool)> {
+        const MAX_NAMEREF_HOPS: usize = 8;
+        let mut current = name.to_owned();
+        for _ in 0..MAX_NAMEREF_HOPS {
+            let (_, var) = self.get_raw(&current)?;
+            if !var.is_treated_as_nameref() {
+                return None;
+            }
+            let ShellValue::String(target) = var.value() else {
+                return None;
+            };
+            if target.is_empty() {
+                return None;
+            }
+            if target == name || *target == current {
+                let (scope, _) = self.get_raw(target)?;
+                let in_function = self
+                    .scopes
+                    .iter()
+                    .any(|(scope, _)| matches!(scope, EnvironmentScope::Local));
+                let global = in_function && !matches!(scope, EnvironmentScope::Global);
+                return Some((target.clone(), global));
+            }
+            current = target.clone();
+        }
+        None
     }
 
     /// Whether following the nameref `name` comes back to a nameref already followed
@@ -334,6 +422,11 @@ impl ShellEnvironment {
         &mut self,
         name: S,
     ) -> Option<(EnvironmentScope, &mut ShellVariable)> {
+        if let Some(global) = self.circular_global(name.as_ref()) {
+            return self
+                .get_mut_using_policy_raw(global, EnvironmentLookup::OnlyInGlobal)
+                .map(|var| (EnvironmentScope::Global, var));
+        }
         let name = self.resolve_nameref(name.as_ref()).into_owned();
         // Look through scopes, from the top of the stack on down.
         for (scope_type, map) in self.scopes.iter_mut().rev() {
@@ -601,8 +694,13 @@ impl ShellEnvironment {
         lookup_policy: EnvironmentLookup,
         scope_if_creating: EnvironmentScope,
     ) -> Result<(), error::Error> {
+        let name = name.into();
+        // A function's local nameref that comes back to itself assigns the global variable.
+        if let Some(global) = self.circular_global(&name) {
+            return self.update_or_add_global(global, value, updater);
+        }
         // Assigning through a nameref assigns to (and if need be creates) the variable it names.
-        let name = self.resolve_nameref(&name.into()).into_owned();
+        let name = self.resolve_nameref(&name).into_owned();
 
         // An array element, named directly (`read 'arr[1]'`) or through a nameref, is assigned as
         // `arr[1]=value` is: bash has no variable whose name holds a subscript.
@@ -659,7 +757,20 @@ impl ShellEnvironment {
         lookup_policy: EnvironmentLookup,
         scope_if_creating: EnvironmentScope,
     ) -> Result<(), error::Error> {
-        let name = self.resolve_nameref(&name.into()).into_owned();
+        let name = name.into();
+        // A function's local nameref that comes back to itself assigns the global array.
+        let (name, lookup_policy, scope_if_creating) = match self.circular_global(&name) {
+            Some(global) => (
+                global,
+                EnvironmentLookup::OnlyInGlobal,
+                EnvironmentScope::Global,
+            ),
+            None => (
+                self.resolve_nameref(&name).into_owned(),
+                lookup_policy,
+                scope_if_creating,
+            ),
+        };
 
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
             var.assign_at_index(index, value, false)
@@ -677,6 +788,33 @@ impl ShellEnvironment {
             updater(&mut var)?;
 
             self.add(name, var, scope_if_creating)
+        }
+    }
+
+    /// Assigns `value` to the global variable `name`, without following namerefs, creating it if
+    /// need be.
+    fn update_or_add_global(
+        &mut self,
+        name: String,
+        value: variables::ShellValueLiteral,
+        updater: impl Fn(&mut ShellVariable) -> Result<(), error::Error>,
+    ) -> Result<(), error::Error> {
+        let auto_export = self.export_variables_on_modification;
+        if let Some(var) = self.get_mut_using_policy_raw(&name, EnvironmentLookup::OnlyInGlobal) {
+            var.assign(value, false)
+                .map_err(|error| name_readonly_error(error, &name))?;
+            if auto_export {
+                var.export();
+            }
+            updater(var)
+        } else {
+            let mut var = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
+            var.assign(value, false)?;
+            if auto_export {
+                var.export();
+            }
+            updater(&mut var)?;
+            self.add(name, var, EnvironmentScope::Global)
         }
     }
 
@@ -833,6 +971,111 @@ mod tests {
         assert!(valid_variable_name("A"));
         assert!(valid_variable_name("a1"));
         assert!(valid_variable_name("A1"));
+    }
+
+    /// The string a variable holds, or an element of it.
+    fn text(env: &ShellEnvironment, name: &str, index: Option<&str>) -> Option<String> {
+        let (_, var) = env.get(name)?;
+        match (var.value(), index) {
+            (ShellValue::String(value), None) => Some(value.clone()),
+            (ShellValue::IndexedArray(values), Some(index)) => {
+                values.get(&index.parse().ok()?).cloned()
+            }
+            (ShellValue::AssociativeArray(values), Some(index)) => values.get(index).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Whether two environments hold the very same value for `name`, not a copy of it.
+    fn shared(one: &ShellEnvironment, other: &ShellEnvironment, name: &str) -> bool {
+        match (one.get(name), other.get(name)) {
+            (Some((_, a)), Some((_, b))) => std::ptr::eq(a.value(), b.value()),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_clone_shares_values_until_it_changes_them_and_never_changes_the_original()
+    -> Result<(), error::Error> {
+        let mut parent = ShellEnvironment::new();
+        for (name, value) in [("s", "parent"), ("t", "kept"), ("p", "base")] {
+            parent.set_global(name, ShellVariable::new(ShellValue::String(value.into())))?;
+        }
+        for (index, value) in [("0", "a0"), ("1", "a1")] {
+            parent.update_or_add_array_element(
+                "a",
+                index.into(),
+                value.into(),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            )?;
+        }
+        let mut map = ShellVariable::new(ShellValue::Unset(
+            variables::ShellValueUnsetType::AssociativeArray,
+        ));
+        map.assign_at_index("k".into(), "parent".into(), false)?;
+        parent.set_global("m", map)?;
+
+        // A subshell or a pipeline stage starts as a clone that copies no value.
+        let mut child = parent.clone();
+        for name in ["s", "t", "p", "a", "m"] {
+            assert!(shared(&parent, &child, name), "{name} is copied");
+        }
+
+        // Its changes stay its own, and copy only what they change.
+        child.update_or_add(
+            "s",
+            variables::ShellValueLiteral::Scalar("child".into()),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+        if let Some((_, var)) = child.get_mut("p") {
+            var.assign(variables::ShellValueLiteral::Scalar("+more".into()), true)?;
+        }
+        child.update_or_add_array_element(
+            "a",
+            "1".into(),
+            "child".into(),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+        child.unset_index("a", "0")?;
+        if let Some((_, var)) = child.get_mut("m") {
+            var.assign_at_index("k".into(), "child".into(), false)?;
+            var.assign_at_index("new".into(), "x".into(), false)?;
+        }
+        child.unset("t")?;
+
+        assert_eq!(text(&parent, "s", None).as_deref(), Some("parent"));
+        assert_eq!(text(&parent, "t", None).as_deref(), Some("kept"));
+        assert_eq!(text(&parent, "p", None).as_deref(), Some("base"));
+        assert_eq!(text(&parent, "a", Some("0")).as_deref(), Some("a0"));
+        assert_eq!(text(&parent, "a", Some("1")).as_deref(), Some("a1"));
+        assert_eq!(text(&parent, "m", Some("k")).as_deref(), Some("parent"));
+        assert_eq!(text(&parent, "m", Some("new")), None);
+
+        assert_eq!(text(&child, "s", None).as_deref(), Some("child"));
+        assert_eq!(text(&child, "t", None), None);
+        assert_eq!(text(&child, "p", None).as_deref(), Some("base+more"));
+        assert_eq!(text(&child, "a", Some("0")), None);
+        assert_eq!(text(&child, "a", Some("1")).as_deref(), Some("child"));
+        assert_eq!(text(&child, "m", Some("k")).as_deref(), Some("child"));
+        assert_eq!(text(&child, "m", Some("new")).as_deref(), Some("x"));
+        for name in ["s", "p", "a", "m"] {
+            assert!(!shared(&parent, &child, name), "{name} is still shared");
+        }
+
+        // The parent's own changes do not reach a clone taken before them either.
+        let snapshot = parent.clone();
+        if let Some((_, var)) = parent.get_mut("a") {
+            var.assign_at_index("2".into(), "later".into(), false)?;
+        }
+        assert_eq!(text(&snapshot, "a", Some("2")), None);
+        assert_eq!(text(&parent, "a", Some("2")).as_deref(), Some("later"));
+        Ok(())
     }
 
     #[test]

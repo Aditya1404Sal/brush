@@ -91,7 +91,9 @@ async fn evaluate_subscript(
     if !indexed || index == "@" || index == "*" || index.parse::<i64>().is_ok() {
         return Ok(operand);
     }
-    let index = arithmetic::expand_and_eval(shell, params, index, false).await?;
+    let index = arithmetic::expand_and_eval(shell, params, index, false)
+        .await
+        .map_err(arithmetic::EvalError::in_subscript)?;
     Ok(format!("{name}[{index}]"))
 }
 
@@ -223,7 +225,8 @@ pub(crate) fn apply_unary_predicate_to_str(
         }
         ast::UnaryPredicate::FileExistsAndIsExecutable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.executable_or_searchable())
+            // A program a builtin stands for (`/bin/cat`) can be executed.
+            Ok(path.executable_or_searchable() || shell.program_builtin(operand).is_some())
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
             let path = shell.absolute_path(Path::new(operand));
@@ -270,7 +273,11 @@ pub(crate) fn apply_unary_predicate_to_str(
                 Ok(false)
             }
         }
-        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(variable_is_set(shell, operand)),
+        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => {
+            // Bash looks the name up once, and a circular name reference warns.
+            shell.warn_circular_nameref(params, operand, 1, false);
+            Ok(variable_is_set(shell, operand))
+        }
         ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get_raw(operand) {
             Some((_, reffed)) => Ok(reffed.value().is_set() && reffed.is_treated_as_nameref()),
             None => Ok(false),

@@ -18,7 +18,7 @@ pub(crate) struct MapFileCommand {
 
     /// Index into array at which to start assignment.
     #[arg(short = 'O', allow_hyphen_values = true)]
-    origin: Option<i64>,
+    origin: Option<String>,
 
     /// Number of initial entries to skip.
     #[arg(short = 's', default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
@@ -64,12 +64,19 @@ impl builtins::Command for MapFileCommand {
             return Ok(ExecutionExitCode::GeneralError.into());
         }
 
-        if let Some(origin) = self.origin {
-            if origin < 0 {
-                context.report(format_args!("{origin}: invalid array origin"))?;
+        // The origin is a number, not an expression, as in bash.
+        let origin = match self
+            .origin
+            .as_deref()
+            .map(|text| (text, text.trim().parse::<i64>()))
+        {
+            None => None,
+            Some((_, Ok(origin))) if origin >= 0 => Some(origin),
+            Some((text, _)) => {
+                context.report(format_args!("{text}: invalid array origin"))?;
                 return Ok(ExecutionExitCode::GeneralError.into());
             }
-        }
+        };
 
         if let Some((_, var)) = context.shell.env().get(&self.array_var_name) {
             if var.value().is_associative_array() {
@@ -97,7 +104,12 @@ impl builtins::Command for MapFileCommand {
             None => variables::ArrayLiteral(vec![]),
         };
 
-        if let Some(origin) = self.origin {
+        // Bash looks the array up once, and a circular name reference warns.
+        context
+            .shell
+            .warn_circular_nameref(&context.params, &self.array_var_name, 1, false);
+
+        if let Some(origin) = origin {
             // -O: preserve existing array, assign at offset.
             for (elem_idx, (_key, value)) in results.0.into_iter().enumerate() {
                 // If the user is getting to wraparounds in *bash*, they got bigger problems.

@@ -132,7 +132,7 @@ fn write_here_doc_bodies(f: &mut std::fmt::Formatter<'_>) -> Result<bool, std::f
     }
     let _verbatim = Verbatim::enter();
     for doc in &docs {
-        write!(f, "\n{}{}", doc.doc, doc.delimiter())?;
+        write!(f, "\n{}{}", doc.doc.value, doc.delimiter())?;
     }
     writeln!(f)?;
     AFTER_HERE_DOC.with(|after| after.set(true));
@@ -158,6 +158,21 @@ fn write_condition_end(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", DISPLAY_INDENT.repeat(level))
     } else {
         write!(f, " ")
+    }
+}
+
+/// A process substitution's command as bash keeps it: printed back from its parse (see
+/// `crate::print_comsub_list`), with a blank before a `(` so the text does not read as `<((`.
+struct ComsubListText<'a>(&'a CompoundList);
+
+impl Display for ComsubListText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _verbatim = Verbatim::enter();
+        let printed = crate::comsub::print_comsub_list(self.0, &crate::ParserOptions::default());
+        if printed.starts_with('(') {
+            write!(f, " ")?;
+        }
+        write!(f, "{printed}")
     }
 }
 
@@ -236,15 +251,30 @@ pub type CompleteCommandItem = CompoundListItem;
 pub enum SeparatorOperator {
     /// The preceding command is executed asynchronously.
     Async,
-    /// The preceding command is executed synchronously.
+    /// The preceding command is executed synchronously (`;`).
     Sequence,
+    /// The preceding command is executed synchronously, and ends its line. Bash keeps a newline
+    /// apart from a `;` only when it prints a command substitution back (see
+    /// [`crate::print_comsub`]); everything else takes it for a `;`.
+    #[cfg_attr(
+        any(test, feature = "serde"),
+        serde(rename = "Sequence", skip_deserializing)
+    )]
+    Newline,
+}
+
+impl SeparatorOperator {
+    /// Whether the preceding command runs in the background (`&`).
+    pub const fn is_async(&self) -> bool {
+        matches!(self, Self::Async)
+    }
 }
 
 impl Display for SeparatorOperator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Async => write!(f, "&"),
-            Self::Sequence => write!(f, ";"),
+            Self::Sequence | Self::Newline => write!(f, ";"),
         }
     }
 }
@@ -756,6 +786,7 @@ impl Display for ForClauseCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "for {} in ", self.variable_name)?;
 
+        // A loop without `in` loops over "$@", which bash writes out.
         if let Some(values) = &self.values {
             for (i, value) in values.iter().enumerate() {
                 if i > 0 {
@@ -764,6 +795,8 @@ impl Display for ForClauseCommand {
 
                 write!(f, "{value}")?;
             }
+        } else {
+            write!(f, "\"$@\"")?;
         }
 
         writeln!(f, ";")?;
@@ -812,6 +845,8 @@ impl Display for SelectClauseCommand {
                     .collect::<Vec<_>>()
                     .join(" ")
             )?;
+        } else {
+            write!(f, "\"$@\"")?;
         }
         writeln!(f, ";")?;
         write!(f, "{}", self.body)
@@ -941,28 +976,17 @@ impl CompoundList {
         TerminatedCompoundList(self)
     }
 
-    /// Displays the list on one line, its commands separated by `; `, the way bash prints the
-    /// list inside a process substitution.
-    fn one_line(&self) -> impl Display + '_ {
-        OneLineCompoundList(self)
-    }
-
     fn fmt_items(
         &self,
         f: &mut std::fmt::Formatter<'_>,
         keep_trailing_separator: bool,
-        one_line: bool,
     ) -> std::fmt::Result {
         let here_doc_bodies = hold_here_doc_bodies();
 
         for (i, item) in self.0.iter().enumerate() {
             // An item after a `&` follows it on the same line, as bash writes it.
             if i > 0 && !matches!(self.0[i - 1].1, SeparatorOperator::Async) {
-                if one_line {
-                    write!(f, " ")?;
-                } else {
-                    writeln!(f)?;
-                }
+                writeln!(f)?;
             }
 
             // Write the and-or list.
@@ -981,7 +1005,7 @@ impl CompoundList {
                         write!(f, "{}", if wrote_bodies { "  " } else { " " })?;
                     }
                 }
-                SeparatorOperator::Sequence => {
+                SeparatorOperator::Sequence | SeparatorOperator::Newline => {
                     if (keep_trailing_separator || !last)
                         && !write_here_doc_bodies(f)?
                         && !take_after_here_doc()
@@ -1002,7 +1026,7 @@ impl CompoundList {
 
 impl Display for CompoundList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_items(f, false, false)
+        self.fmt_items(f, false)
     }
 }
 
@@ -1010,15 +1034,7 @@ struct TerminatedCompoundList<'a>(&'a CompoundList);
 
 impl Display for TerminatedCompoundList<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt_items(f, true, false)
-    }
-}
-
-struct OneLineCompoundList<'a>(&'a CompoundList);
-
-impl Display for OneLineCompoundList<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt_items(f, false, true)
+        self.0.fmt_items(f, true)
     }
 }
 
@@ -1663,7 +1679,7 @@ impl Display for CommandPrefixOrSuffixItem {
             Self::Word(word) => write!(f, "{word}"),
             Self::AssignmentWord(_assignment, word) => write!(f, "{word}"),
             Self::ProcessSubstitution(kind, subshell_command) => {
-                write!(f, "{kind}({})", subshell_command.list.one_line())
+                write!(f, "{kind}({})", ComsubListText(&subshell_command.list))
             }
         }
     }
@@ -1855,8 +1871,19 @@ impl Node for IoRedirect {}
 
 impl SourceLocation for IoRedirect {
     fn location(&self) -> Option<SourceSpan> {
-        // TODO(source-location): complete
-        None
+        // Where the target is written on the command's line: a here-document's delimiter, not
+        // its body. The operator is not counted.
+        match self {
+            Self::File(_, _, target) | Self::NamedFd(_, _, target) => match target {
+                IoFileRedirectTarget::Filename(word) | IoFileRedirectTarget::Duplicate(word) => {
+                    word.location()
+                }
+                IoFileRedirectTarget::ProcessSubstitution(_, subshell) => subshell.location(),
+                IoFileRedirectTarget::Fd(_) => None,
+            },
+            Self::HereDocument(_, here_doc) => here_doc.here_end.location(),
+            Self::HereString(_, word) | Self::OutputAndError(word, _) => word.location(),
+        }
     }
 }
 
@@ -1993,7 +2020,7 @@ impl Display for IoFileRedirectTarget {
             Self::Filename(word) => write!(f, "{word}"),
             Self::Fd(fd) => write!(f, "{fd}"),
             Self::ProcessSubstitution(kind, subshell_command) => {
-                write!(f, "{kind}({})", subshell_command.list.one_line())
+                write!(f, "{kind}({})", ComsubListText(&subshell_command.list))
             }
             Self::Duplicate(word) => write!(f, "{word}"),
         }
@@ -2037,7 +2064,7 @@ impl SourceLocation for IoHereDocument {
 
 impl IoHereDocument {
     /// The line that ends the here-document: its delimiter with any quoting removed.
-    fn delimiter(&self) -> std::borrow::Cow<'_, str> {
+    pub(crate) fn delimiter(&self) -> std::borrow::Cow<'_, str> {
         if self.here_end.value.contains(['\'', '"', '\\']) {
             tokenizer::unquote_str(&self.here_end.value).into()
         } else {
@@ -2069,9 +2096,10 @@ impl Display for IoHereDocument {
                 .map(|docs| docs.push(self.clone()))
                 .is_some()
         });
+        // The body is text, not a word: its substitutions stay as they are written.
         if !held {
             let _verbatim = Verbatim::enter();
-            write!(f, "\n{}{delimiter}\n", self.doc)?;
+            write!(f, "\n{}{delimiter}\n", self.doc.value)?;
         }
 
         Ok(())
@@ -2386,9 +2414,14 @@ impl SourceLocation for Word {
 
 impl Display for Word {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // A word's text is written as it is, newlines and all (see `Indented`).
+        // A word's text is written as it is, newlines and all (see `Indented`), except that a
+        // command or process substitution in it is written as bash keeps it: printed back
+        // from its parse (see `crate::print_comsub`).
         let _verbatim = Verbatim::enter();
-        write!(f, "{}", self.value)
+        match crate::comsub::reprint_word(&self.value, &crate::ParserOptions::default()) {
+            Some(text) => write!(f, "{text}"),
+            None => write!(f, "{}", self.value),
+        }
     }
 }
 

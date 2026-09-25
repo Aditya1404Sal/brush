@@ -177,6 +177,20 @@ impl builtins::Command for ReadCommand {
             ReadResult::InputReady => (None, brush_core::ExecutionResult::success()),
         };
 
+        // A circular name reference warns as bash's lookups of it do: an array once, a variable
+        // as it is bound.
+        if let Some(array) = self.array_variable.as_deref() {
+            context
+                .shell
+                .warn_circular_nameref(&context.params, array, 1, false);
+        } else {
+            for name in &self.variable_names {
+                context
+                    .shell
+                    .warn_circular_nameref(&context.params, name, 0, true);
+            }
+        }
+
         // Assign input to variables based on options. A name that is not a variable is reported
         // where bash reaches it, after the names before it are assigned.
         if let Some(invalid) = assign_input_to_variables(
@@ -274,6 +288,29 @@ fn assign_input_to_variables(
     Ok(None)
 }
 
+/// The name to assign: an element of an indexed array (`name[subscript]`) with its subscript
+/// evaluated arithmetically, as in bash, where a subscript that does not evaluate ends the shell.
+fn indexed_element(
+    shell: &mut brush_core::Shell<impl brush_core::ShellExtensions>,
+    name: &str,
+) -> Result<String, brush_core::Error> {
+    let Some((base, subscript)) = name
+        .split_once('[')
+        .and_then(|(base, rest)| Some((base, rest.strip_suffix(']')?)))
+    else {
+        return Ok(name.to_owned());
+    };
+    let associative = shell
+        .env()
+        .get(base)
+        .is_some_and(|(_, var)| var.value().is_associative_array());
+    if associative {
+        return Ok(name.to_owned());
+    }
+    let index = brush_core::arithmetic::eval_subscript(shell, subscript)?;
+    Ok(format!("{base}[{index}]"))
+}
+
 /// Whether `name` is a variable's name, or an element of one (`name[subscript]`).
 fn is_variable_or_element(name: &str) -> bool {
     let base = name
@@ -319,8 +356,9 @@ fn assign_to_named_variables(
             fields.pop_front().unwrap_or_default()
         };
 
+        let name = indexed_element(shell, name)?;
         shell.env_mut().update_or_add(
-            name,
+            &name,
             variables::ShellValueLiteral::Scalar(value),
             |_| Ok(()),
             env::EnvironmentLookup::Anywhere,

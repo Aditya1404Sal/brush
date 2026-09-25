@@ -640,6 +640,35 @@ pub fn signal_process_group(table: &ProcessTable, pid: Pid, signal: u8) -> bool 
     })
 }
 
+/// Delivers `signal` to every running process of `table`, in pid order: `kill 0` without job
+/// control, which reaches jobs whose starting subshell has ended as well, as bash's process group
+/// does.
+pub fn signal_every_process(table: &ProcessTable, signal: u8) -> bool {
+    let id = table.id();
+    let mut states: Vec<(Pid, Rc<ProcessState>)> = REGISTRY.with_borrow(|registry| {
+        registry
+            .iter()
+            .filter(|((table_id, _), _)| *table_id == id)
+            .filter_map(|((_, pid), state)| Some((*pid, state.upgrade()?)))
+            .collect()
+    });
+    states.sort_by_key(|(pid, _)| *pid);
+    for (_, state) in &states {
+        state.deliver(signal);
+    }
+    !states.is_empty()
+}
+
+/// Whether numbered process `pid` has had its first turn (or has already ended).
+pub fn process_started(table: &ProcessTable, pid: Pid) -> bool {
+    lookup(table, pid).is_none_or(|state| state.started.get())
+}
+
+/// Whether numbered process `pid` has been ended by a signal and exits at its next turn.
+pub fn process_terminating(table: &ProcessTable, pid: Pid) -> bool {
+    lookup(table, pid).is_some_and(|state| state.terminated.get().is_some())
+}
+
 /// Whether execution is currently inside an owned logical process.
 pub(crate) fn is_active() -> bool {
     current().is_some()

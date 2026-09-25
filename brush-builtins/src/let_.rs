@@ -2,11 +2,7 @@ use clap::Parser;
 
 use std::io::Write as _;
 
-use brush_core::{
-    ExecutionExitCode, ExecutionResult,
-    arithmetic::{EvalError, Evaluatable},
-    builtins,
-};
+use brush_core::{ExecutionExitCode, ExecutionResult, arithmetic::EvalError, builtins};
 
 /// Evaluate arithmetic expressions.
 #[derive(Parser)]
@@ -31,9 +27,9 @@ impl builtins::Command for LetCommand {
         }
 
         for expr in &self.exprs {
-            let evaluated = match brush_core::arithmetic::parse(expr.as_str())
-                .and_then(|parsed| parsed.eval(context.shell))
-            {
+            let evaluated = match brush_core::arithmetic::parse(expr.as_str()).and_then(|parsed| {
+                brush_core::arithmetic::eval_reporting(&parsed, context.shell, &context.params)
+            }) {
                 Ok(evaluated) => evaluated,
                 Err(error) => return report(&context, expr, error),
             };
@@ -64,6 +60,10 @@ fn report(
             ))
             .into_fatal(),
         );
+    }
+    // An error in an array subscript ends the shell, reported without `let`.
+    if error.is_in_subscript() {
+        return Err(brush_core::Error::from(error));
     }
     if error.is_readonly_variable() {
         writeln!(

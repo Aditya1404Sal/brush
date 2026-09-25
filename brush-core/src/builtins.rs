@@ -160,6 +160,17 @@ pub enum ExecutionBoundary {
     Command,
 }
 
+/// How a builtin that stands for a program (see [`crate::Shell::set_programs`]) presents itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramKind {
+    /// A shell builtin that is also a program (`echo`): its path runs it, and `type` reports the
+    /// builtin, as bash does.
+    Builtin,
+    /// A program bash has no builtin for (`cat`): its path runs it, and `type`, `command -v` and
+    /// `hash` report its file, as they report a program found on `PATH`.
+    File,
+}
+
 /// Encapsulates a registration for a built-in command.
 #[derive(Clone)]
 pub struct Registration<SE: extensions::ShellExtensions> {
@@ -745,19 +756,11 @@ async fn call_builtin(
                 error::ErrorKind::ReadonlyVariableNamed(name) => {
                     return error::ErrorKind::ReadonlyVariableNamed(name.clone()).into();
                 }
-                // A compound assignment's subscript that fails ends the shell, unnamed by the
-                // builtin, as in bash.
-                error::ErrorKind::SubscriptEvalError(text) if inner.is_fatal() => {
-                    return error::Error::from(error::ErrorKind::SubscriptEvalError(text.clone()))
-                        .into_fatal();
-                }
+                // An associative array's element without a subscript ends the shell, unnamed by
+                // the builtin, as in bash.
                 error::ErrorKind::AssocSubscriptRequired(name, word) if inner.is_fatal() => {
                     let kind = error::ErrorKind::AssocSubscriptRequired(name.clone(), word.clone());
                     return error::Error::from(kind).into_fatal();
-                }
-                error::ErrorKind::BadArraySubscript(text) if inner.is_fatal() => {
-                    return error::Error::from(error::ErrorKind::BadArraySubscript(text.clone()))
-                        .into_fatal();
                 }
                 // `command nosuch` reports the command, as bash does, not `command`.
                 error::ErrorKind::CommandNotFound(name) => {
@@ -768,6 +771,15 @@ async fn call_builtin(
                         name.clone(),
                     ))
                     .into_fatal();
+                }
+                // An array literal's element with a key before the start abandons the command,
+                // reported without the builtin.
+                error::ErrorKind::BadArrayElement(element) => {
+                    return error::ErrorKind::BadArrayElement(element.clone()).into();
+                }
+                // An error in an array subscript ends the shell, reported without the builtin.
+                error::ErrorKind::ArithmeticSubscript(error) => {
+                    return error::ErrorKind::ArithmeticSubscript(error.clone()).into();
                 }
                 // A value an integer variable cannot take ends the shell, named by the builtin.
                 error::ErrorKind::EvalError(_) if inner.is_fatal() => {

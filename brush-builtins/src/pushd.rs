@@ -13,6 +13,10 @@ pub(crate) struct PushdCommand {
     /// from the left or the right, to the top. Without it, the top two entries are exchanged.
     #[arg(allow_hyphen_values = true)]
     dir: Option<String>,
+
+    /// Operands after the first: too many, as in bash.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for PushdCommand {
@@ -22,6 +26,10 @@ impl builtins::Command for PushdCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        if !self.extra.is_empty() {
+            context.report("too many arguments")?;
+            return Ok(ExecutionResult::general_error());
+        }
         let dirs = crate::dirs::listed_dirs(context.shell);
         let rotation = match &self.dir {
             // Exchange the top two entries.

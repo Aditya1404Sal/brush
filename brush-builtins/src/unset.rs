@@ -74,6 +74,13 @@ impl builtins::Command for UnsetCommand {
                         brush_parser::word::Parameter::Positional(_)
                         | brush_parser::word::Parameter::Special(_) => continue,
                         brush_parser::word::Parameter::Named(name) => {
+                            // Bash looks the name up twice; a circular name reference warns.
+                            context.shell.warn_circular_nameref(
+                                &context.params,
+                                name.as_str(),
+                                2,
+                                false,
+                            );
                             let outcome = context.shell.env_mut().unset(name.as_str());
                             (name, outcome.map(|unset| unset.is_some()))
                         }
@@ -176,10 +183,11 @@ async fn unset_array_index(
     let index_to_use: Cow<'_, str> = if is_assoc_array {
         shell.basic_expand_string(params, index).await?.into()
     } else {
-        // First evaluate the index expression.
-        let index_as_expr = brush_parser::arithmetic::parse(index)?;
-        let evaluated_index = shell.eval_arithmetic(&index_as_expr)?;
-        evaluated_index.to_string().into()
+        // Expanded, then evaluated; an error ends the shell, as in bash.
+        let index = shell.basic_expand_string(params, index).await?;
+        brush_core::arithmetic::eval_subscript(shell, &index)?
+            .to_string()
+            .into()
     };
 
     // A scalar is element 0 of itself.

@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
@@ -12,6 +13,10 @@ pub(crate) struct PopdCommand {
     /// Remove the Nth entry, counting from the left (`+N`) or the right (`-N`).
     #[arg(allow_hyphen_values = true)]
     entry: Option<String>,
+
+    /// More operands, each of which bash also checks.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for PopdCommand {
@@ -21,6 +26,17 @@ impl builtins::Command for PopdCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        // An operand that is not `+N` or `-N` is a usage error, whichever it is.
+        if let Some(entry) = self.entry.iter().chain(&self.extra).find(|entry| {
+            matches!(
+                crate::dirs::stack_position(entry, usize::MAX),
+                crate::dirs::StackPosition::NotAnIndex
+            )
+        }) {
+            context.report(format_args!("{entry}: invalid argument"))?;
+            writeln!(context.stderr(), "popd: usage: popd [-n] [+N | -N]")?;
+            return Ok(ExecutionResult::new(2));
+        }
         let mut dirs = crate::dirs::listed_dirs(context.shell);
         if dirs.len() == 1 {
             context.report("directory stack empty")?;
@@ -34,9 +50,11 @@ impl builtins::Command for PopdCommand {
                     context.report(format_args!("{entry}: directory stack index out of range"))?;
                     return Ok(ExecutionResult::general_error());
                 }
+                // As in bash: not `+N` or `-N` is a usage error.
                 crate::dirs::StackPosition::NotAnIndex => {
                     context.report(format_args!("{entry}: invalid argument"))?;
-                    return Ok(ExecutionResult::general_error());
+                    writeln!(context.stderr(), "popd: usage: popd [-n] [+N | -N]")?;
+                    return Ok(ExecutionResult::new(2));
                 }
             },
         };

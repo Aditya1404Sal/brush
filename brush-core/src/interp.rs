@@ -21,6 +21,236 @@ use crate::{
     traps,
 };
 
+/// A simple command bash would run without forking, as `exec` does, so that a program it names
+/// replaces the shell and sees `SHLVL` one lower: the last command of a command string
+/// (`bash -c`, a substitution), the body of a `( list )` subshell, or a background command, and
+/// in a substitution or a background command the last command of a function they call.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NoFork {
+    /// The command's address in the program that holds it, or 0 for none. The program outlives
+    /// any shell that names one of its commands here.
+    command: usize,
+    /// Whether it also needs no trap to be set or running, as bash's `should_suppress_fork` and
+    /// `should_optimize_fork` do.
+    checked: bool,
+    /// Whether a function it calls runs its own last command this way, as bash's
+    /// `optimize_shell_function` does in a substitution or a background command.
+    into_function: bool,
+}
+
+/// How a command string ends the shell that runs it (see [`Shell::exec_last_command`]).
+#[derive(Clone, Copy)]
+pub(crate) enum CommandString {
+    /// A `-c` string: its last command is the end of the input only when nothing but blanks, a
+    /// comment and one newline follow it.
+    Script,
+    /// A `$( )` substitution, which bash runs from its command printed back, so it always ends
+    /// with its last command.
+    Substitution,
+    /// A backquoted substitution, which bash runs as written.
+    Backquoted,
+}
+
+impl NoFork {
+    /// The last command of a command string, `program`, whose text is `input` when known.
+    fn for_command_string(
+        program: &ast::Program,
+        kind: CommandString,
+        input: Option<&str>,
+    ) -> Self {
+        let Some(list) = program.complete_commands.last() else {
+            return Self::default();
+        };
+        if let (CommandString::Script, Some(input)) = (kind, input) {
+            let end = ast::SourceLocation::location(list).map(|span| span.end.index);
+            if !end.is_some_and(|end| ends_input(input, end)) {
+                return Self::default();
+            }
+        }
+        Self::for_last_command(list, !matches!(kind, CommandString::Script))
+    }
+
+    /// The last command of `list`, a command string's or a function body's, as bash's
+    /// `should_suppress_fork` finds it: it has no redirections of its own and needs no trap.
+    fn for_last_command(list: &ast::CompoundList, into_function: bool) -> Self {
+        match last_simple_command(list) {
+            Some((command, _)) if !has_redirects(command) => Self {
+                command: std::ptr::from_ref(command) as usize,
+                checked: true,
+                into_function,
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// The last command of a `( list )` subshell's body: its only command, whatever its
+    /// redirections and the traps, or the last of a `;`, `&&` or `||` connection as a command
+    /// string's.
+    fn for_subshell(list: &ast::CompoundList) -> Self {
+        match last_simple_command(list) {
+            Some((command, false)) => Self {
+                command: std::ptr::from_ref(command) as usize,
+                checked: false,
+                into_function: false,
+            },
+            Some((_, true)) => Self::for_last_command(list, false),
+            None => Self::default(),
+        }
+    }
+
+    /// A background command that is a single simple command, forked as it starts.
+    fn for_background(ao_list: &ast::AndOrList) -> Self {
+        match (ao_list.additional.is_empty(), &ao_list.first) {
+            (
+                true,
+                ast::Pipeline {
+                    timed: None, seq, ..
+                },
+            ) => match seq.as_slice() {
+                [ast::Command::Simple(command)] => Self {
+                    command: std::ptr::from_ref(command) as usize,
+                    checked: false,
+                    into_function: true,
+                },
+                _ => Self::default(),
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// The last command of a function body, when the call runs without forking.
+    pub(crate) fn for_function(body: &ast::CompoundCommand) -> Self {
+        match body {
+            ast::CompoundCommand::BraceGroup(ast::BraceGroupCommand { list, .. }) => {
+                Self::for_last_command(list, true)
+            }
+            _ => Self::default(),
+        }
+    }
+
+    /// Whether `command` is the command this names.
+    fn names(&self, command: &ast::SimpleCommand) -> bool {
+        self.command != 0 && self.command == std::ptr::from_ref(command) as usize
+    }
+}
+
+/// The simple command bash runs last in `list` when that is a whole command of its own: the
+/// list's only pipeline, or the second of its last `;`, `&&` or `||` (`a; b && c` ends with an
+/// `&&`, and `a & b` with a `&`), and whether it is such a second.
+fn last_simple_command(list: &ast::CompoundList) -> Option<(&ast::SimpleCommand, bool)> {
+    let (ast::CompoundListItem(and_or, separator), before) = list.0.split_last()?;
+    if matches!(separator, ast::SeparatorOperator::Async) {
+        return None;
+    }
+    let (pipeline, connection) = match before.last() {
+        Some(ast::CompoundListItem(_, ast::SeparatorOperator::Async)) => return None,
+        Some(_) if !and_or.additional.is_empty() => return None,
+        Some(_) => (&and_or.first, true),
+        None => match and_or.additional.last() {
+            Some(ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline)) => (pipeline, true),
+            None => (&and_or.first, false),
+        },
+    };
+    if pipeline.bang || pipeline.timed.is_some() {
+        return None;
+    }
+    match pipeline.seq.as_slice() {
+        [ast::Command::Simple(command)] => Some((command, connection)),
+        _ => None,
+    }
+}
+
+/// Whether a simple command has redirections of its own.
+fn has_redirects(command: &ast::SimpleCommand) -> bool {
+    command
+        .prefix
+        .iter()
+        .flat_map(|prefix| &prefix.0)
+        .chain(command.suffix.iter().flat_map(|suffix| &suffix.0))
+        .any(|item| matches!(item, CommandPrefixOrSuffixItem::IoRedirect(_)))
+}
+
+/// Whether only blanks, a `;`, a comment and one newline follow character `end` of a command
+/// string's `input`: bash, which reads the string a line at a time, is then at its end.
+fn ends_input(input: &str, end: usize) -> bool {
+    fn skip_blanks(mut text: &str) -> &str {
+        loop {
+            text = text.trim_start_matches([' ', '\t']);
+            match text.strip_prefix("\\\n") {
+                Some(after) => text = after,
+                None => return text,
+            }
+        }
+    }
+    let rest: String = input.chars().skip(end).collect();
+    let mut rest = skip_blanks(rest.as_str());
+    if let Some(after) = rest.strip_prefix(';') {
+        rest = skip_blanks(after);
+    }
+    if rest.starts_with('#') {
+        return rest
+            .split_once('\n')
+            .is_none_or(|(_, after)| after.is_empty());
+    }
+    rest.is_empty() || rest == "\n"
+}
+
+/// How many lines `to` is past `from` (negative when before it).
+fn line_delta(to: usize, from: usize) -> isize {
+    let magnitude = isize::try_from(to.abs_diff(from)).unwrap_or(isize::MAX);
+    if to >= from { magnitude } else { -magnitude }
+}
+
+/// A process substitution's list as bash runs it: printed back from its parse (see
+/// `brush_parser::print_comsub_list`) and read again, so its commands are numbered as that text
+/// has them; `None` when that text does not parse.
+fn reprinted_list(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    list: &ast::CompoundList,
+) -> Option<ast::CompoundList> {
+    let text = brush_parser::print_comsub_list(list, &shell.parser_options());
+    let program = shell.parse_string(text).ok()?;
+    Some(ast::CompoundList(
+        program
+            .complete_commands
+            .into_iter()
+            .flat_map(|list| list.0)
+            .collect(),
+    ))
+}
+
+/// Numbers a process substitution's commands on from the line of the command it belongs to, as
+/// bash numbers those of its text printed back; its first command is on that line.
+fn number_substitution_list(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    list: &ast::CompoundList,
+) {
+    let base = shell.current_position().map(|position| position.line);
+    let first = ast::SourceLocation::location(list).map(|span| span.start.line);
+    if let (Some(base), Some(first)) = (base, first) {
+        shell.shift_lines(line_delta(base, first));
+    }
+}
+
+/// Whether the traps allow bash to run a command without forking: none of `EXIT`, `ERR` or a
+/// caught signal is set, and no trap handler is running.
+fn traps_allow_exec(shell: &Shell<impl extensions::ShellExtensions>) -> bool {
+    let traps = shell.traps();
+    traps
+        .get_effective_handler(traps::TrapSignal::Exit)
+        .is_none()
+        && traps
+            .get_effective_handler(traps::TrapSignal::Err)
+            .is_none()
+        && traps
+            .signal_dispositions()
+            .all(|(_, disposition)| disposition != traps::PipeDisposition::Caught)
+        && !shell
+            .call_stack()
+            .iter()
+            .any(|frame| frame.frame_type.is_trap_handler())
+}
+
 /// Encapsulates the context of execution in a command pipeline.
 struct PipelineExecutionContext<'a, SE: extensions::ShellExtensions> {
     /// The shell in which the command should be executed.
@@ -252,7 +482,13 @@ async fn execute_program(
         let mut result = ExecutionResult::success();
         let (program, interrupted) = shell.begin_program();
         let input = shell.pending_input.take();
+        // A command string's last command may run in place of the shell, as bash's does.
+        let outer_no_fork = shell.no_fork;
+        if let Some(kind) = shell.exec_last.take() {
+            shell.no_fork = NoFork::for_command_string(program_ast, kind, input.as_deref());
+        }
         let mut next_input_line = 1;
+        let mut quiet_lines: Option<SubstitutionLines> = None;
 
         for (index, command) in program_ast.complete_commands.iter().enumerate() {
             shell.begin_command_unit(program, index);
@@ -261,13 +497,35 @@ async fn execute_program(
                 let end = ast::SourceLocation::location(command)
                     .map_or(next_input_line, |span| span.end.line);
                 if shell.options().print_shell_input_lines && end >= next_input_line {
+                    let quiet = quiet_lines.get_or_insert_with(|| {
+                        lines_inside_substitutions(input, &shell.parser_options())
+                    });
                     let mut stderr = params.stderr(shell);
-                    for line in input
+                    for (number, line) in input
                         .lines()
+                        .enumerate()
                         .skip(next_input_line - 1)
                         .take(end + 1 - next_input_line)
                     {
-                        let _ = writeln!(stderr, "{line}");
+                        // A here-document's lines in a substitution are echoed as bash reads
+                        // them while it parses the substitution: once, or twice in double
+                        // quotes. (It echoes them again each time the substitution runs.)
+                        if let Some((_, last, times)) = quiet
+                            .here_documents
+                            .iter()
+                            .find(|(first, _, _)| *first == number + 1)
+                        {
+                            let block: Vec<&str> =
+                                input.lines().skip(number).take(last - number).collect();
+                            for _ in 0..*times {
+                                for line in &block {
+                                    let _ = writeln!(stderr, "{line}");
+                                }
+                            }
+                        }
+                        if !quiet.inside.contains(&(number + 1)) {
+                            let _ = writeln!(stderr, "{line}");
+                        }
                     }
                 }
                 next_input_line = next_input_line.max(end + 1);
@@ -294,6 +552,7 @@ async fn execute_program(
         }
 
         shell.end_program(interrupted);
+        shell.no_fork = outer_no_fork;
         Ok(result)
     }
 }
@@ -374,6 +633,8 @@ async fn execute_list(
 
                 result = ExecutionResult::success();
             } else {
+                #[cfg(target_arch = "wasm32")]
+                give_other_tasks_a_turn(shell).await;
                 result = match ao_list.execute(shell, params).await {
                     Ok(result) => result,
                     // An error that ends the shell is reported where it happened, while LINENO
@@ -395,6 +656,32 @@ async fn execute_list(
         }
 
         Ok(result)
+    }
+}
+
+/// Commands a script runs between turns for the other tasks of the call.
+#[cfg(target_arch = "wasm32")]
+const COMMANDS_PER_TURN: u32 = 64;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Commands run since the running script last gave the other tasks a turn.
+    static COMMANDS_SINCE_TURN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Every [`COMMANDS_PER_TURN`] commands, lets the other tasks of the call run. On wasm32 every
+/// task shares one thread, so a loop of commands that never wait (`while :; do x=1; done`)
+/// would otherwise keep a timer from firing and a signal from being sent, and the signal from
+/// ending it: a signal ends a process only when its body next waits.
+#[cfg(target_arch = "wasm32")]
+async fn give_other_tasks_a_turn(shell: &Shell<impl extensions::ShellExtensions>) {
+    let due = COMMANDS_SINCE_TURN.with(|count| {
+        let next = count.get() + 1;
+        count.set(if next >= COMMANDS_PER_TURN { 0 } else { next });
+        next >= COMMANDS_PER_TURN
+    });
+    if due {
+        (shell.execution_services().yield_now)().await;
     }
 }
 
@@ -466,6 +753,14 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         let completed = std::cell::Cell::new(false);
         let result = leader_process
             .run(async {
+                // A background command is forked as it starts, so a program it names runs in
+                // place of that process; `( list ) &` is a subshell whose body runs as one.
+                cloned_shell.stage_subshell = false;
+                cloned_shell.paren_subshell = subshell_body.is_some();
+                cloned_shell.no_fork = match &subshell_body {
+                    Some((list, _)) => NoFork::for_subshell(list),
+                    None => NoFork::for_background(&cloned_ao_list),
+                };
                 let result = match subshell_body {
                     Some((list, redirects)) => {
                         // `( list ) >log &` is the same one process, its output redirected. Its
@@ -630,6 +925,9 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     }
 
     let join_handle = spawn_command_task(shell.execution_services(), async move {
+        cloned_shell.stage_subshell = false;
+        cloned_shell.paren_subshell = false;
+        cloned_shell.no_fork = NoFork::for_background(&cloned_ao_list);
         cloned_ao_list
             .execute(&mut cloned_shell, &cloned_params)
             .await
@@ -904,7 +1202,11 @@ async fn spawn_pipeline_processes(
         {
             if !run_in_current_shell {
                 let stage_process = shell.take_stage_process();
+                let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
                 let mut stage_shell = shell.clone();
+                stage_shell.debug_trap_ran = debug_trap_ran;
+                stage_shell.stage_subshell = true;
+                stage_shell.paren_subshell = false;
                 if stage_adds_no_subshell(command) {
                     stage_shell.subshell_level = shell.subshell_level;
                 }
@@ -922,7 +1224,11 @@ async fn spawn_pipeline_processes(
                 cmd_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
             }
 
+            let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
             let mut stage_shell = shell.clone();
+            stage_shell.debug_trap_ran = debug_trap_ran;
+            stage_shell.stage_subshell = true;
+            stage_shell.paren_subshell = false;
             if stage_adds_no_subshell(command) {
                 stage_shell.subshell_level = shell.subshell_level;
             }
@@ -1216,8 +1522,38 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
             return Ok(ExecutionSpawnResult::Completed(ExecutionResult::success()));
         }
 
-        // Updates the shell with information about the currently executing command.
+        // Updates the shell with information about the currently executing command. Bash numbers
+        // a simple command by the line its first word (or assignment, or redirection) ends on,
+        // and `(( ))` and `[[ ]]` by their last line.
         pipeline_context.shell.set_current_cmd(self);
+        match self {
+            Self::Simple(simple) => {
+                let first = simple
+                    .prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.0.first())
+                    .and_then(ast::SourceLocation::location)
+                    .or_else(|| {
+                        simple
+                            .word_or_name
+                            .as_ref()
+                            .and_then(ast::SourceLocation::location)
+                    });
+                pipeline_context
+                    .shell
+                    .set_current_position(first.map(|span| span.end));
+            }
+            Self::Compound(
+                compound @ (ast::CompoundCommand::Arithmetic(_)
+                | ast::CompoundCommand::ExtendedTest(_)),
+                _,
+            ) => {
+                pipeline_context.shell.set_current_position(
+                    ast::SourceLocation::location(compound).map(|span| span.end),
+                );
+            }
+            _ => {}
+        }
 
         match self {
             Self::Simple(simple) => simple.execute_in_pipeline(pipeline_context, params).await,
@@ -1258,8 +1594,12 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 }
 
                 // Set up any additional redirects. One that fails fails the command, and the
-                // list goes on.
+                // list goes on. Bash names the line the command ends on.
                 if let Some(redirects) = redirects {
+                    let position = pipeline_context.shell.current_position();
+                    pipeline_context.shell.set_current_position(
+                        ast::SourceLocation::location(redirects).map(|span| span.end),
+                    );
                     for redirect in &redirects.0 {
                         if let Err(error) =
                             setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await
@@ -1269,6 +1609,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                             return Ok(ExecutionResult::general_error().into());
                         }
                     }
+                    pipeline_context.shell.set_current_position(position);
                     if redirects.0.iter().any(redirects_stdin) {
                         params.stdin_redirected = true;
                     }
@@ -1342,6 +1683,10 @@ impl Execute for ast::CompoundCommand {
                 subshell.loop_depth = 0;
                 // Nor does it list the jobs around it, as a pipeline stage does.
                 subshell.jobs_mut().jobs.clear();
+                // Its last command may run in place of the subshell's process.
+                subshell.paren_subshell = true;
+                subshell.stage_subshell = false;
+                subshell.no_fork = NoFork::for_subshell(list);
                 // It is a process of its own, with its own `$BASHPID`.
                 #[cfg(target_arch = "wasm32")]
                 let numbered_subshell = subshell_process(&mut subshell);
@@ -1575,11 +1920,14 @@ impl Execute for ast::ForClauseCommand {
             }
 
             // Update the variable. A nameref control variable is pointed at each word in turn
-            // rather than assigned through, as bash does.
+            // rather than assigned through, as bash does; a circular one (`local -n v=v`) cannot
+            // be followed, so the word is assigned to the global variable, with bash's warning.
+            shell.warn_circular_nameref(params, &self.variable_name, 0, true);
             let nameref = shell
                 .env()
                 .get_raw(&self.variable_name)
-                .is_some_and(|(_, var)| var.is_treated_as_nameref());
+                .is_some_and(|(_, var)| var.is_treated_as_nameref())
+                && shell.env().circular_nameref(&self.variable_name).is_none();
             if nameref {
                 if let Some(var) = shell
                     .env_mut()
@@ -1702,6 +2050,7 @@ impl Execute for ast::SelectClauseCommand {
                 .and_then(|choice| values.get(choice.checked_sub(1)?))
                 .cloned()
                 .unwrap_or_default();
+            shell.warn_circular_nameref(params, &self.variable_name, 0, true);
             shell.env_mut().update_or_add(
                 &self.variable_name,
                 ShellValueLiteral::Scalar(chosen),
@@ -2000,14 +2349,16 @@ impl Execute for ast::ArithmeticForClauseCommand {
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
-        if let Some(initializer) = &self.initializer
-            && let Err(error) = initializer.eval(shell, params, true).await
-        {
-            return arithmetic_command_error(shell, params, "((", &error);
+        if let Some(initializer) = &self.initializer {
+            arithmetic_for_debug_trap(shell, params, initializer).await?;
+            if let Err(error) = initializer.eval(shell, params, true).await {
+                return arithmetic_command_error(shell, params, "((", &error);
+            }
         }
 
         loop {
             if let Some(condition) = &self.condition {
+                arithmetic_for_debug_trap(shell, params, condition).await?;
                 // An empty condition (e.g., `for (( ; ; ))`) means "always true".
                 if !condition.value.is_empty() {
                     match condition.eval(shell, params, true).await {
@@ -2034,16 +2385,41 @@ impl Execute for ast::ArithmeticForClauseCommand {
                 break;
             }
 
-            if let Some(updater) = &self.updater
-                && let Err(error) = updater.eval(shell, params, true).await
-            {
-                return arithmetic_command_error(shell, params, "((", &error);
+            if let Some(updater) = &self.updater {
+                arithmetic_for_debug_trap(shell, params, updater).await?;
+                if let Err(error) = updater.eval(shell, params, true).await {
+                    return arithmetic_command_error(shell, params, "((", &error);
+                }
             }
         }
 
         shell.set_last_exit_status(result.exit_code.into());
         Ok(result)
     }
+}
+
+/// Before an arithmetic `for` evaluates one of its clauses, the clause becomes `BASH_COMMAND` as
+/// bash prints it (`((i=0 ))`) and the DEBUG trap runs, as in bash.
+async fn arithmetic_for_debug_trap(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    clause: &ast::UnexpandedArithmeticExpr,
+) -> Result<(), error::Error> {
+    if !shell.running_trap_handler() {
+        shell.env_mut().update_or_add(
+            "BASH_COMMAND",
+            ShellValueLiteral::Scalar(format!("(({}))", clause.value.trim_start())),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+    }
+    if shell.traps().handles(traps::TrapSignal::Debug) {
+        shell
+            .invoke_trap_handler(traps::TrapSignal::Debug, params)
+            .await?;
+    }
+    Ok(())
 }
 
 /// An arithmetic error in `(( ))`, `for (( ))` or `[[ ]]` fails that command with status 1,
@@ -2060,6 +2436,10 @@ fn arithmetic_command_error(
             error::Error::from(error::ErrorKind::ExpandingUnsetVariable(name.to_owned()))
                 .into_fatal(),
         );
+    }
+    // An error in an array subscript ends the shell, reported without the command.
+    if error.is_in_subscript() {
+        return Err(error::Error::from(error.clone()));
     }
     // A readonly variable is named on its own, without the command.
     let message = if error.is_readonly_variable() {
@@ -2161,28 +2541,15 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let pending = params.own_output_substitutions();
         params.word_process_substitutions = WordProcessSubstitutions::default();
 
-        // Before its words are expanded, the command's text becomes BASH_COMMAND (unless a trap
-        // handler is running, whose commands leave it alone) and the DEBUG trap runs, as in bash.
-        if !context.shell.running_trap_handler() {
-            context.shell.env_mut().update_or_add(
-                "BASH_COMMAND",
-                ShellValueLiteral::Scalar(self.to_string()),
-                |_| Ok(()),
-                EnvironmentLookup::Anywhere,
-                EnvironmentScope::Global,
-            )?;
-        }
-        if context.shell.traps().handles(traps::TrapSignal::Debug) {
-            let _ = context
-                .shell
-                .invoke_trap_handler(traps::TrapSignal::Debug, &params)
-                .await?;
+        // A pipeline stage's DEBUG trap already ran in the shell that started the stage.
+        if !std::mem::take(&mut context.shell.debug_trap_ran) {
+            before_simple_command(&mut context.shell, &params, self).await?;
         }
 
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
-        let mut redirect_failed = false;
+        let mut redirects = vec![];
         let mut alias_follows = false;
 
         // `set -x` traces a simple command to the standard error it had before its own
@@ -2200,43 +2567,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
             params.install_word_process_substitutions();
             match item {
-                CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
-                    // Bash expands a here-document or here-string given to a program it runs in
-                    // a child process there, so the expansion's side effects are lost.
-                    let result = if matches!(
-                        redirect,
-                        ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
-                    ) && runs_as_process(&context.shell, &args)
-                    {
-                        let mut child = Shell::clone(&context.shell);
-                        setup_redirect(&mut child, &mut params, redirect).await
-                    } else {
-                        setup_redirect(&mut context.shell, &mut params, redirect).await
-                    };
-                    if let Err(e) = result {
-                        // An expansion error that ends the shell (a bad substitution in a
-                        // file name) or abandons the top-level command (failglob) still does, as
-                        // in bash; in a here-document or here-string, or any other failed
-                        // redirection, it fails the command.
-                        if (e.is_fatal() || e.abandons_command())
-                            && !matches!(
-                                redirect,
-                                ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
-                            )
-                        {
-                            return Err(e);
-                        }
-                        let _ = context
-                            .shell
-                            .display_error(&mut params.stderr(&context.shell), &e);
-                        // Without a command, the assignments still take effect, as in bash.
-                        if self.word_or_name.is_none() {
-                            redirect_failed = true;
-                            continue;
-                        }
-                        return Ok(ExecutionResult::general_error().into());
-                    }
-                }
+                // Bash expands the command's words first, then its assignments, and makes its
+                // redirections last.
+                CommandPrefixOrSuffixItem::IoRedirect(redirect) => redirects.push(redirect),
                 CommandPrefixOrSuffixItem::ProcessSubstitution(kind, subshell_command) => {
                     let (installed_fd_num, substitution_file) =
                         setup_process_substitution(&context.shell, &params, kind, subshell_command)
@@ -2271,6 +2604,29 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                             check_declared_assoc_elements(&context.shell, &args, assignment)?;
                             let expanded =
                                 expand_assignment(&mut context.shell, &params, assignment).await?;
+                            // Bash traces a compound array assignment to a declaration as it
+                            // expands it, with every element quoted: `a=('1' '2')`.
+                            if let Some(trace_params) = &trace_params
+                                && let ast::AssignmentValue::Array(elements) = &expanded.value
+                            {
+                                let op = if expanded.append { "+=" } else { "=" };
+                                let text = format!(
+                                    "{}{op}({})",
+                                    expanded.name,
+                                    elements
+                                        .iter()
+                                        .map(|(key, value)| match key {
+                                            Some(key) => format!(
+                                                "[{}]={}",
+                                                single_quoted(&key.value),
+                                                single_quoted(&value.value)
+                                            ),
+                                            None => single_quoted(&value.value),
+                                        })
+                                        .join(" ")
+                                );
+                                context.shell.trace_command(trace_params, text).await;
+                            }
                             args.push(CommandArg::Assignment(expanded));
                         } else {
                             // This *looks* like an assignment, but it's really a string we should
@@ -2354,6 +2710,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 process_group_id: context.process_group_id,
             };
 
+            let no_fork = context.shell.no_fork;
             let result = execute_command(
                 context,
                 params,
@@ -2361,6 +2718,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 cmd_name,
                 &assignments,
                 &args,
+                &redirects,
+                &mut stderr,
+                no_fork.names(self).then_some(no_fork),
             )
             .await;
             #[cfg(target_arch = "wasm32")]
@@ -2406,6 +2766,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // argument".
             context.shell.update_last_arg_variable(None);
 
+            // Then the redirections; one that fails fails the statement, but the assignments
+            // still took effect, as in bash.
+            let redirect_failed =
+                !setup_command_redirects(&mut context.shell, &mut params, &redirects, &args)
+                    .await?;
             if redirect_failed {
                 context.shell.set_last_exit_status(1);
                 return Ok(ExecutionResult::general_error().into());
@@ -2427,6 +2792,252 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
     }
 }
 
+/// Sets up a simple command's redirections, which bash makes after it expands the command's
+/// words and assignments. Returns whether they all succeeded: one that fails is reported and
+/// fails the command, unless it ends the shell or abandons the top-level command.
+async fn setup_command_redirects(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
+    redirects: &[&ast::IoRedirect],
+    args: &[CommandArg],
+) -> Result<bool, error::Error> {
+    for redirect in redirects {
+        params.install_word_process_substitutions();
+        let here = matches!(
+            redirect,
+            ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
+        );
+        // Bash expands a here-document or here-string given to a program it runs in a child
+        // process there, so the expansion's side effects are lost.
+        let result = if here && runs_as_process(shell, args) {
+            let mut child = Shell::clone(shell);
+            setup_redirect(&mut child, params, redirect).await
+        } else {
+            setup_redirect(shell, params, redirect).await
+        };
+        if let Err(error) = result {
+            // An expansion error that ends the shell (a bad substitution in a file name) or
+            // abandons the top-level command (failglob) still does, as in bash; in a
+            // here-document or here-string, or any other failed redirection, it fails the
+            // command.
+            if (error.is_fatal() || error.abandons_command()) && !here {
+                return Err(error);
+            }
+            let _ = shell.display_error(&mut params.stderr(shell), &error);
+            // A special builtin's failed redirection ends a non-interactive POSIX-mode shell.
+            if shell.options().posix_mode
+                && !shell.options().interactive
+                && runs_special_builtin(shell, args)
+            {
+                return Err(error.into_reported().into_fatal());
+            }
+            return Ok(false);
+        }
+    }
+    params.install_word_process_substitutions();
+    Ok(true)
+}
+
+/// The input lines of multi-line `$( )`s, as `set -v` echoes them.
+#[derive(Default)]
+struct SubstitutionLines {
+    /// The lines after the first of each: bash reads them while it parses the substitution, and
+    /// echoes none of them.
+    inside: std::collections::HashSet<usize>,
+    /// The first and last lines of the here-documents among them (the body and the delimiter),
+    /// which bash echoes as it reads them, and how many times: once, or twice for a substitution
+    /// in double quotes, which bash parses twice.
+    here_documents: Vec<(usize, usize, usize)>,
+}
+
+/// The input lines of multi-line `$( )`s (see [`SubstitutionLines`]).
+fn lines_inside_substitutions(
+    input: &str,
+    options: &brush_parser::ParserOptions,
+) -> SubstitutionLines {
+    fn substitutions(
+        pieces: &[brush_parser::word::WordPieceWithSource],
+        quoted: bool,
+        found: &mut Vec<(usize, usize, bool)>,
+    ) {
+        for piece in pieces {
+            match &piece.piece {
+                brush_parser::word::WordPiece::CommandSubstitution(_) => {
+                    found.push((piece.start_index, piece.end_index, quoted));
+                }
+                brush_parser::word::WordPiece::DoubleQuotedSequence(inner)
+                | brush_parser::word::WordPiece::GettextDoubleQuotedSequence(inner) => {
+                    substitutions(inner, true, found);
+                }
+                _ => (),
+            }
+        }
+    }
+
+    let mut lines = SubstitutionLines::default();
+    let Ok(tokens) = brush_parser::tokenize_str(input) else {
+        return lines;
+    };
+    for token in tokens {
+        let brush_parser::Token::Word(text, span) = token else {
+            continue;
+        };
+        if !text.contains('\n') {
+            continue;
+        }
+        let Ok(pieces) = brush_parser::word::parse(&text, options) else {
+            continue;
+        };
+        let mut found = vec![];
+        substitutions(&pieces, false, &mut found);
+        for (start, end, quoted) in found {
+            let (Some(before), Some(inside)) = (text.get(..start), text.get(start..end)) else {
+                continue;
+            };
+            let first_line = span.start.line + before.matches('\n').count();
+            lines
+                .inside
+                .extend(first_line + 1..=first_line + inside.matches('\n').count());
+            // Line 1 of the substitution's command is `first_line`.
+            let command = inside
+                .strip_prefix("$(")
+                .and_then(|command| command.strip_suffix(')'))
+                .unwrap_or_default();
+            let times = if quoted { 2 } else { 1 };
+            lines.here_documents.extend(
+                here_document_lines(command)
+                    .into_iter()
+                    .map(|(first, last)| (first_line + first - 1, first_line + last - 1, times)),
+            );
+        }
+    }
+    lines
+}
+
+/// The first and last lines of each here-document's body and delimiter in `command`, counted
+/// from its first line: the tokenizer gives a here-document's operator and tag, then its body,
+/// whose lines are followed by the delimiter's.
+pub(crate) fn here_document_lines(command: &str) -> Vec<(usize, usize)> {
+    let Ok(tokens) = brush_parser::tokenize_str(command) else {
+        return vec![];
+    };
+    let mut found = vec![];
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        if !matches!(token, brush_parser::Token::Operator(op, _) if op == "<<" || op == "<<-") {
+            continue;
+        }
+        let (Some(_tag), Some(body)) = (tokens.next(), tokens.next()) else {
+            break;
+        };
+        let first = body.location().start.line;
+        found.push((first, first + body.to_str().matches('\n').count()));
+    }
+    found
+}
+
+/// What happens before a simple command's words are expanded: its text becomes `BASH_COMMAND`
+/// (unless a trap handler is running, whose commands leave it alone) and the DEBUG trap runs, as
+/// in bash.
+async fn before_simple_command(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: &ast::SimpleCommand,
+) -> Result<(), error::Error> {
+    if !shell.running_trap_handler() {
+        shell.env_mut().update_or_add(
+            "BASH_COMMAND",
+            ShellValueLiteral::Scalar(command.to_string()),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+    }
+    if shell.traps().handles(traps::TrapSignal::Debug) {
+        let _ = shell
+            .invoke_trap_handler(traps::TrapSignal::Debug, params)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Runs a simple command's DEBUG trap in this shell before the pipeline stage that runs it
+/// starts, as bash does before it forks the stage, and returns whether it did.
+async fn stage_debug_trap(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: &ast::Command,
+) -> Result<bool, error::Error> {
+    match command {
+        ast::Command::Simple(simple) => {
+            before_simple_command(shell, params, simple).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// A word in single quotes, as bash's xtrace quotes an array element: `'it'\''s'`.
+fn single_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Whether the command `args` names is a special builtin (not a function of that name).
+fn runs_special_builtin(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    args: &[CommandArg],
+) -> bool {
+    let Some(CommandArg::String(name)) = args.first() else {
+        return false;
+    };
+    shell.funcs().get(name).is_none()
+        && shell
+            .builtins()
+            .get(name)
+            .is_some_and(|builtin| !builtin.disabled && builtin.special_builtin)
+}
+
+/// Runs the command `args` names as bash runs a command without forking: a program replaces the
+/// shell, as `exec` does, and sees `SHLVL` one lower; a function called from a substitution or a
+/// background command runs its own last command this way. Not in a pipeline stage (bash's
+/// substitution there is a process of its own), nor while a trap needs the shell afterwards.
+fn exec_in_place(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    no_fork: NoFork,
+    args: &[CommandArg],
+    params: &ExecutionParameters,
+) {
+    if shell.stage_subshell || (no_fork.checked && !traps_allow_exec(shell)) {
+        return;
+    }
+    let mut words = args.iter().map_while(|arg| match arg {
+        CommandArg::String(word) => Some(word.as_str()),
+        CommandArg::Assignment(_) => None,
+    });
+    let Some(mut name) = words.next() else {
+        return;
+    };
+    // `command NAME` runs the program in place too; it skips functions.
+    let mut function_allowed = true;
+    if name == "command" && shell.funcs().get(name).is_none() {
+        function_allowed = false;
+        match words.find(|word| !matches!(*word, "-p" | "--")) {
+            Some(word) if !word.starts_with('-') => name = word,
+            _ => return,
+        }
+    }
+    if function_allowed && shell.funcs().get(name).is_some() {
+        shell.no_fork_call = no_fork.into_function;
+    } else if shell.builtins().get(name).is_some_and(|builtin| {
+        !builtin.disabled
+            && builtin.execution_boundary == crate::builtins::ExecutionBoundary::Command
+    }) {
+        // Bash sees the command's own `SHLVL=` assignment only in a subshell.
+        let in_subshell = shell.depth() > shell.process_depth;
+        shell.adjust_shell_level(-1, params, in_subshell);
+    }
+}
+
 /// Whether bash would run the command `args` names as a program in a child process: not a
 /// function, and not a builtin other than a utility that stands for a program.
 fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[CommandArg]) -> bool {
@@ -2444,13 +3055,20 @@ fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[Comm
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the command's expanded parts and where its errors go, as the caller holds them"
+)]
 async fn execute_command<T: Into<String>>(
     mut context: PipelineExecutionContext<'_, impl extensions::ShellExtensions>,
-    params: ExecutionParameters,
+    mut params: ExecutionParameters,
     trace_params: Option<&ExecutionParameters>,
     cmd_name: T,
     assignments: &[&ast::Assignment],
     args: &[CommandArg],
+    redirects: &[&ast::IoRedirect],
+    stderr: &mut OpenFile,
+    no_fork: Option<NoFork>,
 ) -> Result<ExecutionSpawnResult, error::Error> {
     // Push a new ephemeral environment scope for the duration of the command. We'll
     // set command-scoped variable assignments after doing so, and revert them before
@@ -2470,53 +3088,92 @@ async fn execute_command<T: Into<String>>(
         )
         .await
         {
-            // A readonly variable keeps its value: bash reports it and still runs the command.
+            // A readonly variable keeps its value: bash reports it and still runs the command,
+            // unless it is a special builtin in a non-interactive POSIX-mode shell, which ends.
             Err(error)
                 if error.abandons_command()
-                    && matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) => {}
+                    && matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) =>
+            {
+                let shell = guard.shell();
+                if shell.options().posix_mode
+                    && !shell.options().interactive
+                    && runs_special_builtin(shell, args)
+                {
+                    return Err(error.into_fatal());
+                }
+            }
             result => result?,
         }
     }
 
     if guard.shell().options().print_commands_and_arguments {
-        // Bash traces a declaration builtin's compound assignments first, each on its own line
-        // with every word quoted, then the command with only their names.
-        for (assignment, elements) in args.iter().filter_map(compound_arg) {
-            let op = if assignment.append { "+=" } else { "=" };
-            let quoted = elements
-                .iter()
-                .map(|(key, value)| match key {
-                    Some(key) => std::format!(
-                        "[{}]={}",
-                        sh_single_quote(&key.value),
-                        sh_single_quote(&value.value)
-                    ),
-                    None => sh_single_quote(&value.value),
-                })
-                .join(" ");
-            guard
-                .shell()
-                .trace_command(
-                    trace_params.unwrap_or(&params),
-                    std::format!("{}{op}({quoted})", assignment.name),
-                )
-                .await;
-        }
-        let line = args
-            .iter()
-            .map(|arg| match compound_arg(arg) {
-                Some((assignment, _)) => Cow::Owned(assignment.name.to_string()),
-                None => arg.quote_for_tracing(),
-            })
-            .join(" ");
+        let trace_params = trace_params.unwrap_or(&params);
         guard
             .shell()
-            .trace_command(trace_params.unwrap_or(&params), line)
+            .trace_command(
+                trace_params,
+                args.iter().map(|arg| arg.quote_for_tracing()).join(" "),
+            )
             .await;
+        // `export` and `readonly` make their scalar assignments as ordinary assignments, which
+        // bash traces as it makes them: `+ a=1`.
+        let name = match args.first() {
+            Some(CommandArg::String(name)) => name.as_str(),
+            _ => "",
+        };
+        if matches!(name, "export" | "readonly")
+            && guard.shell().funcs().get(name).is_none()
+            && guard
+                .shell()
+                .builtins()
+                .get(name)
+                .is_some_and(|builtin| !builtin.disabled)
+        {
+            for arg in args.iter().skip(1) {
+                if let CommandArg::Assignment(assignment) = arg
+                    && let ast::AssignmentValue::Scalar(value) = &assignment.value
+                {
+                    let op = if assignment.append { "+=" } else { "=" };
+                    let value = if value.value.is_empty() {
+                        Cow::Borrowed("")
+                    } else {
+                        crate::escape::quote_if_needed(
+                            &value.value,
+                            crate::escape::QuoteMode::SingleQuote,
+                        )
+                    };
+                    guard
+                        .shell()
+                        .trace_command(trace_params, format!("{}{op}{value}", assignment.name))
+                        .await;
+                }
+            }
+        }
     }
+
+    // The redirections come last, after the words and assignments, and without the command's
+    // own variables, as in bash.
+    let scope = guard
+        .shell()
+        .env_mut()
+        .take_scope(EnvironmentScope::Command)?;
+    let redirected = setup_command_redirects(guard.shell(), &mut params, redirects, args).await;
+    guard
+        .shell()
+        .env_mut()
+        .restore_scope(EnvironmentScope::Command, scope);
+    if !redirected? {
+        return Ok(ExecutionResult::general_error().into());
+    }
+    // An error the command fails with is reported where its standard error now goes.
+    *stderr = params.stderr(guard.shell());
 
     guard.detach();
     drop(guard);
+
+    if let Some(no_fork) = no_fork {
+        exec_in_place(&mut context.shell, no_fork, args, &params);
+    }
 
     // Construct the command struct.
     let mut cmd =
@@ -2740,8 +3397,34 @@ async fn apply_assignment_unchecked(
             name
         }
     };
-    // Assigning through a circular nameref fails, as a readonly variable does in bash.
-    if shell.env().is_circular_nameref(variable_name) {
+    // Assigning through a nameref that comes back to itself from a function's local
+    // (`local -n v=v`) assigns the global variable it closes on, as bash does after following
+    // the reference as far as it goes.
+    let circular = shell.env().circular_nameref(variable_name);
+    let global_only = if let Some((closing, true)) = &circular {
+        // Bash's lookups on the way say so as they go: once for a list, twice for an element.
+        let prefix = shell.diagnostic_prefix();
+        let warning = match (&array_index, &assignment.value) {
+            (Some(_), _) => format!(
+                "{prefix}warning: {variable_name}: circular name reference\n\
+                 {prefix}warning: {variable_name}: circular name reference"
+            ),
+            (None, ast::AssignmentValue::Array(_)) => {
+                format!("{prefix}warning: {variable_name}: circular name reference")
+            }
+            (None, ast::AssignmentValue::Scalar(_)) => {
+                format!("{prefix}warning: {variable_name}: maximum nameref depth (8) exceeded")
+            }
+        };
+        writeln!(params.stderr(shell), "{warning}")?;
+        Some(closing.clone())
+    } else {
+        None
+    };
+    // Assigning through any other circular nameref fails, as a readonly variable does in bash.
+    if global_only.is_none()
+        && (circular.is_some() || shell.env().is_circular_nameref(variable_name))
+    {
         writeln!(
             params.stderr(shell),
             "{}warning: {variable_name}: circular name reference",
@@ -2755,11 +3438,15 @@ async fn apply_assignment_unchecked(
 
     // Assigning through a nameref assigns to the variable it names, and a nameref to an array
     // element (`declare -n ref='arr[1]'`) to that element, just as `arr[1]=value` would.
-    let mut resolved_name = shell
-        .env()
-        .resolve_nameref(variable_name.as_str())
-        .into_owned();
+    let mut resolved_name = match &global_only {
+        Some(closing) => closing.clone(),
+        None => shell
+            .env()
+            .resolve_nameref(variable_name.as_str())
+            .into_owned(),
+    };
     if array_index.is_none()
+        && global_only.is_none()
         && let Some((array, index)) = shell.env().resolve_nameref_element(variable_name.as_str())
     {
         resolved_name = array;
@@ -2775,8 +3462,11 @@ async fn apply_assignment_unchecked(
         )
     });
     if let ast::AssignmentValue::Array(elements) = &assignment.value {
-        // Bash traces a compound assignment as written, before expanding its elements.
-        if shell.options().print_commands_and_arguments {
+        // Bash traces a compound assignment as written, before expanding its elements; one
+        // written before a command is a string, traced as its value is.
+        if shell.options().print_commands_and_arguments
+            && creation_scope != EnvironmentScope::Command
+        {
             let op = if assignment.append { "+=" } else { "=" };
             let written = elements
                 .iter()
@@ -2804,12 +3494,33 @@ async fn apply_assignment_unchecked(
         }
     }
 
+    // An element of an array literal whose subscript is empty or counts back past the start
+    // fails the assignment once the elements before it are assigned, as in bash.
+    let mut failed_element = None;
+
     // Expand the values.
     let new_value = match &assignment.value {
         ast::AssignmentValue::Scalar(unexpanded_value) => {
             let value =
                 expansion::basic_expand_assignment_word(shell, params, unexpanded_value).await?;
             ShellValueLiteral::Scalar(value)
+        }
+        // A command's own variable is a string, as in bash: an array written before a command
+        // is the text of its elements, `(1 2)`, expanded as one assignment word.
+        ast::AssignmentValue::Array(unexpanded_values)
+            if creation_scope == EnvironmentScope::Command =>
+        {
+            let text = unexpanded_values
+                .iter()
+                .map(|(key, value)| match key {
+                    Some(key) => format!("[{}]={}", key.value, value.value),
+                    None => value.value.clone(),
+                })
+                .join(" ");
+            let word = ast::Word::from(format!("({text})"));
+            ShellValueLiteral::Scalar(
+                expansion::basic_expand_assignment_word(shell, params, &word).await?,
+            )
         }
         ast::AssignmentValue::Array(unexpanded_values) => {
             let mut elements = vec![];
@@ -2880,16 +3591,14 @@ async fn apply_assignment_unchecked(
     // A compound assignment to an indexed array evaluates its subscripts arithmetically; an
     // associative array's are words.
     let new_value = match new_value {
-        ShellValueLiteral::Array(literal) if !associative => ShellValueLiteral::Array(
-            arithmetic::resolve_indexed_array_literal(
-                shell,
-                params,
-                variable_name,
-                assignment.append,
-                literal,
-            )
-            .await?,
-        ),
+        ShellValueLiteral::Array(literal) if !associative => {
+            let existing = shell.env().get(variable_name).map(|(_, var)| var.value());
+            let keys = crate::variables::IndexedLiteralKeys::new(existing, assignment.append);
+            let (literal, failed) =
+                arithmetic::resolve_indexed_array_literal(shell, params, keys, literal).await?;
+            failed_element = failed;
+            ShellValueLiteral::Array(literal)
+        }
         value => value,
     };
 
@@ -2920,7 +3629,8 @@ async fn apply_assignment_unchecked(
         if will_be_indexed_array {
             array_index = Some(
                 arithmetic::expand_and_eval(shell, params, idx.as_str(), false)
-                    .await?
+                    .await
+                    .map_err(arithmetic::EvalError::in_subscript)?
                     .to_string(),
             );
         }
@@ -2929,10 +3639,17 @@ async fn apply_assignment_unchecked(
     // Read option before taking mutable borrow on env.
     let export_variables_on_modification = shell.options().export_variables_on_modification;
 
-    // See if we can find an existing value associated with the variable.
-    if let Some((existing_value_scope, existing_value)) =
+    // See if we can find an existing value associated with the variable: the global one, for a
+    // circular reference.
+    let existing = if global_only.is_some() {
+        shell
+            .env_mut()
+            .get_mut_using_policy_raw(variable_name.as_str(), EnvironmentLookup::OnlyInGlobal)
+            .map(|var| (EnvironmentScope::Global, var))
+    } else {
         shell.env_mut().get_mut(variable_name.as_str())
-    {
+    };
+    if let Some((existing_value_scope, existing_value)) = existing {
         if required_scope.is_none() || Some(existing_value_scope) == required_scope {
             if let Some(array_index) = array_index {
                 match new_value {
@@ -2959,7 +3676,7 @@ async fn apply_assignment_unchecked(
             }
 
             // That's it!
-            return Ok(());
+            return failed_element.map_or(Ok(()), Err);
         }
 
         // A command's own assignment cannot shadow a readonly variable either.
@@ -2994,7 +3711,15 @@ async fn apply_assignment_unchecked(
         new_var.export();
     }
 
-    shell.env_mut().add(variable_name, new_var, creation_scope)
+    let creation_scope = if global_only.is_some() {
+        EnvironmentScope::Global
+    } else {
+        creation_scope
+    };
+    shell
+        .env_mut()
+        .add(variable_name, new_var, creation_scope)?;
+    failed_element.map_or(Ok(()), Err)
 }
 
 #[expect(clippy::too_many_lines)]
@@ -3383,6 +4108,7 @@ async fn setup_process_substitution(
     // Execute in a subshell, read one xtrace level deeper, as bash does.
     let mut subshell = shell.clone();
     subshell.trace_level += 1;
+    number_substitution_list(&mut subshell, &subshell_cmd.list);
 
     // Set up execution parameters for the child execution.
     let mut child_params = params.clone();
@@ -3405,13 +4131,13 @@ async fn setup_process_substitution(
 
     // Asynchronously spawn off the subshell; we intentionally don't block on its
     // completion.
-    let subshell_cmd = subshell_cmd.to_owned();
+    let list =
+        reprinted_list(shell, &subshell_cmd.list).unwrap_or_else(|| subshell_cmd.list.clone());
     tokio::spawn(async move {
+        subshell.no_fork = NoFork::for_last_command(&list, true);
+        number_substitution_list(&mut subshell, &list);
         // Intentionally ignore the result of the subshell command.
-        let _ = subshell_cmd
-            .list
-            .execute(&mut subshell, &child_params)
-            .await;
+        let _ = list.execute(&mut subshell, &child_params).await;
     });
 
     // Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
@@ -3474,7 +4200,8 @@ async fn setup_process_substitution(
         ast::ProcessSubstitutionKind::Write => {
             let (sink, input) = openfiles::memory_sink(openfiles::MAX_SUBSTITUTION_BYTES);
             params.output_substitutions.push(PendingOutputSubstitution {
-                list: subshell_cmd.list.clone(),
+                list: reprinted_list(shell, &subshell_cmd.list)
+                    .unwrap_or_else(|| subshell_cmd.list.clone()),
                 params: child_params,
                 input,
                 fd,
@@ -3690,6 +4417,7 @@ fn start_persistent_output_substitutions(
             async move {
                 numbered
                     .run(async {
+                        subshell.no_fork = NoFork::for_last_command(&list, true);
                         let result = list.execute(&mut subshell, &params).await;
                         subshell.exit_with_trap_in(result, &params).await
                     })
@@ -3732,8 +4460,13 @@ async fn run_substitution_list(
     subshell.traps_mut().reset_pipe_for_subshell();
     subshell.traps_mut().reset_exit_for_subshell();
     subshell.loop_depth = 0;
-    // Bash reads the list one xtrace level deeper.
+    // Bash reads the list one xtrace level deeper, as a command string whose last command may
+    // run in place of the substitution's process.
     subshell.trace_level += 1;
+    let reprinted = reprinted_list(shell, list);
+    let list = reprinted.as_ref().unwrap_or(list);
+    subshell.no_fork = NoFork::for_last_command(list, true);
+    number_substitution_list(&mut subshell, list);
     let disposition = subshell.traps().pipe_disposition();
     let body = async {
         let result = list.execute(&mut subshell, params).await;
@@ -3803,9 +4536,6 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
     }
 }
 
-/// The elements of a compound array assignment, each with its subscript, if any.
-type ArrayElements = [(Option<ast::Word>, ast::Word)];
-
 /// Bash checks a declaration builtin's compound assignment to an associative array (`-A`, or
 /// one that already is) before expanding it: once the first element has a subscript, every
 /// element needs one, and the error quotes the word as written.
@@ -3842,26 +4572,10 @@ fn check_declared_assoc_elements(
     });
     if makes_associative || is_associative {
         let kind =
-            error::ErrorKind::AssocSubscriptRequired(name.to_owned(), sh_single_quote(&word.value));
+            error::ErrorKind::AssocSubscriptRequired(name.to_owned(), single_quoted(&word.value));
         return Err(error::Error::from(kind).into_fatal());
     }
     Ok(())
-}
-
-/// Bash's `sh_single_quote`: the text in single quotes, each `'` as `'\''`.
-fn sh_single_quote(text: &str) -> String {
-    std::format!("'{}'", text.replace('\'', "'\\''"))
-}
-
-/// A command argument that is a compound array assignment, with its elements.
-fn compound_arg(arg: &CommandArg) -> Option<(&ast::Assignment, &ArrayElements)> {
-    match arg {
-        CommandArg::Assignment(a) => match &a.value {
-            ast::AssignmentValue::Array(elements) => Some((a, elements)),
-            ast::AssignmentValue::Scalar(_) => None,
-        },
-        CommandArg::String(_) => None,
-    }
 }
 
 #[cfg(test)]
@@ -3882,5 +4596,26 @@ mod execution_context_tests {
         assert_eq!(&*second.context::<String>().unwrap(), "second");
         assert!(child.context::<usize>().is_none());
         assert!(ExecutionParameters::default().context::<String>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod no_fork_tests {
+    use super::ends_input;
+
+    #[test]
+    fn a_command_string_ends_where_bash_reads_its_end() {
+        assert!(ends_input("env", 3));
+        assert!(ends_input("env\n", 3));
+        assert!(ends_input("env ;\n", 3));
+        assert!(ends_input("env # comment", 3));
+        assert!(ends_input("env # comment\n", 3));
+        assert!(ends_input("env \\\n", 3));
+        assert!(ends_input("é; env", 6));
+        assert!(!ends_input("env\n\n", 3));
+        assert!(!ends_input("env\n ", 3));
+        assert!(!ends_input("env\n# comment", 3));
+        assert!(!ends_input("env # comment\ntrue", 3));
+        assert!(!ends_input("env; true", 3));
     }
 }

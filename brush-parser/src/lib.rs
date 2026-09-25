@@ -11,6 +11,7 @@ pub mod readline_binding;
 pub mod test_command;
 pub mod word;
 
+mod comsub;
 mod error;
 mod parser;
 mod source;
@@ -31,6 +32,7 @@ pub use error::miette::PrettyError;
 pub use parser::winnow_str;
 pub use parser::{Parser, ParserBuilder, ParserImpl, ParserOptions, SourceInfo, parse_tokens};
 
+pub use comsub::{print_comsub, print_comsub_list, reprint_comsub_text, reprint_word};
 pub use source::{SourcePosition, SourcePositionOffset, SourceSpan};
 pub use tokenizer::{
     Token, TokenLocation, TokenizerError, TokenizerOptions, UnterminatedHereDocument, tokenize_str,

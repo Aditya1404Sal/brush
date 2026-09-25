@@ -117,6 +117,17 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.subshell_level = 0;
         self.trace_level = 0;
         self.exit_trace_level = 0;
+        self.paren_subshell = false;
+        self.stage_subshell = false;
+        self.no_fork = crate::interp::NoFork::default();
+    }
+
+    /// Marks the next program the shell runs as a command string that ends the shell, as
+    /// `bash -c` runs one. When its last command is a simple command naming a program, and
+    /// nothing (a trap, a redirection) needs the shell after it, bash runs the program in place
+    /// of the shell, as `exec` does: the program sees `SHLVL` one lower.
+    pub const fn exec_last_command(&mut self) {
+        self.exec_last = Some(crate::interp::CommandString::Script);
     }
 
     /// Updates the shell's internal tracking state to reflect that command
@@ -263,21 +274,58 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         for frame in self.call_stack.iter_mut() {
             match frame.frame_type {
                 // Function calls always shadow positional parameters.
-                crate::callstack::FrameType::Function(..) => return &mut frame.args,
+                crate::callstack::FrameType::Function(..) => {
+                    return std::sync::Arc::make_mut(&mut frame.args);
+                }
                 // Executed scripts always shadow positional parameters.
-                _ if frame.frame_type.is_run_script() => return &mut frame.args,
+                _ if frame.frame_type.is_run_script() => {
+                    return std::sync::Arc::make_mut(&mut frame.args);
+                }
                 // Sourced scripts shadow positional parameters if they have arguments.
                 _ if frame.frame_type.is_sourced_script() && !frame.args.is_empty() => {
-                    return &mut frame.args;
+                    return std::sync::Arc::make_mut(&mut frame.args);
                 }
                 _ => (),
             }
         }
 
-        &mut self.args
+        std::sync::Arc::make_mut(&mut self.args)
     }
 }
 
 fn repeated_char_str(c: char, count: usize) -> String {
     (0..count).map(|_| c).collect()
+}
+
+#[cfg(test)]
+mod shared_state_tests {
+    use crate::Shell;
+
+    #[test]
+    fn a_clone_shares_positional_parameters_and_aliases_until_it_changes_them()
+    -> Result<(), crate::Error> {
+        let mut shell: Shell = Shell::new(crate::CreateOptions::default())?;
+        shell
+            .current_shell_args_mut()
+            .extend(["one".to_owned(), "two".to_owned()]);
+        shell.define_alias("g".into(), "echo parent".into());
+
+        // A subshell or a pipeline stage starts as a clone that copies neither.
+        let mut clone = shell.clone();
+        assert!(std::ptr::eq(
+            shell.current_shell_args().as_ptr(),
+            clone.current_shell_args().as_ptr()
+        ));
+        assert!(std::ptr::eq(shell.aliases(), clone.aliases()));
+
+        // Its changes stay its own.
+        clone.current_shell_args_mut().remove(0);
+        clone.define_alias("g".into(), "echo clone".into());
+        assert_eq!(shell.current_shell_args(), ["one", "two"]);
+        assert_eq!(clone.current_shell_args(), ["two"]);
+        let alias = |shell: &Shell| shell.aliases().get("g").cloned();
+        assert_eq!(alias(&shell).as_deref(), Some("echo parent"));
+        assert_eq!(alias(&clone).as_deref(), Some("echo clone"));
+        Ok(())
+    }
 }

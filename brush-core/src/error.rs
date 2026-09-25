@@ -155,7 +155,12 @@ pub enum ErrorKind {
 
     /// An error occurred evaluating an arithmetic expression.
     #[error("{0}")]
-    EvalError(#[from] crate::arithmetic::EvalError),
+    EvalError(crate::arithmetic::EvalError),
+
+    /// An error in an indexed array's subscript: bash reports it without the command's name and
+    /// ends the shell.
+    #[error("{0}")]
+    ArithmeticSubscript(crate::arithmetic::EvalError),
 
     /// The given string could not be parsed as an integer.
     #[error("failed to parse '{s}' as a {int_type_name}, base-{radix} integer: {inner}")]
@@ -213,6 +218,10 @@ pub enum ErrorKind {
     /// An indirect expansion's value is not a name to expand.
     #[error("{0}: invalid variable name")]
     InvalidVariableName(String),
+
+    /// `${!ref}` of a name reference that cannot be followed (`local -n v=v`).
+    #[error("{0}: invalid indirect expansion")]
+    InvalidIndirectExpansion(String),
 
     /// An error occurred while creating a child process.
     #[error("failed to create child process")]
@@ -306,7 +315,10 @@ pub enum ErrorKind {
     FunctionNestingTooDeep(String, usize),
 
     /// A command substitution's output exceeded what the shell holds in memory.
-    #[error("command substitution: output over 16 MiB is unsupported in bash-tool")]
+    #[error(
+        "command substitution: output over {} MiB is unsupported in bash-tool",
+        crate::openfiles::MAX_SUBSTITUTION_BYTES >> 20
+    )]
     SubstitutionTooLarge,
 
     /// Execution would nest deeper than the stack can hold.
@@ -325,19 +337,15 @@ pub enum ErrorKind {
     #[error("{0}: bad array subscript")]
     ArrayIndexOutOfRange(String),
 
-    /// An element of a compound array assignment (`[-5]=x`) whose subscript names no element.
-    #[error("{0}: bad array subscript")]
-    BadArraySubscript(String),
-
     /// An element without a subscript in a compound assignment to an associative array whose
     /// elements have them; bash names no builtin for it.
     #[error("{0}: {1}: must use subscript when assigning associative array")]
     AssocSubscriptRequired(String, String),
 
-    /// A subscript of a compound array assignment that does not evaluate; bash names no builtin
-    /// for it, even in `declare` or `local`.
-    #[error("{0}")]
-    SubscriptEvalError(String),
+    /// An element of an array literal whose key is empty or counts back past the start
+    /// (`a=([-1]=x)`): it abandons the top-level command, reported without the command's name.
+    #[error("{0}: bad array subscript")]
+    BadArrayElement(String),
 
     /// Unhandled key code.
     #[error("unhandled key code: {0:?}")]
@@ -480,6 +488,15 @@ impl From<&Error> for results::ExecutionExitCode {
     }
 }
 
+impl From<crate::arithmetic::EvalError> for ErrorKind {
+    fn from(error: crate::arithmetic::EvalError) -> Self {
+        match error {
+            crate::arithmetic::EvalError::InSubscript(inner) => Self::ArithmeticSubscript(*inner),
+            error => Self::EvalError(error),
+        }
+    }
+}
+
 impl<T> From<T> for Error
 where
     ErrorKind: From<T>,
@@ -523,7 +540,10 @@ impl Error {
         (matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported)
             || matches!(
                 self.kind,
-                ErrorKind::NoMatch(_) | ErrorKind::InvalidVariableName(_)
+                ErrorKind::NoMatch(_)
+                    | ErrorKind::InvalidVariableName(_)
+                    | ErrorKind::InvalidIndirectExpansion(_)
+                    | ErrorKind::BadArrayElement(_)
             )
     }
 
@@ -552,7 +572,7 @@ impl Error {
 
     /// Returns whether or not this error is fatal.
     pub const fn is_fatal(&self) -> bool {
-        self.fatal
+        self.fatal || matches!(self.kind, ErrorKind::ArithmeticSubscript(_))
     }
 
     /// Returns a reference to the error kind.

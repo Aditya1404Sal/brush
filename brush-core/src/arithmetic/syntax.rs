@@ -66,6 +66,52 @@ pub(crate) fn diagnose(expression: &str) -> SyntaxError {
 
 const OPERAND_EXPECTED: &str = "arithmetic syntax error: operand expected";
 
+/// How deeply the expression nests, counted as the parser and the evaluator recurse: one for
+/// each parenthesis, prefix operator (`-`, `!`, `++`) and right-associative operator (`**`, `=`,
+/// `?`) still open. A chain of left-associative operators (`1+2+3`) does not nest. The count is
+/// read with a loop, so it costs no stack however deep the expression is.
+pub(crate) fn nesting(expression: &str) -> usize {
+    let mut reader = Reader::new(expression);
+    // For each open parenthesis, what was open around it.
+    let mut levels: Vec<usize> = vec![];
+    let mut outside = 0;
+    // What is open in the current parenthesis: assignments and conditionals until a comma,
+    // powers until another operator, prefix operators until their operand.
+    let (mut assignments, mut powers, mut prefixes) = (0, 0, 0);
+    let mut deepest = 0;
+    while reader.next().is_ok() {
+        let previous_is_operand = matches!(
+            reader.previous,
+            Token::Number | Token::Name | Token::CloseParen | Token::PostStep
+        );
+        match reader.current {
+            Token::End => break,
+            Token::OpenParen => {
+                let open = assignments + powers + prefixes + 1;
+                levels.push(open);
+                outside += open;
+                (assignments, powers, prefixes) = (0, 0, 0);
+            }
+            Token::CloseParen => {
+                outside -= levels.pop().unwrap_or(0).min(outside);
+                (assignments, powers, prefixes) = (0, 0, 0);
+            }
+            Token::Number | Token::Name => prefixes = 0,
+            Token::PreStep | Token::Not | Token::BitNot => prefixes += 1,
+            Token::Plus | Token::Minus if !previous_is_operand => prefixes += 1,
+            Token::Power => powers += 1,
+            Token::Assign | Token::OperatorAssign | Token::Question => {
+                assignments += 1;
+                powers = 0;
+            }
+            Token::Comma => (assignments, powers) = (0, 0),
+            _ => powers = 0,
+        }
+        deepest = deepest.max(outside + assignments + powers + prefixes);
+    }
+    deepest
+}
+
 /// The tokens of bash's arithmetic grammar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token {
@@ -543,6 +589,25 @@ mod tests {
         ] {
             assert_eq!(message(expression), expected, "{expression}");
         }
+    }
+
+    #[test]
+    fn nesting_counts_what_the_parser_recurses_on() {
+        for (expression, depth) in [
+            ("1+2+3+4", 0),
+            ("((1))", 2),
+            ("- - -1", 3),
+            ("2**3**4", 2),
+            ("a=b=c=1", 3),
+            ("a=1, b=2, c=3", 1),
+            ("1+(2+(3+(4)))", 3),
+            ("(1)+(2)+(3)", 1),
+            ("!(a ? b : c ? d : e)", 4),
+        ] {
+            assert_eq!(nesting(expression), depth, "{expression}");
+        }
+        let deep = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
+        assert_eq!(nesting(&deep), 10_000);
     }
 
     #[test]

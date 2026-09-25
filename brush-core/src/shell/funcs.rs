@@ -55,7 +55,8 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
     }
 
     /// Tries to define a function in the shell's environment using the given
-    /// string as its body.
+    /// string as its body, as a function imported from the environment
+    /// (`BASH_FUNC_name%%`).
     ///
     /// # Arguments
     ///
@@ -79,7 +80,17 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             body: func_body,
         };
 
-        self.define_func(name, def, &crate::SourceInfo::default());
+        // Bash names the source of an imported function `environment`, and numbers its lines
+        // from 0.
+        let source_info = crate::SourceInfo {
+            source: "environment".to_owned(),
+            start: Some(std::sync::Arc::new(crate::SourcePosition {
+                index: 0,
+                line: 0,
+                column: 1,
+            })),
+        };
+        self.define_func(name, def, &source_info);
 
         Ok(())
     }

@@ -22,6 +22,76 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         params
     }
 
+    /// Lowers `SHLVL` by one before `exec` runs `name` in place of the shell, as bash does,
+    /// unless the shell is a `( list )` subshell or `name` is nothing it can run.
+    pub fn exec_shell_level(&mut self, params: &ExecutionParameters, name: &str) {
+        if !self.paren_subshell
+            && self
+                .builtins
+                .get(name)
+                .is_some_and(|builtin| !builtin.disabled)
+        {
+            self.adjust_shell_level(-1, params, true);
+        }
+    }
+
+    /// Changes `SHLVL` by `change`, as bash's `adjust_shell_level` does before it replaces the
+    /// shell with a program: a value that is not a number counts as 0, the level stays at least
+    /// 0, and one of 1000 or more is reported and reset to 1. The variable ends up exported. The
+    /// command's own assignment (`SHLVL=5 cmd`) is the one changed only when `own_assignments`
+    /// holds, as bash sees it only from a builtin or in a subshell; otherwise the program gets
+    /// the shell's level in its place.
+    pub(crate) fn adjust_shell_level(
+        &mut self,
+        change: i64,
+        params: &ExecutionParameters,
+        own_assignments: bool,
+    ) {
+        use crate::env::{EnvironmentLookup, EnvironmentScope};
+        use crate::variables::ShellValueLiteral;
+        use std::io::Write as _;
+
+        let command_scope = if own_assignments {
+            None
+        } else {
+            self.env.take_scope(EnvironmentScope::Command).ok()
+        };
+        let old = self
+            .env_str("SHLVL")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut level = old.saturating_add(change).max(0);
+        if level >= 1000 {
+            let _ = writeln!(
+                params.stderr(self),
+                "{}warning: shell level ({level}) too high, resetting to 1",
+                self.diagnostic_prefix()
+            );
+            level = 1;
+        }
+        let result = self.env.update_or_add(
+            "SHLVL",
+            ShellValueLiteral::Scalar(level.to_string()),
+            |var| {
+                var.export();
+                Ok(())
+            },
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        );
+        if let Some(mut scope) = command_scope {
+            if result.is_ok()
+                && let Some(var) = scope.get_mut("SHLVL")
+            {
+                let _ = var.assign(ShellValueLiteral::Scalar(level.to_string()), false);
+            }
+            self.env.restore_scope(EnvironmentScope::Command, scope);
+        }
+        if let Err(error) = result {
+            let _ = self.display_error(&mut params.stderr(self), &error);
+        }
+    }
+
     pub(super) async fn source_if_exists(
         &mut self,
         path: impl AsRef<Path>,
@@ -145,6 +215,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
         self.pending_input = Some(text.as_str().into());
+        let alias_scope = self.alias_scope.take();
 
         #[cfg(any(target_arch = "wasm32", test))]
         let result = {
@@ -171,6 +242,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         };
 
         self.pending_input = None;
+        self.alias_scope = alias_scope;
 
         // The RETURN trap runs as a sourced script returns, as in bash.
         if matches!(call_type, callstack::ScriptCallType::Source) {
@@ -198,9 +270,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let command: String = command.into();
         let parse_result = self.parse_string(command.as_str());
         self.pending_input = Some(command.as_str().into());
+        // Text read now (`eval`'s, a trap's, a sourced file's) expands the aliases in effect now,
+        // even in a function body, whose own text expands those where it was defined.
+        let alias_scope = self.alias_scope.take();
         let result = self
             .run_parsed_result(parse_result, Some(&command), source_info, params)
             .await;
+        self.alias_scope = alias_scope;
         self.pending_input = None;
         result
     }

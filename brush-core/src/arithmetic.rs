@@ -19,7 +19,7 @@ const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
 const MAX_VARIABLE_DEREF_DEPTH: u32 = 200;
 
 /// Represents an error that occurs during evaluation of an arithmetic expression.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum EvalError {
     /// Division by zero.
     #[error("division by 0")]
@@ -68,6 +68,17 @@ pub enum EvalError {
     /// An assignment to a readonly variable.
     #[error("{0}: readonly variable")]
     ReadonlyVariable(String),
+
+    /// An error in an indexed array's subscript, which ends the shell as bash's does, reported
+    /// without the command's name.
+    #[error("{0}")]
+    InSubscript(Box<Self>),
+
+    /// An expression that nests deeper than the stack can hold.
+    #[error(
+        "arithmetic expression nesting level exceeded ({0}): deeper nesting is unsupported in bash-tool"
+    )]
+    NestedTooDeeply(usize),
 }
 
 /// Trait implemented by arithmetic expressions that can be evaluated.
@@ -145,17 +156,85 @@ async fn eval_expanded(
     }
 
     // Now evaluate.
-    expr.eval(shell)
+    eval_reporting(&expr, shell, params)
         .map_err(|error| EvalError::in_expression(&expanded_self, error))
 }
 
-/// Parses an arithmetic expression, failing as bash reports a malformed one.
+/// Evaluates a parsed expression, writing the warnings a circular name reference gets from it
+/// (see `Shell::note_circular_nameref`) to the standard error of `params`.
+pub fn eval_reporting(
+    expr: &ast::ArithmeticExpr,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Result<i64, EvalError> {
+    let outer = shell.nameref_warnings.replace(String::new());
+    let result = expr.eval(shell);
+    let warnings = std::mem::replace(&mut shell.nameref_warnings, outer).unwrap_or_default();
+    if !warnings.is_empty() {
+        use std::io::Write as _;
+        let _ = params.stderr(shell).write_all(warnings.as_bytes());
+    }
+    result
+}
+
+/// How deeply an expression may nest (see `syntax::nesting`): the parser and the evaluator
+/// recurse at each level, and a hundred levels fit in the stack left at the shell's deepest
+/// nesting. A chain of left-associative operators (`1+2+…`) does not nest, and may be as long as
+/// memory allows.
+const MAX_EXPRESSION_NESTING: usize = 100;
+
+/// A parsed arithmetic expression. A long chain of operators (`1+2+…+5000`) makes a deep tree,
+/// so it is taken apart with a loop rather than dropped recursively.
+pub struct ParsedExpression(ast::ArithmeticExpr);
+
+impl std::ops::Deref for ParsedExpression {
+    type Target = ast::ArithmeticExpr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ParsedExpression {
+    fn drop(&mut self) {
+        let mut parts = vec![std::mem::replace(
+            &mut self.0,
+            ast::ArithmeticExpr::Literal(0),
+        )];
+        while let Some(expr) = parts.pop() {
+            match expr {
+                ast::ArithmeticExpr::UnaryOp(_, operand)
+                | ast::ArithmeticExpr::Assignment(_, operand)
+                | ast::ArithmeticExpr::BinaryAssignment(_, _, operand) => parts.push(*operand),
+                ast::ArithmeticExpr::BinaryOp(_, left, right) => {
+                    parts.push(*left);
+                    parts.push(*right);
+                }
+                ast::ArithmeticExpr::Conditional(condition, then_expr, else_expr) => {
+                    parts.push(*condition);
+                    parts.push(*then_expr);
+                    parts.push(*else_expr);
+                }
+                ast::ArithmeticExpr::Literal(_)
+                | ast::ArithmeticExpr::Reference(_)
+                | ast::ArithmeticExpr::UnaryAssignment(..) => (),
+            }
+        }
+    }
+}
+
+/// Parses an arithmetic expression, failing as bash reports a malformed one, or as one that
+/// nests too deeply to evaluate.
 ///
 /// # Arguments
 ///
 /// * `text` - The (already expanded) expression.
-pub fn parse(text: &str) -> Result<ast::ArithmeticExpr, EvalError> {
-    match brush_parser::arithmetic::parse(text) {
+pub fn parse(text: &str) -> Result<ParsedExpression, EvalError> {
+    let nesting = syntax::nesting(text);
+    if nesting > MAX_EXPRESSION_NESTING {
+        return Err(EvalError::NestedTooDeeply(nesting));
+    }
+    match brush_parser::arithmetic::parse(text).map(ParsedExpression) {
         // Bash's grammar is stricter than the parser's in places (`-a=1`), so an expression bash
         // rejects fails even when it parses.
         Ok(expr) => match syntax::check(text) {
@@ -235,132 +314,51 @@ pub fn eval_integer_literal(
 
 /// Resolves the subscripts of a compound assignment to an indexed array.
 ///
-/// As bash's `assign_compound_array_list` does, each subscript (already expanded, as an
-/// element's words are) is expanded again and evaluated arithmetically, in order, and the
-/// elements are placed by [`place_indexed_array_literal`]. An error in a subscript ends the
-/// shell, as in bash.
+/// As bash's `assign_compound_array_list` does once every element is expanded, each subscript
+/// is expanded again and evaluated arithmetically, in order, and placed by
+/// [`variables::IndexedLiteralKeys`]: a negative one counts back from one past the highest index
+/// so far. An error in a subscript ends the shell, as in bash. An empty subscript, or one that
+/// counts back past the start, stops there: the elements before it are returned with the error
+/// to report once they are assigned (`[KEY]=VALUE: bad array subscript`, which abandons the
+/// command).
 ///
 /// # Arguments
 ///
 /// * `shell` - The shell to use for evaluation.
 /// * `params` - The execution parameters to use.
-/// * `name` - The array variable being assigned.
-/// * `append` - Whether the assignment appends (`a+=(...)`).
+/// * `keys` - Where the elements go: after the array's elements when appending.
 /// * `literal` - The expanded elements.
 pub async fn resolve_indexed_array_literal(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
-    name: &str,
-    append: bool,
+    mut keys: variables::IndexedLiteralKeys,
     literal: variables::ArrayLiteral,
-) -> Result<variables::ArrayLiteral, crate::error::Error> {
-    let mut evaluated = Vec::with_capacity(literal.0.len());
+) -> Result<(variables::ArrayLiteral, Option<crate::error::Error>), crate::error::Error> {
+    let mut placed = Vec::with_capacity(literal.0.len());
     for (key, value) in literal.0 {
         let key = match key {
-            Some(key) if key.is_empty() => return Err(bad_subscript(&key, &value)),
             Some(key) => {
-                let index = expand_and_eval(shell, params, &key, false)
-                    .await
-                    .map_err(|error| subscript_error(&error))?;
-                Some((index, key))
+                let index = if key.is_empty() {
+                    None
+                } else {
+                    let index = expand_and_eval(shell, params, &key, false)
+                        .await
+                        .map_err(EvalError::in_subscript)?;
+                    keys.key(index)
+                };
+                let Some(index) = index else {
+                    let element =
+                        crate::error::ErrorKind::BadArrayElement(format!("[{key}]={value}"));
+                    return Ok((variables::ArrayLiteral(placed), Some(element.into())));
+                };
+                Some(index.to_string())
             }
             None => None,
         };
-        evaluated.push((key, value));
+        placed.push((key, value));
+        keys.placed();
     }
-    place_indexed_array_literal(shell, name, append, evaluated)
-}
-
-/// Evaluates the (expanded) subscript of an element of a compound assignment to an indexed
-/// array; an error, or an empty subscript, ends the shell, as in bash.
-///
-/// # Arguments
-///
-/// * `shell` - The shell to use for evaluation.
-/// * `key` - The expanded subscript.
-/// * `value` - The element's expanded value.
-pub fn eval_indexed_array_subscript(
-    shell: &mut Shell<impl extensions::ShellExtensions>,
-    key: &str,
-    value: &str,
-) -> Result<i64, crate::error::Error> {
-    if key.is_empty() {
-        return Err(bad_subscript(key, value));
-    }
-    parse(key)
-        .and_then(|expr| {
-            expr.eval(shell)
-                .map_err(|error| EvalError::in_expression(key, error))
-        })
-        .map_err(|error| subscript_error(&error))
-}
-
-/// Bash's `err_badarraysub` for an element: `[KEY]=VALUE: bad array subscript`.
-fn bad_subscript(key: &str, value: &str) -> crate::error::Error {
-    crate::error::Error::from(crate::error::ErrorKind::BadArraySubscript(format!(
-        "[{key}]={value}"
-    )))
-    .into_fatal()
-}
-
-fn subscript_error(error: &EvalError) -> crate::error::Error {
-    crate::error::Error::from(crate::error::ErrorKind::SubscriptEvalError(
-        error.to_string(),
-    ))
-    .into_fatal()
-}
-
-/// Places the elements of a compound assignment to an indexed array, subscripts evaluated.
-///
-/// As in bash, a negative subscript counts back from one past the highest index assigned so far
-/// (the existing elements' too when appending), and an element without one follows the element
-/// before. Every element of the result names its index.
-///
-/// # Arguments
-///
-/// * `shell` - The shell holding the array.
-/// * `name` - The array variable being assigned.
-/// * `append` - Whether the assignment appends (`a+=(...)`).
-/// * `elements` - Each element's evaluated subscript and its text, if it has one, and value.
-pub fn place_indexed_array_literal(
-    shell: &Shell<impl extensions::ShellExtensions>,
-    name: &str,
-    append: bool,
-    elements: Vec<(Option<(i64, String)>, String)>,
-) -> Result<variables::ArrayLiteral, crate::error::Error> {
-    use variables::ShellValue;
-    let mut highest = if append {
-        shell
-            .env()
-            .get(name)
-            .and_then(|(_, var)| match var.value() {
-                ShellValue::IndexedArray(values) => values.keys().next_back().copied(),
-                ShellValue::String(_) => Some(0),
-                _ => None,
-            })
-    } else {
-        None
-    };
-    let mut next = highest.map_or(0, |highest| highest + 1);
-    let mut placed = Vec::with_capacity(elements.len());
-    for (key, value) in elements {
-        let index = match key {
-            None => next,
-            Some((mut index, key)) => {
-                if index < 0 {
-                    let end = highest.map_or(0, |highest| {
-                        i64::try_from(highest).unwrap_or(i64::MAX).saturating_add(1)
-                    });
-                    index = index.saturating_add(end);
-                }
-                u64::try_from(index).map_err(|_| bad_subscript(&key, &value))?
-            }
-        };
-        highest = Some(highest.map_or(index, |highest| highest.max(index)));
-        next = index.saturating_add(1);
-        placed.push((Some(index.to_string()), value));
-    }
-    Ok(variables::ArrayLiteral(placed))
+    Ok((variables::ArrayLiteral(placed), None))
 }
 
 /// Trait implemented by evaluatable arithmetic expressions.
@@ -388,9 +386,7 @@ fn eval_expr_impl(
         ast::ArithmeticExpr::Literal(l) => *l,
         ast::ArithmeticExpr::Reference(lvalue) => deref_lvalue(shell, lvalue, depth)?,
         ast::ArithmeticExpr::UnaryOp(op, operand) => apply_unary_op(shell, *op, operand, depth)?,
-        ast::ArithmeticExpr::BinaryOp(op, left, right) => {
-            apply_binary_op(shell, *op, left, right, depth)?
-        }
+        ast::ArithmeticExpr::BinaryOp(..) => eval_binary_chain(expr, shell, depth)?,
         ast::ArithmeticExpr::Conditional(condition, then_expr, else_expr) => {
             let conditional_eval = eval_expr_impl(condition, shell, depth)?;
 
@@ -409,13 +405,8 @@ fn eval_expr_impl(
             apply_unary_assignment_op(shell, lvalue, *op, depth)?
         }
         ast::ArithmeticExpr::BinaryAssignment(op, lvalue, operand) => {
-            let value = apply_binary_op(
-                shell,
-                *op,
-                &ast::ArithmeticExpr::Reference(lvalue.clone()),
-                operand,
-                depth,
-            )?;
+            let current = deref_lvalue(shell, lvalue, depth)?;
+            let value = apply_binary_op(shell, *op, current, operand, depth)?;
             assign(shell, lvalue, value, depth)?
         }
     };
@@ -465,6 +456,11 @@ fn deref_lvalue(
     lvalue: &ast::ArithmeticTarget,
     depth: u32,
 ) -> Result<i64, EvalError> {
+    // Bash looks a variable up once to read it, an element twice.
+    match lvalue {
+        ast::ArithmeticTarget::Variable(name) => shell.note_circular_nameref(name, 1, false),
+        ast::ArithmeticTarget::ArrayElement(name, _) => shell.note_circular_nameref(name, 2, false),
+    }
     let value_str: Cow<'_, str> = match lvalue {
         ast::ArithmeticTarget::Variable(name) => get_var_value(shell, name.as_str())?,
         ast::ArithmeticTarget::ArrayElement(name, index) => {
@@ -488,7 +484,7 @@ fn deref_lvalue(
     // Literals don't need depth tracking — they can't cause recursion.
     // Only increment depth when the parsed value requires further evaluation
     // (i.e., it references other variables), matching bash's behavior.
-    if matches!(parsed_value, ast::ArithmeticExpr::Literal(_)) {
+    if matches!(*parsed_value, ast::ArithmeticExpr::Literal(_)) {
         return eval_expr_impl(&parsed_value, shell, depth);
     }
 
@@ -522,20 +518,39 @@ fn apply_unary_op(
     }
 }
 
+/// Evaluates a binary operation. A chain of left-associative operators (`1+2+3+…`) nests down its
+/// left side, so it is evaluated along that side with a loop: its length costs no stack.
+fn eval_binary_chain(
+    expr: &ast::ArithmeticExpr,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    depth: u32,
+) -> Result<i64, EvalError> {
+    let mut rights = vec![];
+    let mut leftmost = expr;
+    while let ast::ArithmeticExpr::BinaryOp(op, left, right) = leftmost {
+        rights.push((*op, right.as_ref()));
+        leftmost = left;
+    }
+    let mut value = eval_expr_impl(leftmost, shell, depth)?;
+    while let Some((op, right)) = rights.pop() {
+        value = apply_binary_op(shell, op, value, right, depth)?;
+    }
+    Ok(value)
+}
+
+/// Applies a binary operator to a left operand already evaluated and a right one to evaluate
+/// (unless the operator short-circuits).
 fn apply_binary_op(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     op: ast::BinaryOperator,
-    left: &ast::ArithmeticExpr,
+    left: i64,
     right: &ast::ArithmeticExpr,
     depth: u32,
 ) -> Result<i64, EvalError> {
-    // First, special-case short-circuiting operators. For those, we need
-    // to ensure we don't eagerly evaluate both operands. After we
-    // get these out of the way, we can easily just evaluate operands
-    // for the other operators.
+    // First, special-case short-circuiting operators: the right operand is evaluated only
+    // when it decides the result.
     match op {
         ast::BinaryOperator::LogicalAnd => {
-            let left = eval_expr_impl(left, shell, depth)?;
             if left == 0 {
                 return Ok(bool_to_i64(false));
             }
@@ -544,7 +559,6 @@ fn apply_binary_op(
             return Ok(bool_to_i64(right != 0));
         }
         ast::BinaryOperator::LogicalOr => {
-            let left = eval_expr_impl(left, shell, depth)?;
             if left != 0 {
                 return Ok(bool_to_i64(true));
             }
@@ -556,7 +570,6 @@ fn apply_binary_op(
     }
 
     // The remaining operators unconditionally operate both operands.
-    let left = eval_expr_impl(left, shell, depth)?;
     let right = eval_expr_impl(right, shell, depth)?;
 
     #[expect(clippy::cast_possible_truncation)]
@@ -641,6 +654,11 @@ fn assign(
     value: i64,
     depth: u32,
 ) -> Result<i64, EvalError> {
+    // Bash looks a variable up once and binds it to assign it (an element: three lookups).
+    match lvalue {
+        ast::ArithmeticTarget::Variable(name) => shell.note_circular_nameref(name, 1, true),
+        ast::ArithmeticTarget::ArrayElement(name, _) => shell.note_circular_nameref(name, 3, false),
+    }
     match lvalue {
         ast::ArithmeticTarget::Variable(name) => {
             shell
@@ -692,10 +710,33 @@ fn element_key(
     if associative {
         return Ok(index.to_owned());
     }
-    let index_expr = parse(index)?;
+    // An error in the subscript ends the shell, as bash's does.
+    let index_expr = parse(index).map_err(EvalError::in_subscript)?;
     Ok(eval_expr_impl(&index_expr, shell, depth)
-        .map_err(|error| EvalError::in_expression(index, error))?
+        .map_err(|error| EvalError::in_expression(index, error).in_subscript())?
         .to_string())
+}
+
+/// Evaluates an indexed array's subscript, already expanded, as bash does: arithmetically, with
+/// an error ending the shell.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to evaluate in.
+/// * `index` - The subscript's text.
+///
+/// # Errors
+///
+/// Returns an error, which ends the shell, if the subscript does not evaluate.
+pub fn eval_subscript(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    index: &str,
+) -> Result<i64, crate::error::Error> {
+    let evaluated = parse(index).and_then(|expr| {
+        expr.eval(shell)
+            .map_err(|error| EvalError::in_expression(index, error))
+    });
+    evaluated.map_err(|error| crate::error::Error::from(error.in_subscript()))
 }
 
 /// The error for an assignment the environment refused: bash names a readonly variable.
@@ -715,7 +756,11 @@ impl EvalError {
     #[must_use]
     pub fn in_expression(expression: &str, error: Self) -> Self {
         match error {
-            Self::Syntax(_) | Self::InExpression(..) => error,
+            // Too deep an expression is not named: it would be as long.
+            Self::Syntax(_)
+            | Self::InExpression(..)
+            | Self::NestedTooDeeply(_)
+            | Self::InSubscript(_) => error,
             error => Self::InExpression(
                 syntax::without_leading_blanks(expression).to_owned(),
                 Box::new(error),
@@ -723,12 +768,28 @@ impl EvalError {
         }
     }
 
+    /// The error as one in an indexed array's subscript (see [`Self::InSubscript`]). An unset
+    /// variable under `set -u` stays what it is: it ends the shell anyway.
+    #[must_use]
+    pub fn in_subscript(self) -> Self {
+        match self {
+            error if error.unset_variable().is_some() => error,
+            error @ Self::InSubscript(_) => error,
+            error => Self::InSubscript(Box::new(error)),
+        }
+    }
+
+    /// Whether the error is one in an indexed array's subscript, which ends the shell.
+    pub const fn is_in_subscript(&self) -> bool {
+        matches!(self, Self::InSubscript(_))
+    }
+
     /// The variable, if the error is an unset variable under `set -u`, which ends the shell
     /// rather than failing only the command.
     pub fn unset_variable(&self) -> Option<&str> {
         match self {
             Self::ExpandingUnsetVariable(name) => Some(name),
-            Self::InExpression(_, inner) => inner.unset_variable(),
+            Self::InExpression(_, inner) | Self::InSubscript(inner) => inner.unset_variable(),
             _ => None,
         }
     }

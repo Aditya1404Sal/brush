@@ -12,8 +12,9 @@ use crate::{error, escape, extensions};
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShellVariable {
-    /// The value currently associated with the variable.
-    value: ShellValue,
+    /// The value currently associated with the variable. Clones of the variable (a subshell's,
+    /// a pipeline stage's) share it until one of them changes it.
+    value: std::sync::Arc<ShellValue>,
     /// Whether or not the variable is marked as exported to child processes.
     exported: bool,
     /// Whether or not the variable is marked as read-only.
@@ -67,6 +68,16 @@ impl DynamicState {
         }
     }
 
+    /// Marks `RANDOM`'s generator, if this is it, as belonging to a new subshell or process: bash
+    /// reseeds it there before its first value, so each subshell's sequence is its own.
+    pub(crate) fn enter_subshell(&self) {
+        if let Self::Random(generator) = self {
+            generator
+                .reseed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The next value of `RANDOM`, if this is its generator.
     pub(crate) fn next_random(&self) -> Option<u32> {
         match self {
@@ -97,11 +108,13 @@ pub(crate) fn epoch_seconds() -> i64 {
 
 /// Bash's generator for `RANDOM`: the Park-Miller minimal standard generator, folded to 15 bits,
 /// never giving the same value twice in a row. Assigning `RANDOM` seeds it, so a seeded sequence
-/// repeats exactly as bash's does.
+/// repeats exactly as bash's does; a subshell reseeds it before its first value, as bash does.
 #[derive(Debug)]
 pub(crate) struct RandomGenerator {
     state: std::sync::atomic::AtomicU32,
     last: std::sync::atomic::AtomicU32,
+    /// Whether to reseed before the next value (a subshell that has not seeded it).
+    reseed: std::sync::atomic::AtomicBool,
 }
 
 impl RandomGenerator {
@@ -110,6 +123,7 @@ impl RandomGenerator {
         Self {
             state: std::sync::atomic::AtomicU32::new(seed),
             last: std::sync::atomic::AtomicU32::new(0),
+            reseed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -119,11 +133,17 @@ impl RandomGenerator {
         self.state
             .store(seed as u32, std::sync::atomic::Ordering::Relaxed);
         self.last.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reseed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn next(&self) -> u32 {
         use std::sync::atomic::Ordering::Relaxed;
+        if self.reseed.swap(false, Relaxed) {
+            self.state.store(rand::random(), Relaxed);
+            self.last.store(0, Relaxed);
+        }
         let last = self.last.load(Relaxed);
         let mut state = self.state.load(Relaxed);
         let value = loop {
@@ -150,6 +170,10 @@ impl Clone for RandomGenerator {
             self.last.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
+        generator.reseed.store(
+            self.reseed.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         generator
     }
 }
@@ -171,7 +195,7 @@ pub enum ShellVariableUpdateTransform {
 impl Default for ShellVariable {
     fn default() -> Self {
         Self {
-            value: ShellValue::String(String::new()),
+            value: std::sync::Arc::new(ShellValue::String(String::new())),
             exported: false,
             readonly: false,
             enumerable: true,
@@ -192,13 +216,13 @@ impl ShellVariable {
     /// * `value` - The value to associate with the variable.
     pub fn new<I: Into<ShellValue>>(value: I) -> Self {
         Self {
-            value: value.into(),
+            value: std::sync::Arc::new(value.into()),
             ..Self::default()
         }
     }
 
     /// Returns the value associated with the variable.
-    pub const fn value(&self) -> &ShellValue {
+    pub fn value(&self) -> &ShellValue {
         &self.value
     }
 
@@ -337,7 +361,7 @@ impl ShellVariable {
                     0,
                     self.value.to_cow_str_without_dynamic_support().to_string(),
                 );
-                self.value = ShellValue::IndexedArray(new_values);
+                self.value = std::sync::Arc::new(ShellValue::IndexedArray(new_values));
                 Ok(())
             }
         }
@@ -356,7 +380,7 @@ impl ShellVariable {
                     String::from("0"),
                     self.value.to_cow_str_without_dynamic_support().to_string(),
                 );
-                self.value = ShellValue::AssociativeArray(new_values);
+                self.value = std::sync::Arc::new(ShellValue::AssociativeArray(new_values));
                 Ok(())
             }
         }
@@ -377,7 +401,7 @@ impl ShellVariable {
         let value = self.convert_value_literal_for_assignment(value);
 
         if append {
-            match (&self.value, &value) {
+            match (&*self.value, &value) {
                 // If we're appending an array to a declared-but-unset variable (or appending
                 // anything to a declared-but-unset array), then fill it out first.
                 (ShellValue::Unset(_), ShellValueLiteral::Array(_))
@@ -406,7 +430,7 @@ impl ShellVariable {
             let treat_as_int = self.is_treated_as_integer();
             let update_transform = self.get_update_transform();
 
-            match &mut self.value {
+            match std::sync::Arc::make_mut(&mut self.value) {
                 ShellValue::String(base) => match value {
                     ShellValueLiteral::Scalar(suffix) => {
                         if treat_as_int {
@@ -450,7 +474,7 @@ impl ShellVariable {
                 ShellValue::Dynamic { .. } => Ok(()),
             }
         } else {
-            match (&self.value, value) {
+            match (&*self.value, value) {
                 // If we're updating an array value with a string, then treat it as an update to
                 // just the "0"-indexed element of the array.
                 (
@@ -474,7 +498,9 @@ impl ShellVariable {
                     | ShellValue::Dynamic { .. },
                     ShellValueLiteral::Array(literal_values),
                 ) => {
-                    self.value = ShellValue::indexed_array_from_literals(literal_values);
+                    self.value = std::sync::Arc::new(ShellValue::indexed_array_from_literals(
+                        literal_values,
+                    ));
                     Ok(())
                 }
 
@@ -485,7 +511,9 @@ impl ShellVariable {
                     | ShellValue::Unset(ShellValueUnsetType::AssociativeArray),
                     ShellValueLiteral::Array(literal_values),
                 ) => {
-                    self.value = ShellValue::associative_array_from_literals(literal_values)?;
+                    self.value = std::sync::Arc::new(ShellValue::associative_array_from_literals(
+                        literal_values,
+                    )?);
                     Ok(())
                 }
 
@@ -498,7 +526,7 @@ impl ShellVariable {
 
                 // Assign a scalar value to a scalar or unset (and untyped) variable.
                 (ShellValue::String(_) | ShellValue::Unset(_), ShellValueLiteral::Scalar(s)) => {
-                    self.value = ShellValue::String(s);
+                    self.value = std::sync::Arc::new(ShellValue::String(s));
                     Ok(())
                 }
             }
@@ -524,7 +552,7 @@ impl ShellVariable {
             return Err(error::ErrorKind::ReadonlyVariable.into());
         }
 
-        match &self.value {
+        match &*self.value {
             ShellValue::Unset(_) => {
                 self.assign(ShellValueLiteral::Array(ArrayLiteral(vec![])), false)?;
             }
@@ -537,7 +565,7 @@ impl ShellVariable {
         let treat_as_int = self.is_treated_as_integer();
         let value = self.convert_value_str_for_assignment(value);
 
-        match &mut self.value {
+        match std::sync::Arc::make_mut(&mut self.value) {
             ShellValue::IndexedArray(arr) => {
                 let key = get_key_for_indexed_array(arr, array_index.as_str())?;
 
@@ -647,7 +675,7 @@ impl ShellVariable {
     ///
     /// * `index` - The index at which to unset the value.
     pub fn unset_index(&mut self, index: &str) -> Result<bool, error::Error> {
-        match &mut self.value {
+        match std::sync::Arc::make_mut(&mut self.value) {
             ShellValue::Unset(ty) => match ty {
                 ShellValueUnsetType::Untyped => Err(error::ErrorKind::NotArray.into()),
                 ShellValueUnsetType::AssociativeArray | ShellValueUnsetType::IndexedArray => {
@@ -671,9 +699,9 @@ impl ShellVariable {
     /// * `shell` - The shell in which the variable is being resolved.
     pub fn resolve_value(&self, shell: &Shell<impl extensions::ShellExtensions>) -> ShellValue {
         // N.B. We do *not* specially handle a dynamic value that resolves to a dynamic value.
-        match &self.value {
+        match &*self.value {
             ShellValue::Dynamic { getter, .. } => getter(shell),
-            _ => self.value.clone(),
+            _ => (*self.value).clone(),
         }
     }
 
@@ -967,6 +995,60 @@ impl From<Vec<&str>> for ShellValueLiteral {
 /// An array literal.
 #[derive(Clone, Debug)]
 pub struct ArrayLiteral(pub Vec<(Option<String>, String)>);
+
+/// Where the elements of an indexed array literal go: a key places an element (and those after
+/// it), and a negative key counts back from one past the array's highest index, as in bash.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedLiteralKeys {
+    next: i64,
+    end: i64,
+}
+
+impl IndexedLiteralKeys {
+    /// For a literal replacing `existing`'s value, or appended to it.
+    ///
+    /// # Arguments
+    ///
+    /// * `existing` - The variable's current value, if it has one.
+    /// * `append` - Whether the literal is appended (`+=`).
+    pub fn new(existing: Option<&ShellValue>, append: bool) -> Self {
+        let end = match existing {
+            Some(ShellValue::IndexedArray(values)) if append => {
+                values.keys().next_back().map_or(0, |last| {
+                    i64::try_from(*last).unwrap_or(i64::MAX).saturating_add(1)
+                })
+            }
+            Some(ShellValue::String(_)) if append => 1,
+            _ => 0,
+        };
+        Self { next: end, end }
+    }
+
+    /// Places the next element at the evaluated `key`, returning the index it resolves to, or
+    /// `None` when a negative key counts back past the start.
+    pub const fn key(&mut self, key: i64) -> Option<i64> {
+        let key = if key < 0 {
+            key.saturating_add(self.end)
+        } else {
+            key
+        };
+        if key < 0 {
+            return None;
+        }
+        self.next = key;
+        Some(key)
+    }
+
+    /// Records an element placed where the next one goes.
+    pub const fn placed(&mut self) {
+        self.end = if self.end > self.next.saturating_add(1) {
+            self.end
+        } else {
+            self.next.saturating_add(1)
+        };
+        self.next = self.next.saturating_add(1);
+    }
+}
 
 /// Style for formatting a shell variable's value.
 #[derive(Copy, Clone, Debug)]

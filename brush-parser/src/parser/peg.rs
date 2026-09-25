@@ -26,8 +26,9 @@ peg::parser! {
                     and_ors.push(ao);
                 }
 
-                // N.B. We default to synchronous if no separator op is given.
-                seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
+                // N.B. We default to synchronous if no separator op is given: the command ends
+                // its line.
+                seps.push(last_sep.unwrap_or(SeparatorOperator::Newline));
 
                 let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
@@ -172,14 +173,15 @@ peg::parser! {
                 let mut and_ors = vec![first];
                 let mut seps = Vec::with_capacity(remainder.len());
 
+                // A newline separates as `;` does, but bash prints it back as a newline.
                 for (sep, ao) in remainder {
-                    seps.push(sep.unwrap_or(SeparatorOperator::Sequence));
+                    seps.push(sep.unwrap_or(SeparatorOperator::Newline));
                     and_ors.push(ao);
                 }
 
                 // N.B. We default to synchronous if no separator op is given.
                 let last_sep = last_sep.unwrap_or(None);
-                seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
+                seps.push(last_sep.unwrap_or(SeparatorOperator::Newline));
 
                 let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
@@ -191,7 +193,8 @@ peg::parser! {
                 let start = s.location();
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
-                ast::ForClauseCommand { variable_name: n.to_owned(), values: w, body: d, loc }
+                // `for i in; do` loops over nothing; only a loop without `in` loops over "$@".
+                ast::ForClauseCommand { variable_name: n.to_owned(), values: Some(w.unwrap_or_default()), body: d, loc }
             } /
             s:specific_word("for") n:name() sequential_sep()? d:do_group() {
                 let start = s.location();
@@ -210,7 +213,7 @@ peg::parser! {
         rule select_clause() -> ast::SelectClauseCommand =
             s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
                 let loc = SourceSpan::within(s.location(), &d.loc);
-                ast::SelectClauseCommand { variable_name: n.to_owned(), values: w, body: d, loc }
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: Some(w.unwrap_or_default()), body: d, loc }
             } /
             s:specific_word("select") n:name() sequential_sep()? d:do_group() {
                 let loc = SourceSpan::within(s.location(), &d.loc);
