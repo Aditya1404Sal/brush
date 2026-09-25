@@ -70,8 +70,11 @@ pub(crate) fn resolve<'a, SE: ShellExtensions>(
             resolved.push(Resolved::Function(registration.definition()));
         }
 
-        // Check for builtins.
-        if shell.builtins().get(name).is_some_and(|b| !b.disabled) {
+        // Check for builtins. One that stands for a program bash has no builtin for (`cat`) is
+        // reported as that program's file instead, below.
+        if shell.builtins().get(name).is_some_and(|b| !b.disabled)
+            && shell.program_file(name).is_none()
+        {
             resolved.push(Resolved::Builtin);
         }
     }
@@ -123,25 +126,30 @@ fn resolve_in_filesystem<SE: ShellExtensions>(
         }
     }
 
-    match (&options.path_dirs, options.all_locations) {
-        (Some(dirs), true) => {
-            resolved.extend(pathsearch::search_for_executable(dirs.iter(), name).map(to_file));
+    // A builtin that stands for a program is that program's file (`/bin/cat`), and it is what
+    // the name runs, whatever else `PATH` holds.
+    let program = shell.program_path(name);
+    if let Some(path) = &program {
+        resolved.push(to_file(path.clone()));
+        if !options.all_locations {
+            return;
         }
-        (Some(dirs), false) => {
-            resolved.extend(pathsearch::resolve_command(dirs.iter(), name).map(to_file));
-        }
-        (None, true) => resolved.extend(shell.find_executables_in_path(name).map(to_file)),
-        (None, false) => resolved.extend(shell.resolve_command_in_path(name).map(to_file)),
     }
 
-    // A builtin that stands for a program is also that program's file (`/bin/cat`).
-    if let Some(path) = shell.program_path(name)
-        && !resolved
-            .iter()
-            .any(|found| matches!(found, Resolved::File { path: file, .. } if *file == path))
-    {
-        resolved.push(to_file(path));
-    }
+    let found: Vec<PathBuf> = match (&options.path_dirs, options.all_locations) {
+        (Some(dirs), true) => pathsearch::search_for_executable(dirs.iter(), name).collect(),
+        (Some(dirs), false) => pathsearch::resolve_command(dirs.iter(), name)
+            .into_iter()
+            .collect(),
+        (None, true) => shell.find_executables_in_path(name).collect(),
+        (None, false) => shell.resolve_command_in_path(name).into_iter().collect(),
+    };
+    resolved.extend(
+        found
+            .into_iter()
+            .filter(|path| program.as_ref() != Some(path))
+            .map(to_file),
+    );
 }
 
 /// Writes the description shown by `type NAME` and `command -V NAME`, newline included.

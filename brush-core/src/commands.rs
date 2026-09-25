@@ -343,9 +343,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
         // A program's path (`/bin/cat`) runs the builtin that stands for it, under its own name.
-        if sys::fs::contains_path_separator(&self.command_name)
-            && let Some(name) = self.shell.program_builtin(&self.command_name)
-        {
+        let named_by_path = sys::fs::contains_path_separator(&self.command_name);
+        if named_by_path && let Some(name) = self.shell.program_builtin(&self.command_name) {
             self.command_name = name.to_owned();
         }
 
@@ -378,6 +377,20 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // then invoke it.
         if let Some(builtin) = builtin {
             if !builtin.disabled {
+                // A program run by name is hashed at its file, as bash hashes a command it finds
+                // on `PATH`.
+                if !named_by_path
+                    && self.shell.options().remember_command_locations
+                    && self
+                        .shell
+                        .program_location_cache()
+                        .get(&self.command_name)
+                        .is_none()
+                    && let Some(path) = self.shell.program_file(&self.command_name)
+                {
+                    let name = self.command_name.clone();
+                    self.shell.program_location_cache_mut().set(name, path);
+                }
                 return self.execute_via_builtin(builtin).await;
             }
         }

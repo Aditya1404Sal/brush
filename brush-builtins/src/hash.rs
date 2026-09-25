@@ -114,6 +114,24 @@ impl builtins::Command for HashCommand {
                     continue;
                 }
 
+                // As in bash, a function or a builtin is not hashed, and not an error; a builtin
+                // that stands for a program bash has no builtin for is hashed at its file.
+                if context.shell.funcs().get(name).is_some() {
+                    continue;
+                }
+                if let Some(path) = context.shell.program_file(name) {
+                    context.shell.program_location_cache_mut().set(name, path);
+                    continue;
+                }
+                if context
+                    .shell
+                    .builtins()
+                    .get(name)
+                    .is_some_and(|registration| !registration.disabled)
+                {
+                    continue;
+                }
+
                 // Hash the path
                 if context
                     .shell

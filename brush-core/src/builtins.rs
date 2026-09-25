@@ -160,6 +160,17 @@ pub enum ExecutionBoundary {
     Command,
 }
 
+/// How a builtin that stands for a program (see [`crate::Shell::set_programs`]) presents itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramKind {
+    /// A shell builtin that is also a program (`echo`): its path runs it, and `type` reports the
+    /// builtin, as bash does.
+    Builtin,
+    /// A program bash has no builtin for (`cat`): its path runs it, and `type`, `command -v` and
+    /// `hash` report its file, as they report a program found on `PATH`.
+    File,
+}
+
 /// Encapsulates a registration for a built-in command.
 #[derive(Clone)]
 pub struct Registration<SE: extensions::ShellExtensions> {

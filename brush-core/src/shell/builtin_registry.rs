@@ -6,17 +6,22 @@ use std::path::{Path, PathBuf};
 use crate::{builtins, extensions};
 
 /// The directories a Linux system keeps its programs in, where the builtins that stand for
-/// programs are found (see [`crate::Shell::set_program_names`]); the first is where they are
-/// reported to be.
+/// programs are found (see [`crate::Shell::set_programs`]); the first is where they are reported
+/// to be.
 const PROGRAM_DIRS: [&str; 2] = ["/bin", "/usr/bin"];
 
 impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
     /// Declares which builtins stand for programs a Linux system has as files (`cat`, `sed`,
-    /// `echo`, ...), as opposed to shell-language builtins (`cd`, `export`): naming one by its
-    /// path in [`PROGRAM_DIRS`] (`/bin/cat`, `/usr/bin/cat`) runs the builtin, `[ -x /bin/cat ]`
-    /// holds, and `type -P cat` reports `/bin/cat`.
-    pub fn set_program_names(&mut self, names: impl IntoIterator<Item = String>) {
-        self.program_names = std::sync::Arc::new(names.into_iter().collect());
+    /// `echo`, ...), as opposed to builtins that only a shell can be (`cd`, `read`): naming one by
+    /// its path in [`PROGRAM_DIRS`] (`/bin/cat`, `/usr/bin/cat`) runs the builtin,
+    /// `[ -x /bin/cat ]` holds, and `type -P cat` reports `/bin/cat`. A
+    /// [`builtins::ProgramKind::File`] program is also reported as that file where bash reports
+    /// a program found on `PATH` (`type`, `command -v`, `hash`).
+    pub fn set_programs(
+        &mut self,
+        programs: impl IntoIterator<Item = (String, builtins::ProgramKind)>,
+    ) {
+        self.programs = std::sync::Arc::new(programs.into_iter().collect());
     }
 
     /// The builtin that stands for the program at `path` (as written; relative to the working
@@ -32,7 +37,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         {
             return None;
         }
-        let name = self.program_names.get(name)?;
+        let (name, _) = self.programs.get_key_value(name)?;
         self.builtins
             .get(name)
             .is_some_and(|registration| !registration.disabled)
@@ -46,8 +51,14 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             .builtins
             .get(name)
             .is_some_and(|registration| !registration.disabled);
-        (enabled && self.program_names.contains(name))
-            .then(|| Path::new(PROGRAM_DIRS[0]).join(name))
+        (enabled && self.programs.contains_key(name)).then(|| Path::new(PROGRAM_DIRS[0]).join(name))
+    }
+
+    /// The file the builtin `name` is reported as (`/bin/cat` for `cat`), if it stands for a
+    /// [`builtins::ProgramKind::File`] program.
+    pub fn program_file(&self, name: &str) -> Option<PathBuf> {
+        self.program_path(name)
+            .filter(|_| self.programs.get(name) == Some(&builtins::ProgramKind::File))
     }
 
     /// Register a builtin to the shell's environment, replacing any existing
@@ -124,7 +135,8 @@ mod tests {
     }
 
     /// A program's path names the builtin declared to stand for it, from either program
-    /// directory and however the path is spelled; nothing else does.
+    /// directory and however the path is spelled; nothing else does. Only a file program is
+    /// reported as its file.
     #[tokio::test]
     async fn program_paths_name_the_builtins_that_stand_for_programs() -> Result<(), error::Error> {
         let mut shell = Shell::builder()
@@ -134,9 +146,17 @@ mod tests {
             .await?;
         shell.register_builtin("cat", builtins::simple_builtin::<Nop, _>());
         shell.register_builtin("cd", builtins::simple_builtin::<Nop, _>());
+        shell.register_builtin("echo", builtins::simple_builtin::<Nop, _>());
         assert_eq!(shell.program_builtin("/bin/cat"), None);
 
-        shell.set_program_names(["cat".to_owned()]);
+        shell.set_programs([
+            ("cat".to_owned(), builtins::ProgramKind::File),
+            ("echo".to_owned(), builtins::ProgramKind::Builtin),
+        ]);
+        assert_eq!(shell.program_builtin("/bin/echo"), Some("echo"));
+        assert_eq!(shell.program_path("echo"), Some(PathBuf::from("/bin/echo")));
+        assert_eq!(shell.program_file("echo"), None);
+        assert_eq!(shell.program_file("cat"), Some(PathBuf::from("/bin/cat")));
         assert_eq!(shell.program_builtin("/bin/cat"), Some("cat"));
         assert_eq!(shell.program_builtin("/usr/bin/cat"), Some("cat"));
         assert_eq!(
@@ -158,6 +178,7 @@ mod tests {
         }
         assert_eq!(shell.program_builtin("/bin/cat"), None);
         assert_eq!(shell.program_path("cat"), None);
+        assert_eq!(shell.program_file("cat"), None);
         Ok(())
     }
 }
