@@ -260,6 +260,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             process_depth: 0,
             trace_level: 0,
             exit_trace_level: 0,
+            pending_input: None,
             name: None,
             args: vec![],
             version: None,

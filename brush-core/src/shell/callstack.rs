@@ -95,7 +95,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// in no subshell (`BASH_SUBSHELL` is 0), xtrace starts at PS4's own level, and an error
     /// that ends it exits with `bash -c`'s status.
     pub fn start_command_string_mode(&mut self) {
-        self.call_stack.push_command_string();
+        let name = self.name.clone().unwrap_or_else(|| "bash".to_owned());
+        self.call_stack.push_command_string(&name);
         self.process_depth = self.depth;
         self.subshell_level = 0;
         self.trace_level = 0;

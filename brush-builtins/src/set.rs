@@ -396,6 +396,13 @@ impl builtins::Command for SetCommand {
             }
         }
 
+        // `set -` also turns off -x and -v, as in bash.
+        if self.positional_args.first().is_some_and(|arg| arg == "-") {
+            let options = context.shell.options_mut();
+            options.print_commands_and_arguments = false;
+            options.print_shell_input_lines = false;
+        }
+
         let args = context.shell.current_shell_args_mut();
 
         let skip = match self.positional_args.first() {

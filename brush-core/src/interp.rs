@@ -219,9 +219,27 @@ impl Execute for ast::Program {
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
         let (program, interrupted) = shell.begin_program();
+        let input = shell.pending_input.take();
+        let mut next_input_line = 1;
 
         for (index, command) in self.complete_commands.iter().enumerate() {
             shell.begin_command_unit(program, index);
+            // `set -v` echoes the input lines of each command as bash reads them, before it runs.
+            if let Some(input) = &input {
+                let end = ast::SourceLocation::location(command)
+                    .map_or(next_input_line, |span| span.end.line);
+                if shell.options().print_shell_input_lines && end >= next_input_line {
+                    let mut stderr = params.stderr(shell);
+                    for line in input
+                        .lines()
+                        .skip(next_input_line - 1)
+                        .take(end + 1 - next_input_line)
+                    {
+                        let _ = writeln!(stderr, "{line}");
+                    }
+                }
+                next_input_line = next_input_line.max(end + 1);
+            }
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -1920,7 +1938,15 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     )));
                 }
                 CommandPrefixOrSuffixItem::AssignmentWord(assignment, word) => {
-                    if args.is_empty() {
+                    // With `set -k`, an assignment anywhere among the words is one for the
+                    // command's environment, as in bash.
+                    if args.is_empty()
+                        || (!command_takes_assignments
+                            && context
+                                .shell
+                                .options()
+                                .place_all_assignment_args_in_command_env)
+                    {
                         // If we haven't yet seen any arguments, then this must be a proper
                         // scoped assignment. Add it to the list we're accumulating.
                         assignments.push(assignment);

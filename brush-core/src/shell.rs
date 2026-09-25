@@ -127,6 +127,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) exit_trace_level: usize,
 
+    /// The text of the program about to run as read input (a command string, `eval`'d text or a
+    /// sourced file), which `set -v` echoes line by line as the program reaches it. The program
+    /// takes it when it starts, so command substitutions inside it echo nothing of their own.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) pending_input: Option<std::sync::Arc<str>>,
+
     /// Shell name
     name: Option<String>,
 
@@ -272,6 +278,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             process_depth: self.process_depth,
             trace_level: self.trace_level,
             exit_trace_level: self.trace_level + 1,
+            pending_input: None,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
             #[cfg(target_arch = "wasm32")]

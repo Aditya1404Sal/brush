@@ -518,12 +518,17 @@ impl CallStack {
         });
     }
 
-    /// Pushes a new command string frame onto the stack.
-    pub fn push_command_string(&mut self) {
+    /// Pushes a new command string frame onto the stack. Bash names the shell (`$0`) as the
+    /// source of what a command string defines.
+    ///
+    /// # Arguments
+    ///
+    /// * `shell_name` - The shell's name, `$0`.
+    pub fn push_command_string(&mut self, shell_name: &str) {
         self.frames.push_front(Frame {
             frame_type: FrameType::CommandString,
             args: vec![],
-            source_info: crate::SourceInfo::from("environment"),
+            source_info: crate::SourceInfo::from(shell_name),
             current_line_offset: 0,
             current: None, // TODO(source-info): fill this out
             entry: None,   // TODO(source-info): fill this out

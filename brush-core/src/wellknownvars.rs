@@ -633,9 +633,10 @@ fn get_bash_lineno_value(shell: &dyn ShellState) -> variables::ShellValue {
     let stack = shell.call_stack();
 
     // BASH_LINENO[$i] contains the line number where FUNCNAME[$i] was called
-    // This is extracted from the call_site of each frame
+    // This is extracted from the call_site of each frame. Outside functions it is empty, as in
+    // bash.
     if stack.iter_function_calls().next().is_none() {
-        ShellValue::Unset(variables::ShellValueUnsetType::IndexedArray)
+        Vec::<String>::new().into()
     } else {
         stack
             .iter()

@@ -144,6 +144,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
+        self.pending_input = Some(text.as_str().into());
 
         #[cfg(any(target_arch = "wasm32", test))]
         let result = {
@@ -168,6 +169,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             self.call_stack.pop();
             result
         };
+
+        self.pending_input = None;
 
         // The RETURN trap runs as a sourced script returns, as in bash.
         if matches!(call_type, callstack::ScriptCallType::Source) {
@@ -194,8 +197,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     ) -> Result<ExecutionResult, error::Error> {
         let command: String = command.into();
         let parse_result = self.parse_string(command.as_str());
-        self.run_parsed_result(parse_result, Some(&command), source_info, params)
-            .await
+        self.pending_input = Some(command.as_str().into());
+        let result = self
+            .run_parsed_result(parse_result, Some(&command), source_info, params)
+            .await;
+        self.pending_input = None;
+        result
     }
 
     /// Executes the given command, provided to a shell executable on the command
