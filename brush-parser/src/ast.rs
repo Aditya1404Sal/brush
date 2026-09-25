@@ -569,7 +569,8 @@ impl Display for Command {
                 }
                 Ok(())
             }
-            Self::Function(function_definition) => write!(f, "{function_definition}"),
+            // Bash names a function defined inside another with `function`.
+            Self::Function(function_definition) => write!(f, "function {function_definition}"),
         }
     }
 }
@@ -1082,9 +1083,7 @@ impl Display for IfClauseCommand {
         writeln!(f, "then")?;
         write!(indented(f), "{}", self.then.terminated())?;
         if let Some(elses) = &self.elses {
-            for else_clause in elses {
-                write!(f, "{else_clause}")?;
-            }
+            fmt_else_clauses(f, elses, &self.loc)?;
         }
 
         writeln!(f)?;
@@ -1092,6 +1091,41 @@ impl Display for IfClauseCommand {
 
         Ok(())
     }
+}
+
+/// Writes the `else` clauses of a conditional command as bash writes them: an `elif` is an `if`
+/// nested in an `else`.
+fn fmt_else_clauses(
+    f: &mut std::fmt::Formatter<'_>,
+    elses: &[ElseClause],
+    loc: &SourceSpan,
+) -> std::fmt::Result {
+    let Some((first, rest)) = elses.split_first() else {
+        return Ok(());
+    };
+    writeln!(f)?;
+    writeln!(f, "else")?;
+    let Some(condition) = &first.condition else {
+        return write!(indented(f), "{}", first.body.terminated());
+    };
+    let nested = IfClauseCommand {
+        condition: condition.clone(),
+        then: first.body.clone(),
+        elses: (!rest.is_empty()).then(|| rest.to_vec()),
+        loc: loc.clone(),
+    };
+    let list = CompoundList(vec![CompoundListItem(
+        AndOrList {
+            first: Pipeline {
+                timed: None,
+                bang: false,
+                seq: vec![Command::Compound(CompoundCommand::IfClause(nested), None)],
+            },
+            additional: vec![],
+        },
+        SeparatorOperator::Sequence,
+    )]);
+    write!(indented(f), "{}", list.terminated())
 }
 
 /// Represents the `else` clause of a conditional command.
@@ -1336,12 +1370,25 @@ impl SourceLocation for FunctionBody {
 
 impl Display for FunctionBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)?;
-        if let Some(redirect_list) = &self.1 {
-            write!(f, "{redirect_list}")?;
+        if matches!(self.0, CompoundCommand::BraceGroup(_)) {
+            write!(f, "{}", self.0)?;
+            if let Some(redirect_list) = &self.1 {
+                write!(f, "{redirect_list}")?;
+            }
+            return Ok(());
         }
 
-        Ok(())
+        // Bash writes any other body inside braces, with its redirections.
+        writeln!(f, "{{ ")?;
+        {
+            let mut body = indented(f);
+            write!(body, "{}", self.0)?;
+            if let Some(redirect_list) = &self.1 {
+                write!(body, "{redirect_list}")?;
+            }
+        }
+        writeln!(f)?;
+        write!(f, "}}")
     }
 }
 
