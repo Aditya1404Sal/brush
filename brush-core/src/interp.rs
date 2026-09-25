@@ -2004,14 +2004,16 @@ impl Execute for ast::ArithmeticForClauseCommand {
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
-        if let Some(initializer) = &self.initializer
-            && let Err(error) = initializer.eval(shell, params, true).await
-        {
-            return arithmetic_command_error(shell, params, "((", &error);
+        if let Some(initializer) = &self.initializer {
+            arithmetic_for_debug_trap(shell, params, initializer).await?;
+            if let Err(error) = initializer.eval(shell, params, true).await {
+                return arithmetic_command_error(shell, params, "((", &error);
+            }
         }
 
         loop {
             if let Some(condition) = &self.condition {
+                arithmetic_for_debug_trap(shell, params, condition).await?;
                 // An empty condition (e.g., `for (( ; ; ))`) means "always true".
                 if !condition.value.is_empty() {
                     match condition.eval(shell, params, true).await {
@@ -2038,16 +2040,41 @@ impl Execute for ast::ArithmeticForClauseCommand {
                 break;
             }
 
-            if let Some(updater) = &self.updater
-                && let Err(error) = updater.eval(shell, params, true).await
-            {
-                return arithmetic_command_error(shell, params, "((", &error);
+            if let Some(updater) = &self.updater {
+                arithmetic_for_debug_trap(shell, params, updater).await?;
+                if let Err(error) = updater.eval(shell, params, true).await {
+                    return arithmetic_command_error(shell, params, "((", &error);
+                }
             }
         }
 
         shell.set_last_exit_status(result.exit_code.into());
         Ok(result)
     }
+}
+
+/// Before an arithmetic `for` evaluates one of its clauses, the clause becomes `BASH_COMMAND` as
+/// bash prints it (`((i=0 ))`) and the DEBUG trap runs, as in bash.
+async fn arithmetic_for_debug_trap(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    clause: &ast::UnexpandedArithmeticExpr,
+) -> Result<(), error::Error> {
+    if !shell.running_trap_handler() {
+        shell.env_mut().update_or_add(
+            "BASH_COMMAND",
+            ShellValueLiteral::Scalar(format!("(({}))", clause.value.trim_start())),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )?;
+    }
+    if shell.traps().handles(traps::TrapSignal::Debug) {
+        shell
+            .invoke_trap_handler(traps::TrapSignal::Debug, params)
+            .await?;
+    }
+    Ok(())
 }
 
 /// An arithmetic error in `(( ))`, `for (( ))` or `[[ ]]` fails that command with status 1,
