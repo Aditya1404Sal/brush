@@ -192,9 +192,13 @@ pub enum ErrorKind {
     #[error("{}", io_message(.0))]
     IoError(#[from] std::io::Error),
 
-    /// Invalid substitution syntax.
-    #[error("bad substitution: {0}")]
+    /// Invalid substitution syntax; holds bash's message (`${v:}: bad substitution`).
+    #[error("{0}")]
     BadSubstitution(String),
+
+    /// An indirect expansion's value is not a name to expand.
+    #[error("{0}: invalid variable name")]
+    InvalidVariableName(String),
 
     /// An error occurred while creating a child process.
     #[error("failed to create child process")]

@@ -737,6 +737,11 @@ struct WordExpander<'a, SE: extensions::ShellExtensions> {
     heredoc_mode: bool,
     /// Whether the word is an arithmetic expression's text (see `basic_expand_arithmetic_text`).
     arithmetic_mode: bool,
+    /// The outermost word being expanded, which some diagnostics quote.
+    outer_word: Option<String>,
+    /// The text being expanded at the current level (a word, the inside of its double quotes,
+    /// or a here-document's body), which a bad substitution's diagnostic quotes, as bash's does.
+    current_text: String,
     /// Whether the next word expanded is a command-line word that, if it looks like an
     /// assignment, gets tilde expansion after its `=` and colons (see
     /// [`ExpanderOptions::assignment_word_tilde`]). Cleared once that word is taken, so words
@@ -759,6 +764,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             in_double_quotes: false,
             heredoc_mode: false,
             arithmetic_mode: false,
+            outer_word: None,
+            current_text: String::new(),
         }
     }
 
@@ -788,6 +795,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             in_double_quotes: false,
             heredoc_mode: false,
             arithmetic_mode: false,
+            outer_word: None,
+            current_text: String::new(),
         }
     }
 
@@ -890,6 +899,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
     async fn basic_expand(&mut self, word: &str) -> Result<Expansion, error::Error> {
         tracing::debug!(target: trace_categories::EXPANSION, "Basic expanding: '{word}'");
 
+        if self.outer_word.is_none() {
+            self.outer_word = Some(word.to_owned());
+        }
+
         // Bash tests the word as written, before brace expansion: `{x=~,y}` is not assignment-like.
         let assignment_word = std::mem::take(&mut self.assignment_word_tilde)
             && brush_parser::word::assignment_value_start(word).is_some();
@@ -972,9 +985,27 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         };
 
         let mut expansions = Vec::with_capacity(pieces.len());
+        let outer_text = std::mem::replace(&mut self.current_text, word.to_owned());
         for piece in pieces {
-            expansions.push(self.expand_word_piece(piece.piece).await?);
+            // Inside double quotes, the text a diagnostic quotes is what they enclose.
+            let quoted = match &piece.piece {
+                brush_parser::word::WordPiece::DoubleQuotedSequence(_) => Some(1),
+                brush_parser::word::WordPiece::GettextDoubleQuotedSequence(_) => Some(2),
+                _ => None,
+            };
+            if let Some(open) = quoted {
+                self.current_text = word
+                    .get(piece.start_index + open..piece.end_index.saturating_sub(1))
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            let expansion = self.expand_word_piece(piece.piece).await;
+            if quoted.is_some() {
+                word.clone_into(&mut self.current_text);
+            }
+            expansions.push(expansion?);
         }
+        self.current_text = outer_text;
 
         Ok(coalesce_expansions(expansions))
     }
@@ -1908,6 +1939,63 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     undefined: false,
                 })
             }
+            brush_parser::word::ParameterExpr::ToggleCaseFirstChar {
+                parameter,
+                indirect,
+                pattern,
+            } => {
+                let expanded_parameter = self.expand_parameter(&parameter, indirect).await?;
+                let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
+
+                transform_expansion(expanded_parameter, async |s| {
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), toggle_char_case)
+                })
+                .await
+            }
+            brush_parser::word::ParameterExpr::ToggleCasePattern {
+                parameter,
+                indirect,
+                pattern,
+            } => {
+                let expanded_parameter = self.expand_parameter(&parameter, indirect).await?;
+                let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
+
+                transform_expansion(expanded_parameter, async |s| {
+                    Self::pattern_to_string(s.as_str(), expanded_pattern.as_ref(), |str| {
+                        str.chars().flat_map(toggle_char_case).collect()
+                    })
+                })
+                .await
+            }
+            brush_parser::word::ParameterExpr::BadSubstitution { text, transform } => {
+                // As in bash, this ends a non-interactive shell; a transformation that does not
+                // exist ends `bash -c` with 127, as an unset variable does. The diagnostic
+                // quotes the text being expanded around it. A subscript left open hides the
+                // closing brace from bash, which says so, quoting the whole word.
+                let inner = text
+                    .strip_prefix("${")
+                    .and_then(|t| t.strip_suffix('}'))
+                    .unwrap_or_default();
+                let unclosed_subscript = inner
+                    .rfind('[')
+                    .is_some_and(|open| !inner.get(open..).unwrap_or_default().contains(']'));
+                let context = if self.current_text.is_empty() {
+                    text.as_str()
+                } else {
+                    self.current_text.as_str()
+                };
+                let kind = if transform {
+                    error::ErrorKind::CheckedExpansionError(format!("{context}: bad substitution"))
+                } else if unclosed_subscript {
+                    error::ErrorKind::BadSubstitution(format!(
+                        "bad substitution: no closing `}}' in {}",
+                        self.outer_word.as_deref().unwrap_or(&text)
+                    ))
+                } else {
+                    error::ErrorKind::BadSubstitution(format!("{context}: bad substitution"))
+                };
+                Err(error::Error::from(kind).into_fatal())
+            }
         }
     }
 
@@ -1966,6 +2054,17 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
     }
 
+    /// Parses the value of an indirect expansion as the parameter to expand; one that names
+    /// none ends a non-interactive shell, as in bash.
+    fn parse_indirect_parameter(
+        &self,
+        value: String,
+    ) -> Result<brush_parser::word::Parameter, error::Error> {
+        brush_parser::word::parse_parameter(value.as_str(), &self.parser_options).map_err(|_| {
+            error::Error::from(error::ErrorKind::InvalidVariableName(value)).into_fatal()
+        })
+    }
+
     async fn try_resolve_parameter_to_variable(
         &mut self,
         parameter: &brush_parser::word::Parameter,
@@ -1976,8 +2075,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         } else {
             let expansion = self.expand_parameter(parameter, false).await?;
             let parameter_str: String = self.fields_to_string(expansion);
-            let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+            let inner_parameter = self.parse_indirect_parameter(parameter_str)?;
             Ok(self.try_resolve_parameter_to_variable_without_indirect(&inner_parameter))
         }
     }
@@ -2049,10 +2147,19 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             .await?;
         if !indirect {
             Ok(expansion)
+        } else if expansion.fields.is_empty()
+            && matches!(
+                parameter,
+                brush_parser::word::Parameter::Special(
+                    brush_parser::word::SpecialParameter::AllPositionalParameters { .. }
+                )
+            )
+        {
+            // `${!@}` and `${!*}` with no positional parameters expand to nothing, as in bash.
+            Ok(expansion)
         } else {
             let parameter_str: String = self.fields_to_string(expansion);
-            let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+            let inner_parameter = self.parse_indirect_parameter(parameter_str)?;
 
             self.expand_parameter_without_indirect(&inner_parameter, allow_unset_vars)
                 .await
@@ -2094,7 +2201,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::Parameter::Special(s) => Ok(self.expand_special_parameter(s)),
             brush_parser::word::Parameter::Named(n) => {
                 if !env::valid_variable_name(n.as_str()) {
-                    Err(error::ErrorKind::BadSubstitution(n.clone()).into())
+                    Err(
+                        error::ErrorKind::BadSubstitution(format!("${{{n}}}: bad substitution"))
+                            .into(),
+                    )
                 } else if let Some((_, var)) = self.shell.env().get(n) {
                     if matches!(var.value(), ShellValue::Unset(_)) {
                         self.undefined_expansion(parameter, allow_unset_vars)
@@ -2392,6 +2502,18 @@ fn list_element_fields(values: Vec<String>, preserve_empty_elements: bool) -> Ve
             WordField(vec![piece])
         })
         .collect()
+}
+
+/// The character with its case toggled (`${v~}`, `${v~~}`).
+fn toggle_char_case(c: char) -> std::vec::IntoIter<char> {
+    let toggled: Vec<char> = if c.is_uppercase() {
+        c.to_lowercase().collect()
+    } else if c.is_lowercase() {
+        c.to_uppercase().collect()
+    } else {
+        vec![c]
+    };
+    toggled.into_iter()
 }
 
 fn coalesce_expansions(expansions: Vec<Expansion>) -> Expansion {

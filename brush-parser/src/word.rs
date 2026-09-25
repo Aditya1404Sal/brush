@@ -424,6 +424,35 @@ pub enum ParameterExpr {
         /// Whether to concatenate the results.
         concatenate: bool,
     },
+    /// Toggle the case of the first character of the given parameter.
+    ToggleCaseFirstChar {
+        /// The parameter.
+        parameter: Parameter,
+        /// Whether to treat the expanded parameter as an indirect
+        /// reference, which should be subsequently dereferenced
+        /// for the expansion.
+        indirect: bool,
+        /// Optionally provides a pattern to match.
+        pattern: Option<String>,
+    },
+    /// Toggle the case of the portion of the given parameter matching the given pattern.
+    ToggleCasePattern {
+        /// The parameter.
+        parameter: Parameter,
+        /// Whether to treat the expanded parameter as an indirect
+        /// reference, which should be subsequently dereferenced
+        /// for the expansion.
+        indirect: bool,
+        /// Optionally provides a pattern to match.
+        pattern: Option<String>,
+    },
+    /// A `${...}` that is not a valid expansion, which is an error when the word is expanded.
+    BadSubstitution {
+        /// The text, from `${` through `}`.
+        text: String,
+        /// Whether it is a parameter followed by a `@` transformation that does not exist.
+        transform: bool,
+    },
 }
 
 /// Kind of substring match.
@@ -1151,12 +1180,28 @@ peg::parser! {
             "${" e:parameter_expression() "}" {
                 WordPiece::ParameterExpansion(e)
             } /
+            // Anything else from `${` to its closing brace is a bad substitution, which bash
+            // reports when it expands the word.
+            text:$("${" parameter_indirection() parameter() "@" bad_braced_text() "}") {
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text: text.to_owned(), transform: true })
+            } /
+            text:$("${" bad_braced_text() "}") {
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text: text.to_owned(), transform: false })
+            } /
             "$" parameter:unbraced_parameter() {
                 WordPiece::ParameterExpansion(ParameterExpr::Parameter { parameter, indirect: false })
             } /
             "$" !['\''] {
                 WordPiece::Text("$".to_owned())
             }
+
+        // The text between `${` and its closing brace: nested braces, quotes and escapes included.
+        rule bad_braced_text() =
+            ("{" bad_braced_text() "}" /
+             "\\" [_] /
+             "'" [^'\'']* "'" /
+             "\"" ("\\" [_] / [^'"'])* "\"" /
+             [^'{' | '}' | '\\' | '\'' | '"'])*
 
         rule parameter_expression() -> ParameterExpr =
             indirect:parameter_indirection() parameter:parameter() test_type:parameter_test_type() "-" default_value:parameter_expression_word()? {
@@ -1208,7 +1253,8 @@ peg::parser! {
             "!" variable_name:variable_name() "[@]" {
                 ParameterExpr::MemberKeys { variable_name: variable_name.to_owned(), concatenate: false }
             } /
-            indirect:parameter_indirection() parameter:parameter() ":" offset:substring_offset() length:(":" l:substring_length() { l })? {
+            // `${v:}`, with nothing after the colon, is a bad substitution.
+            indirect:parameter_indirection() parameter:parameter() ":" !"}" offset:substring_offset() length:(":" l:substring_length() { l })? {
                 ParameterExpr::Substring { parameter, indirect, offset, length }
             } /
             indirect:parameter_indirection() parameter:parameter() "@" op:non_posix_parameter_transformation_op() {
@@ -1243,10 +1289,19 @@ peg::parser! {
             } /
             indirect:parameter_indirection() parameter:parameter() "," pattern:parameter_expression_word()? {
                 ParameterExpr::LowercaseFirstChar { parameter, indirect, pattern }
+            } /
+            indirect:parameter_indirection() parameter:parameter() "~~" pattern:parameter_expression_word()? {
+                ParameterExpr::ToggleCasePattern { parameter, indirect, pattern }
+            } /
+            indirect:parameter_indirection() parameter:parameter() "~" pattern:parameter_expression_word()? {
+                ParameterExpr::ToggleCaseFirstChar { parameter, indirect, pattern }
             }
 
+        // A `!` names what follows as the variable to expand indirectly only when a name, a
+        // digit or one of `#?@*` follows it, as in bash; otherwise it is the special parameter
+        // `$!` (`${!}`, `${!-word}`, `${!:+word}`).
         rule parameter_indirection() -> bool =
-            non_posix_extensions_enabled() "!" { true } /
+            non_posix_extensions_enabled() "!" &['a'..='z' | 'A'..='Z' | '_' | '0'..='9' | '#' | '?' | '@' | '*'] { true } /
             { false }
 
         rule non_posix_parameter_transformation_op() -> ParameterTransformOp =
@@ -1422,6 +1477,53 @@ mod tests {
             input: word,
             result: parsed,
         })
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn parse_special_bang_toggles_and_bad_substitutions() -> Result<()> {
+        let expr = |word: &str| -> Result<ParameterExpr> {
+            let parsed = super::parse(word, &ParserOptions::default())?;
+            match parsed.into_iter().next().map(|p| p.piece) {
+                Some(WordPiece::ParameterExpansion(expr)) => Ok(expr),
+                other => Err(anyhow::anyhow!("{word}: {other:?}")),
+            }
+        };
+        let bang = Parameter::Special(SpecialParameter::LastBackgroundProcessId);
+        // `!` is `$!` unless a name or one of `#?@*` follows it.
+        assert_matches!(expr("${!}")?, ParameterExpr::Parameter { parameter, indirect: false } if parameter == bang);
+        assert_matches!(expr("${!-x}")?, ParameterExpr::UseDefaultValues { parameter, indirect: false, .. } if parameter == bang);
+        assert_matches!(expr("${!:+x}")?, ParameterExpr::UseAlternativeValue { parameter, indirect: false, .. } if parameter == bang);
+        assert_matches!(expr("${#!}")?, ParameterExpr::ParameterLength { parameter, .. } if parameter == bang);
+        assert_matches!(
+            expr("${!v}")?,
+            ParameterExpr::Parameter { indirect: true, .. }
+        );
+        assert_matches!(
+            expr("${!#}")?,
+            ParameterExpr::Parameter { indirect: true, .. }
+        );
+        assert_matches!(expr("${v~}")?, ParameterExpr::ToggleCaseFirstChar { .. });
+        assert_matches!(
+            expr("${v~~[ab]}")?,
+            ParameterExpr::ToggleCasePattern {
+                pattern: Some(_),
+                ..
+            }
+        );
+        for bad in [
+            "${v:}", "${}", "${1a}", "${v w}", "${a[}", "${#v:-x}", "${${v}}",
+        ] {
+            assert_matches!(expr(bad)?, ParameterExpr::BadSubstitution { text, transform: false } if text == bad);
+        }
+        assert_matches!(
+            expr("${v@Z}")?,
+            ParameterExpr::BadSubstitution {
+                transform: true,
+                ..
+            }
+        );
+        Ok(())
     }
 
     #[test]

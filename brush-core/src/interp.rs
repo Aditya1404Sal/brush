@@ -1669,6 +1669,17 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                     if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
                     {
+                        // An expansion error that ends the shell (a bad substitution in a
+                        // file name) still does, as in bash; in a here-document or here-string,
+                        // or any other failed redirection, it fails the command.
+                        if e.is_fatal()
+                            && !matches!(
+                                redirect,
+                                ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
+                            )
+                        {
+                            return Err(e);
+                        }
                         let _ = context
                             .shell
                             .display_error(&mut params.stderr(&context.shell), &e);
