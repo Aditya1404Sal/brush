@@ -625,17 +625,16 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     }
 
     fn next_char(&mut self) -> Result<Option<char>, TokenizerError> {
-        let c = match self.put_back.take() {
-            Some(c) => Some(c),
-            None => {
-                let c = self
-                    .char_reader
-                    .next()
-                    .transpose()
-                    .map_err(TokenizerError::ReadError)?;
-                self.text.extend(c);
-                c
-            }
+        let c = if let Some(c) = self.put_back.take() {
+            Some(c)
+        } else {
+            let c = self
+                .char_reader
+                .next()
+                .transpose()
+                .map_err(TokenizerError::ReadError)?;
+            self.text.extend(c);
+            c
         };
 
         if let Some(ch) = c {
@@ -2101,6 +2100,7 @@ echo after
     }
 
     #[test]
+    #[allow(clippy::panic)]
     fn tokenize_unterminated_here_documents() {
         let open = |input: &str| -> Vec<(String, String, usize)> {
             match tokenize_str(input) {

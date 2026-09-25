@@ -3444,6 +3444,7 @@ pub(crate) async fn setup_word_process_substitution(
         })
         .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
     waiting.push((fd, file));
+    drop(waiting);
     Ok(std::format!("/dev/fd/{fd}"))
 }
 
