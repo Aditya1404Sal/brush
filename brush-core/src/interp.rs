@@ -571,27 +571,31 @@ impl Execute for ast::Pipeline {
             shell.apply_errexit_if_enabled(&mut result);
         }
 
-        // If requested, report timing.
+        // If requested, report timing, in TIMEFORMAT (bash's default when it is unset; nothing
+        // when it is empty) or, for `time -p`, the POSIX format.
         if let (Some(timed), Some(stopwatch)) = (&self.timed, &stopwatch)
             && let Some(mut stderr) = params.try_fd(shell, openfiles::OpenFiles::STDERR_FD)
         {
             let timing = stopwatch.stop()?;
-            if timed.is_posix_output() {
-                std::write!(
-                    stderr,
-                    "real {}\nuser {}\nsys {}\n",
-                    timing::format_duration_posixly(&timing.wall),
-                    timing::format_duration_posixly(&timing.user),
-                    timing::format_duration_posixly(&timing.system),
-                )?;
+            let format = if timed.is_posix_output() {
+                timing::POSIX_TIMEFORMAT.to_owned()
             } else {
-                std::write!(
-                    stderr,
-                    "\nreal\t{}\nuser\t{}\nsys\t{}\n",
-                    timing::format_duration_non_posixly(&timing.wall),
-                    timing::format_duration_non_posixly(&timing.user),
-                    timing::format_duration_non_posixly(&timing.system),
-                )?;
+                shell
+                    .env()
+                    .get("TIMEFORMAT")
+                    .filter(|(_, var)| var.value().is_set())
+                    .map_or_else(
+                        || timing::BASH_TIMEFORMAT.to_owned(),
+                        |(_, var)| var.value().to_cow_str(shell).into_owned(),
+                    )
+            };
+            if !format.is_empty() {
+                match timing::format_timing(&format, &timing) {
+                    Ok(text) => std::writeln!(stderr, "{text}")?,
+                    Err(message) => {
+                        std::writeln!(stderr, "{}{message}", shell.diagnostic_prefix())?;
+                    }
+                }
             }
         }
 
