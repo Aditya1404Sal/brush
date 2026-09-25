@@ -25,6 +25,7 @@ impl builtins::Command for ReturnCommand {
         };
 
         if context.shell.in_function() || context.shell.in_sourced_script() {
+            context.shell.note_status_before_return();
             let mut result = ExecutionResult::new(code_8bit);
             result.next_control_flow = ExecutionControlFlow::ReturnFromFunctionOrScript;
 

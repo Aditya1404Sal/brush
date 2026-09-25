@@ -163,6 +163,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) alias_scope: Option<std::sync::Arc<HashMap<String, String>>>,
 
+    /// The status before a `return` ran, which the RETURN trap sees as `$?`, as in bash.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) status_before_return: Option<u8>,
+
     /// `set -o` options saved by `local -`, restored when the saving function returns.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) local_option_saves: Vec<Vec<(&'static str, bool)>>,
@@ -231,6 +235,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             alias_units: self.alias_units.clone(),
             programs_started: self.programs_started,
             alias_scope: self.alias_scope.clone(),
+            status_before_return: None,
             local_option_saves: self.local_option_saves.clone(),
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
@@ -358,6 +363,30 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// * `delta` - The number of lines to increment the current line offset by.
     pub fn increment_interactive_line_offset(&mut self, delta: usize) {
         self.call_stack.increment_current_line_offset(delta);
+    }
+
+    /// Notes the status before `return` runs: the RETURN trap sees it as `$?`, as in bash.
+    pub const fn note_status_before_return(&mut self) {
+        self.status_before_return = Some(self.last_exit_status);
+    }
+
+    /// Runs the RETURN trap as a function or sourced script returns, with `$?` the status before
+    /// any `return` that ended it, as in bash.
+    pub(crate) async fn run_return_trap(
+        &mut self,
+        params: &crate::ExecutionParameters,
+    ) -> Result<(), error::Error> {
+        let status = self
+            .status_before_return
+            .take()
+            .unwrap_or(self.last_exit_status);
+        let saved = self.last_exit_status;
+        self.last_exit_status = status;
+        let result = self
+            .invoke_trap_handler(crate::traps::TrapSignal::Return, params)
+            .await;
+        self.last_exit_status = saved;
+        result.map(|_| ())
     }
 
     /// Numbers the code about to run in this frame on from the command running now, as bash

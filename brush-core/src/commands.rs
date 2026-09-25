@@ -969,11 +969,9 @@ pub(crate) async fn invoke_shell_function(
                 .options()
                 .shell_functions_inherit_debug_and_return_traps)
     {
-        let _ = context
-            .shell
-            .invoke_trap_handler(traps::TrapSignal::Return, &context.params)
-            .await;
+        let _ = context.shell.run_return_trap(&context.params).await;
     }
+    context.shell.status_before_return = None;
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;

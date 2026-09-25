@@ -146,7 +146,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             .push_script(call_type, source_info, script_positional_args);
 
         #[cfg(any(target_arch = "wasm32", test))]
-        {
+        let result = {
             let mut frame = super::FrameGuard::new(
                 self,
                 |shell| {
@@ -159,15 +159,24 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
                 .shell()
                 .run_parsed_result(parse_result, Some(&text), source_info, params)
                 .await
-        }
+        };
         #[cfg(not(any(target_arch = "wasm32", test)))]
-        {
+        let result = {
             let result = self
                 .run_parsed_result(parse_result, Some(&text), source_info, params)
                 .await;
             self.call_stack.pop();
             result
+        };
+
+        // The RETURN trap runs as a sourced script returns, as in bash.
+        if matches!(call_type, callstack::ScriptCallType::Source) {
+            if let Ok(result) = &result {
+                self.last_exit_status = result.exit_code.into();
+            }
+            self.run_return_trap(params).await?;
         }
+        result
     }
 
     /// Executes the given string as a shell program, returning the resulting exit status.

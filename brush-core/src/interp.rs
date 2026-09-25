@@ -554,7 +554,11 @@ impl Execute for ast::Pipeline {
         // We reuse `suppress_errexit` here because bash suppresses the ERR trap in
         // exactly the same contexts it suppresses errexit (conditionals, `!`-prefixed
         // pipelines, etc.).
-        if !result.is_success() && !params.suppress_errexit && !self.bang {
+        if !result.is_success()
+            && !params.suppress_errexit
+            && !self.bang
+            && !runs_its_own_commands(self)
+        {
             if shell.traps().handles(crate::traps::TrapSignal::Err) {
                 shell
                     .invoke_trap_handler(crate::traps::TrapSignal::Err, &params)
@@ -593,6 +597,27 @@ impl Execute for ast::Pipeline {
 
         Ok(result)
     }
+}
+
+/// Whether the pipeline is one compound command that runs its commands in this shell (a group,
+/// a loop, `if` or `case`), or a function definition. The commands inside set PIPESTATUS and run
+/// the ERR trap themselves, as in bash; `(( ))`, `[[ ]]` and `( )` do both as commands.
+const fn runs_its_own_commands(pipeline: &ast::Pipeline) -> bool {
+    matches!(
+        pipeline.seq.as_slice(),
+        [ast::Command::Function(_)
+            | ast::Command::Compound(
+                ast::CompoundCommand::BraceGroup(_)
+                    | ast::CompoundCommand::ForClause(_)
+                    | ast::CompoundCommand::ArithmeticForClause(_)
+                    | ast::CompoundCommand::SelectClause(_)
+                    | ast::CompoundCommand::CaseClause(_)
+                    | ast::CompoundCommand::IfClause(_)
+                    | ast::CompoundCommand::WhileClause(_)
+                    | ast::CompoundCommand::UntilClause(_),
+                _,
+            )]
+    )
 }
 
 async fn spawn_pipeline_processes(
@@ -819,21 +844,7 @@ async fn wait_for_pipeline_processes_and_update_status(
 
     // A compound command or function definition run on its own in this shell leaves PIPESTATUS
     // as the last pipeline it ran set it, as in bash; `(( ))`, `[[ ]]` and `( )` set it.
-    let keeps_statuses = matches!(
-        pipeline.seq.as_slice(),
-        [ast::Command::Function(_)
-            | ast::Command::Compound(
-                ast::CompoundCommand::BraceGroup(_)
-                    | ast::CompoundCommand::ForClause(_)
-                    | ast::CompoundCommand::ArithmeticForClause(_)
-                    | ast::CompoundCommand::SelectClause(_)
-                    | ast::CompoundCommand::CaseClause(_)
-                    | ast::CompoundCommand::IfClause(_)
-                    | ast::CompoundCommand::WhileClause(_)
-                    | ast::CompoundCommand::UntilClause(_),
-                _,
-            )]
-    );
+    let keeps_statuses = runs_its_own_commands(pipeline);
 
     // Clear our the pipeline status so we can start filling it out.
     if !keeps_statuses {
@@ -925,6 +936,36 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 // `>(list)` substitutions in these redirects run once the command has finished.
                 #[cfg(target_arch = "wasm32")]
                 let pending = params.own_output_substitutions();
+
+                // `(( ))`, `[[ ]]` and `( )` are commands in their own right: they become
+                // BASH_COMMAND, and the DEBUG trap runs before `(( ))` and `[[ ]]`, as in bash.
+                let text = match compound {
+                    ast::CompoundCommand::Arithmetic(arithmetic) => {
+                        Some((format!("(( {} ))", arithmetic.expr.value), true))
+                    }
+                    ast::CompoundCommand::ExtendedTest(test) => {
+                        Some((format!("[[ {test} ]]"), true))
+                    }
+                    ast::CompoundCommand::Subshell(subshell) => Some((subshell.to_string(), false)),
+                    _ => None,
+                };
+                if let Some((text, debug)) = text {
+                    let shell = &mut pipeline_context.shell;
+                    if !shell.running_trap_handler() {
+                        shell.env_mut().update_or_add(
+                            "BASH_COMMAND",
+                            ShellValueLiteral::Scalar(text),
+                            |_| Ok(()),
+                            EnvironmentLookup::Anywhere,
+                            EnvironmentScope::Global,
+                        )?;
+                    }
+                    if debug && shell.traps().handles(traps::TrapSignal::Debug) {
+                        shell
+                            .invoke_trap_handler(traps::TrapSignal::Debug, &params)
+                            .await?;
+                    }
+                }
 
                 // Set up any additional redirects. One that fails fails the command, and the
                 // list goes on.
@@ -1143,24 +1184,35 @@ impl Execute for ast::ForClauseCommand {
             shell.current_shell_args().to_vec()
         };
 
+        let header = if let Some(unexpanded_values) = &self.values {
+            std::format!(
+                "for {} in {}",
+                self.variable_name,
+                unexpanded_values.iter().join(" ")
+            )
+        } else {
+            std::format!("for {}", self.variable_name)
+        };
+
         for value in expanded_values {
+            // Each iteration runs the DEBUG trap with the header as BASH_COMMAND, as in bash.
+            if !shell.running_trap_handler() {
+                shell.env_mut().update_or_add(
+                    "BASH_COMMAND",
+                    ShellValueLiteral::Scalar(header.clone()),
+                    |_| Ok(()),
+                    EnvironmentLookup::Anywhere,
+                    EnvironmentScope::Global,
+                )?;
+            }
+            if shell.traps().handles(traps::TrapSignal::Debug) {
+                shell
+                    .invoke_trap_handler(traps::TrapSignal::Debug, params)
+                    .await?;
+            }
+
             if shell.options().print_commands_and_arguments {
-                if let Some(unexpanded_values) = &self.values {
-                    shell
-                        .trace_command(
-                            params,
-                            std::format!(
-                                "for {} in {}",
-                                self.variable_name,
-                                unexpanded_values.iter().join(" ")
-                            ),
-                        )
-                        .await;
-                } else {
-                    shell
-                        .trace_command(params, std::format!("for {}", self.variable_name))
-                        .await;
-                }
+                shell.trace_command(params, header.as_str()).await;
             }
 
             // Update the variable. A nameref control variable is pointed at each word in turn
