@@ -22,7 +22,7 @@ fn cacheable_parse(input: &str) -> Result<ast::ArithmeticExpr, error::WordParseE
 peg::parser! {
     grammar arithmetic() for str {
         pub(crate) rule full_expression() -> ast::ArithmeticExpr =
-            ![_] { ast::ArithmeticExpr::Literal(0) } /
+            _ ![_] { ast::ArithmeticExpr::Literal(0) } /
             _ e:expression() _ { e }
 
         pub(crate) rule expression() -> ast::ArithmeticExpr = precedence!{
@@ -203,6 +203,16 @@ mod tests {
                 element(input),
                 Some((input[..1].to_owned(), subscript.to_owned())),
                 "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_expressions_are_zero() {
+        for input in ["", " ", "  \t "] {
+            assert!(
+                matches!(parse(input), Ok(ast::ArithmeticExpr::Literal(0))),
+                "{input:?}"
             );
         }
     }

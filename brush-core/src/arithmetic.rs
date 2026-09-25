@@ -51,6 +51,10 @@ pub enum EvalError {
     /// Expression recursion level exceeded.
     #[error("expression recursion level exceeded")]
     RecursionLimitExceeded,
+
+    /// An assignment to a readonly variable.
+    #[error("{0}: readonly variable")]
+    ReadonlyVariable(String),
 }
 
 /// Trait implemented by arithmetic expressions that can be evaluated.
@@ -117,9 +121,10 @@ pub(crate) async fn expand_and_eval(
             .await;
     }
 
-    // Now evaluate.
-    expr.eval(shell)
-        .map_err(|error| EvalError::InExpression(expanded_self.clone(), Box::new(error)))
+    // Now evaluate. Bash names the expression without its leading whitespace.
+    expr.eval(shell).map_err(|error| {
+        EvalError::InExpression(expanded_self.trim_start().to_owned(), Box::new(error))
+    })
 }
 
 /// Bash's wording for an arithmetic error: `EXPR: message (error token is "TOKEN")`, where the
@@ -136,8 +141,14 @@ fn in_expression_message(expr: &str, error: &EvalError) -> String {
         _ => None,
     };
     match (error, token) {
-        (EvalError::ExpandingUnsetVariable(_), _) => error.to_string(),
-        (_, Some(token)) => format!("{expr}: {error} (error token is \"{}\")", token.trim()),
+        (EvalError::ExpandingUnsetVariable(_) | EvalError::ReadonlyVariable(_), _) => {
+            error.to_string()
+        }
+        // Bash keeps the whitespace that follows the failing token.
+        (_, Some(token)) => format!(
+            "{expr}: {error} (error token is \"{}\")",
+            token.trim_start()
+        ),
         (_, None) => format!("{expr}: {error}"),
     }
 }
@@ -465,7 +476,7 @@ fn assign(
                     env::EnvironmentLookup::Anywhere,
                     env::EnvironmentScope::Global,
                 )
-                .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
+                .map_err(|error| assignment_error(&error))?;
         }
         ast::ArithmeticTarget::ArrayElement(name, index) => {
             let index_str = element_key(shell, name, index, depth)?;
@@ -480,7 +491,7 @@ fn assign(
                     env::EnvironmentLookup::Anywhere,
                     env::EnvironmentScope::Global,
                 )
-                .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
+                .map_err(|error| assignment_error(&error))?;
         }
     }
 
@@ -508,6 +519,38 @@ fn element_key(
     let index_expr = brush_parser::arithmetic::parse(index)
         .map_err(|_err| EvalError::ParseError(index.to_owned()))?;
     Ok(eval_expr_impl(&index_expr, shell, depth)?.to_string())
+}
+
+/// The error for an assignment the environment refused: bash names a readonly variable.
+fn assignment_error(error: &crate::error::Error) -> EvalError {
+    match error.kind() {
+        crate::error::ErrorKind::ReadonlyVariableNamed(name) => {
+            EvalError::ReadonlyVariable(name.clone())
+        }
+        _ => EvalError::FailedToUpdateEnvironment,
+    }
+}
+
+impl EvalError {
+    /// The variable, if the error is an unset variable under `set -u`, which ends the shell
+    /// rather than failing only the command.
+    pub fn unset_variable(&self) -> Option<&str> {
+        match self {
+            Self::ExpandingUnsetVariable(name) => Some(name),
+            Self::InExpression(_, inner) => inner.unset_variable(),
+            _ => None,
+        }
+    }
+
+    /// Whether the error is an assignment to a readonly variable, which bash reports on its own
+    /// (`NAME: readonly variable`) rather than with the expression.
+    pub fn is_readonly_variable(&self) -> bool {
+        match self {
+            Self::ReadonlyVariable(_) => true,
+            Self::InExpression(_, inner) => inner.is_readonly_variable(),
+            _ => false,
+        }
+    }
 }
 
 const fn bool_to_i64(value: bool) -> i64 {

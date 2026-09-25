@@ -621,12 +621,23 @@ async fn call_builtin(
     let builtin_name = context.command_name.clone();
     let result = command.execute(context).await.map_err(|e| {
         // A readonly variable the builtin could not assign is reported as bash words it,
-        // `NAME: readonly variable`, without the builtin's name.
+        // `NAME: readonly variable`, without the builtin's name; an unset variable under
+        // `set -u` also ends the shell.
         if let Some(inner) =
             (&e as &(dyn std::error::Error + 'static)).downcast_ref::<error::Error>()
-            && let error::ErrorKind::ReadonlyVariableNamed(name) = inner.kind()
         {
-            return error::Error::from(error::ErrorKind::ReadonlyVariableNamed(name.clone()));
+            match inner.kind() {
+                error::ErrorKind::ReadonlyVariableNamed(name) => {
+                    return error::ErrorKind::ReadonlyVariableNamed(name.clone()).into();
+                }
+                error::ErrorKind::ExpandingUnsetVariable(name) if inner.is_fatal() => {
+                    return error::Error::from(error::ErrorKind::ExpandingUnsetVariable(
+                        name.clone(),
+                    ))
+                    .into_fatal();
+                }
+                _ => (),
+            }
         }
         error::ErrorKind::BuiltinError(Box::new(e), builtin_name).into()
     })?;

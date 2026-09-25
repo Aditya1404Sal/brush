@@ -917,10 +917,17 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 #[cfg(target_arch = "wasm32")]
                 let pending = params.own_output_substitutions();
 
-                // Set up any additional redirects.
+                // Set up any additional redirects. One that fails fails the command, and the
+                // list goes on.
                 if let Some(redirects) = redirects {
                     for redirect in &redirects.0 {
-                        setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await?;
+                        if let Err(error) =
+                            setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await
+                        {
+                            let shell = &mut pipeline_context.shell;
+                            let _ = shell.display_error(&mut params.stderr(shell), &error);
+                            return Ok(ExecutionResult::general_error().into());
+                        }
                     }
                 }
 
@@ -1006,10 +1013,15 @@ impl Execute for ast::CompoundCommand {
             Self::Coprocess(c) => c.execute(shell, params).await,
             Self::ExtendedTest(e) => {
                 let result =
-                    if extendedtests::eval_extended_test_expr(&e.expr, shell, params).await? {
-                        0
-                    } else {
-                        1
+                    match extendedtests::eval_extended_test_expr(&e.expr, shell, params).await {
+                        Ok(true) => 0,
+                        Ok(false) => 1,
+                        Err(error) => {
+                            return match error.into_eval_error() {
+                                Ok(error) => arithmetic_command_error(shell, params, "[[", &error),
+                                Err(error) => Err(error),
+                            };
+                        }
                     };
                 Ok(ExecutionResult::new(result))
             }
@@ -1543,7 +1555,10 @@ impl Execute for ast::ArithmeticCommand {
         shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
-        let value = self.expr.eval(shell, params, true).await?;
+        let value = match self.expr.eval(shell, params, true).await {
+            Ok(value) => value,
+            Err(error) => return arithmetic_command_error(shell, params, "((", &error),
+        };
         let result = if value != 0 {
             ExecutionResult::success()
         } else {
@@ -1565,15 +1580,21 @@ impl Execute for ast::ArithmeticForClauseCommand {
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
-        if let Some(initializer) = &self.initializer {
-            initializer.eval(shell, params, true).await?;
+        if let Some(initializer) = &self.initializer
+            && let Err(error) = initializer.eval(shell, params, true).await
+        {
+            return arithmetic_command_error(shell, params, "((", &error);
         }
 
         loop {
             if let Some(condition) = &self.condition {
                 // An empty condition (e.g., `for (( ; ; ))`) means "always true".
-                if !condition.value.is_empty() && condition.eval(shell, params, true).await? == 0 {
-                    break;
+                if !condition.value.is_empty() {
+                    match condition.eval(shell, params, true).await {
+                        Ok(0) => break,
+                        Ok(_) => (),
+                        Err(error) => return arithmetic_command_error(shell, params, "((", &error),
+                    }
                 }
             }
 
@@ -1593,14 +1614,47 @@ impl Execute for ast::ArithmeticForClauseCommand {
                 break;
             }
 
-            if let Some(updater) = &self.updater {
-                updater.eval(shell, params, true).await?;
+            if let Some(updater) = &self.updater
+                && let Err(error) = updater.eval(shell, params, true).await
+            {
+                return arithmetic_command_error(shell, params, "((", &error);
             }
         }
 
         shell.set_last_exit_status(result.exit_code.into());
         Ok(result)
     }
+}
+
+/// An arithmetic error in `(( ))`, `for (( ))` or `[[ ]]` fails that command with status 1,
+/// reported as bash words it (`((: EXPR: message`), and the list goes on. An unset variable under
+/// `set -u` ends the shell instead, as it does anywhere else.
+fn arithmetic_command_error(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: &str,
+    error: &arithmetic::EvalError,
+) -> Result<ExecutionResult, error::Error> {
+    if let Some(name) = error.unset_variable() {
+        return Err(
+            error::Error::from(error::ErrorKind::ExpandingUnsetVariable(name.to_owned()))
+                .into_fatal(),
+        );
+    }
+    // A readonly variable is named on its own, without the command.
+    let message = if error.is_readonly_variable() {
+        error.to_string()
+    } else {
+        format!("{command}: {error}")
+    };
+    writeln!(
+        params.stderr(shell),
+        "{}{message}",
+        shell.diagnostic_prefix()
+    )?;
+    let result = ExecutionResult::general_error();
+    shell.set_last_exit_status(result.exit_code.into());
+    Ok(result)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -1703,6 +1757,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
+        let mut redirect_failed = false;
 
         // Capture the status change count before expansion, so we can detect
         // if expansion (e.g., command substitution) set an exit status.
@@ -1716,6 +1771,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                         let _ = context
                             .shell
                             .display_error(&mut params.stderr(&context.shell), &e);
+                        // Without a command, the assignments still take effect, as in bash.
+                        if self.word_or_name.is_none() {
+                            redirect_failed = true;
+                            continue;
+                        }
                         return Ok(ExecutionResult::general_error().into());
                     }
                 }
@@ -1877,6 +1937,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // This matches bash behavior where assignments don't have a "last
             // argument".
             context.shell.update_last_arg_variable(None);
+
+            if redirect_failed {
+                context.shell.set_last_exit_status(1);
+                return Ok(ExecutionResult::general_error().into());
+            }
 
             // We need to set the last exit status to indicate assignment success,
             // but only if there was no status set during expansion. We use the

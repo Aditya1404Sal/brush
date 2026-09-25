@@ -471,6 +471,18 @@ impl Error {
         }
     }
 
+    /// The arithmetic error this error carries, or the error itself when it is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error itself when it is not an arithmetic error.
+    pub fn into_eval_error(self) -> Result<crate::arithmetic::EvalError, Self> {
+        match self.kind {
+            ErrorKind::EvalError(error) => Ok(error),
+            _ => Err(self),
+        }
+    }
+
     /// Returns whether or not this error is fatal.
     pub const fn is_fatal(&self) -> bool {
         self.fatal
