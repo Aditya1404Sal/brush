@@ -78,11 +78,11 @@ impl builtins::Command for ExecCommand {
                 command_and_args: self.args.clone(),
                 ..Default::default()
             };
-            // Bash's own wording for a target `exec` cannot find ("NAME: not found") differs
-            // from the generic "command not found" the `command` builtin below produces for an
-            // ordinary lookup failure. And unlike an ordinary command, a failed `exec` always
-            // ends a non-interactive shell: there is no process image left for the rest of the
-            // script to run in, exactly as there would be none after a successful one.
+            // Bash's own wording for a target `exec` cannot find ("exec: NAME: not found")
+            // differs from the generic "command not found" the `command` builtin below produces
+            // for an ordinary lookup failure; a path it cannot run is named alone ("PATH: No such
+            // file or directory"). A failed `exec` ends a non-interactive shell, unless `execfail`
+            // is set and the shell is no subshell, as in bash.
             let diagnostic_prefix = context.shell.diagnostic_prefix();
             let mut stderr = context.params.stderr(context.shell);
             let shell = context.shell;
@@ -99,7 +99,7 @@ impl builtins::Command for ExecCommand {
                     use std::io::Write as _;
                     let (message, exit_code) = match error.kind() {
                         brush_core::ErrorKind::CommandNotFound(name) => (
-                            std::format!("{name}: not found"),
+                            std::format!("exec: {name}: not found"),
                             brush_core::ExecutionExitCode::NotFound,
                         ),
                         _ => (
@@ -107,8 +107,12 @@ impl builtins::Command for ExecCommand {
                             brush_core::ExecutionExitCode::from(&error),
                         ),
                     };
-                    let _ = writeln!(stderr, "{diagnostic_prefix}exec: {message}");
-                    brush_core::ExecutionResult::new(exit_code.into())
+                    let _ = writeln!(stderr, "{diagnostic_prefix}{message}");
+                    let result = brush_core::ExecutionResult::new(exit_code.into());
+                    if shell.options().exit_on_exec_fail && !shell.in_subshell_environment() {
+                        return Ok(result);
+                    }
+                    result
                 }
             };
             shell

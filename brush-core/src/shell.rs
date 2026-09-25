@@ -553,6 +553,13 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             .and_then(|frame| frame.current.clone())
     }
 
+    /// Whether this shell is a subshell, a pipeline stage, a substitution or a background job of
+    /// the shell process it belongs to (bash's `subshell_environment`), and not that process
+    /// itself (a `bash -c` child is a process of its own).
+    pub const fn in_subshell_environment(&self) -> bool {
+        self.depth > self.process_depth
+    }
+
     /// Numbers the current command by `position` (its `LINENO`, and the line its diagnostics
     /// name), when known.
     pub(crate) fn set_current_position(
