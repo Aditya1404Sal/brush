@@ -2523,20 +2523,33 @@ fn setup_redirect_output_and_error_to(
 ) -> Result<(), error::Error> {
     let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
 
-    let mut file_options = std::fs::File::options();
-    file_options
-        .create(true)
-        .write(true)
-        .truncate(!append)
-        .append(append);
+    // `set -C` guards `&>` and `>&word` as it guards `>`: an existing regular file is refused.
+    let noclobber = !append
+        && shell
+            .options()
+            .disallow_overwriting_regular_files_via_output_redirection;
 
+    let mut file_options = std::fs::File::options();
+    file_options.write(true);
+    if noclobber && abs_file_path.is_file() {
+        file_options.create_new(true);
+    } else {
+        file_options
+            .create(true)
+            .truncate(!append && !noclobber)
+            .append(append);
+    }
+
+    // Diagnostics name the file as the script did, not its absolute path.
     let stdout_file = shell
         .open_file(&file_options, &abs_file_path, params)
         .map_err(|err| {
-            error::ErrorKind::RedirectionFailure(
-                abs_file_path.to_string_lossy().to_string(),
-                error::io_message(&err),
-            )
+            let message = if noclobber && err.kind() == std::io::ErrorKind::AlreadyExists {
+                "cannot overwrite existing file".to_owned()
+            } else {
+                error::io_message(&err)
+            };
+            error::ErrorKind::RedirectionFailure(file_path.to_owned(), message)
         })?;
 
     let stderr_file = stdout_file.clone();
