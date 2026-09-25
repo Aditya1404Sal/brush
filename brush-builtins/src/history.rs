@@ -62,7 +62,7 @@ impl builtins::Command for HistoryCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         // Retrieve the shell's history config -- and the diagnostic prefix a numeric-argument
-        // error needs -- while `context.shell` is still borrowed immutably; `history_mut()`
+        // error needs -- while `context.shell` is still borrowed immutably; `history_or_init_mut()`
         // right below needs it mutably.
         let config = HistoryConfig {
             default_history_file_path: context.shell.history_file_path(),
@@ -73,12 +73,11 @@ impl builtins::Command for HistoryCommand {
         let stdout = context.stdout();
         let stderr = context.stderr();
 
-        if let Some(history) = context.shell.history_mut() {
-            self.execute_with_history(history, &config, stdout, stderr)
-        } else {
-            // A shell that keeps no history has an empty one, as a non-interactive bash does.
-            Ok(ExecutionResult::success())
-        }
+        // The builtin works on the list whether or not `set -o history` is on: that option only
+        // gates automatic recording (done elsewhere, in the interactive layer), not whether the
+        // list itself exists. See `Shell::history_or_init_mut`.
+        let history = context.shell.history_or_init_mut();
+        self.execute_with_history(history, &config, stdout, stderr)
     }
 }
 
