@@ -193,6 +193,8 @@ pub(super) struct ProcessState {
     handling: Cell<bool>,
     waker: RefCell<Option<Waker>>,
     children: RefCell<Vec<Weak<Self>>>,
+    /// Tasks waiting for this numbered process to end (see [`process_exited`]).
+    exit_waiters: RefCell<Vec<Waker>>,
 }
 
 impl ProcessState {
@@ -212,6 +214,7 @@ impl ProcessState {
             handling: Cell::new(false),
             waker: RefCell::new(None),
             children: RefCell::new(Vec::new()),
+            exit_waiters: RefCell::new(Vec::new()),
         });
         if let Some(parent) = parent {
             let mut children = parent.children.borrow_mut();
@@ -573,6 +576,10 @@ impl Drop for NumberedProcess {
             self.table
                 .set_status(self.pid, ProcessStatus::Signaled(signals::KILL));
         }
+        // The registration goes with this value; waiters see the process gone when they run.
+        for waker in self.state.exit_waiters.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -591,6 +598,22 @@ pub async fn run_numbered_process(
 
 fn lookup(table: &ProcessTable, pid: Pid) -> Option<Rc<ProcessState>> {
     REGISTRY.with_borrow(|registry| registry.get(&(table.id(), pid)).and_then(Weak::upgrade))
+}
+
+/// Resolves once numbered process `pid` of `table` has ended, or at once if it is not running.
+/// The waiting task sleeps until then: nothing polls in a loop.
+pub fn process_exited(table: &ProcessTable, pid: Pid) -> impl Future<Output = ()> + use<> {
+    let table = table.clone();
+    std::future::poll_fn(move |cx| match lookup(&table, pid) {
+        None => Poll::Ready(()),
+        Some(state) => {
+            let mut waiters = state.exit_waiters.borrow_mut();
+            if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+            Poll::Pending
+        }
+    })
 }
 
 /// Whether numbered process `pid` (including the main script, `$$`) is still running.
@@ -1027,6 +1050,43 @@ mod tests {
             );
             assert_eq!(u8::from(result.unwrap().exit_code), 3);
             assert_eq!(u8::from(early_result.unwrap().exit_code), 130);
+        });
+    }
+
+    #[test]
+    fn a_waiter_sleeps_until_a_numbered_process_ends() {
+        run(async {
+            let table = ProcessTable::new(10, 11);
+            let pid = table.allocate(10, "job".into());
+            let process = NumberedProcess::register(&table, pid, Dispositions::default());
+            // The job runs as a task of its own, so its turns do not wake the waiter.
+            let job = tokio::task::spawn_local(process.run(async {
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                Ok(ExecutionResult::new(3))
+            }));
+            // So does the waiter: `LocalSet::run_until` polls its own future on every turn.
+            let waiter_table = table.clone();
+            let polls = tokio::task::spawn_local(async move {
+                let mut polls = 0;
+                let exited = process_exited(&waiter_table, pid);
+                futures::pin_mut!(exited);
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    exited.as_mut().poll(cx)
+                })
+                .await;
+                polls
+            })
+            .await
+            .unwrap();
+            // The job yielded 16 times; the waiter was polled on registration and on exit.
+            assert!(polls <= 3, "polled {polls} times");
+            assert!(!process_exists(&table, pid));
+            // A new waiter on an ended process returns at once.
+            process_exited(&table, pid).await;
+            assert_eq!(u8::from(job.await.unwrap().unwrap().exit_code), 3);
         });
     }
 
