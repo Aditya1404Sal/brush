@@ -65,6 +65,13 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+
+    /// Identifies where the stream writes, shared by its clones (as `2>&1` makes), so
+    /// [`OpenFile::same_target`] can tell two descriptors write to one place. `None` when the
+    /// stream cannot say.
+    fn target_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Represents a file open in a shell context.
@@ -276,56 +283,93 @@ pub struct Captured {
     pub truncated: bool,
 }
 
+/// A write-only stream that keeps what is written to it in memory, up to a limit (see
+/// [`memory_sink`]).
+struct MemorySink(Arc<std::sync::Mutex<Captured>>, usize);
+
+impl std::io::Read for MemorySink {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+impl std::io::Write for MemorySink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut captured = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = self.1.saturating_sub(captured.bytes.len());
+        if room == 0 && !buf.is_empty() {
+            captured.truncated = true;
+            drop(captured);
+            #[cfg(target_arch = "wasm32")]
+            crate::execution::process::record_broken_pipe();
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        let count = buf.len().min(room);
+        captured.bytes.extend_from_slice(&buf[..count]);
+        drop(captured);
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stream for MemorySink {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        Box::new(Self(self.0.clone(), self.1))
+    }
+    fn target_id(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0).addr())
+    }
+    #[cfg(unix)]
+    fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+    #[cfg(unix)]
+    fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+}
+
 /// Creates a write-only stream that keeps what is written to it in memory, up to `limit` bytes,
 /// and the buffer it writes to. A write past the limit fails as a write to a closed pipe does.
 pub fn memory_sink(limit: usize) -> (OpenFile, Arc<std::sync::Mutex<Captured>>) {
-    struct Sink(Arc<std::sync::Mutex<Captured>>, usize);
-    impl std::io::Read for Sink {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::PermissionDenied.into())
-        }
-    }
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let mut captured = self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let room = self.1.saturating_sub(captured.bytes.len());
-            if room == 0 && !buf.is_empty() {
-                captured.truncated = true;
-                drop(captured);
-                #[cfg(target_arch = "wasm32")]
-                crate::execution::process::record_broken_pipe();
-                return Err(std::io::ErrorKind::BrokenPipe.into());
-            }
-            let count = buf.len().min(room);
-            captured.bytes.extend_from_slice(&buf[..count]);
-            drop(captured);
-            Ok(count)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl Stream for Sink {
-        fn clone_box(&self) -> Box<dyn Stream> {
-            Box::new(Self(self.0.clone(), self.1))
-        }
-        #[cfg(unix)]
-        fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
-            Err(error::ErrorKind::CannotConvertToNativeFd.into())
-        }
-        #[cfg(unix)]
-        fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
-            Err(error::ErrorKind::CannotConvertToNativeFd.into())
-        }
-    }
     let buffer = Arc::new(std::sync::Mutex::new(Captured::default()));
     (
-        OpenFile::Stream(Box::new(Sink(buffer.clone(), limit))),
+        OpenFile::Stream(Box::new(MemorySink(buffer.clone(), limit))),
         buffer,
     )
+}
+
+/// Whether `file` is a [`memory_sink`] writing to `buffer`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn is_memory_sink_of(file: &OpenFile, buffer: &Arc<std::sync::Mutex<Captured>>) -> bool {
+    matches!(file, OpenFile::Stream(stream) if stream
+        .as_any()
+        .and_then(|any| any.downcast_ref::<MemorySink>())
+        .is_some_and(|sink| Arc::ptr_eq(&sink.0, buffer)))
+}
+
+impl OpenFile {
+    /// Whether `self` and `other` write to the same place: clones of one open file, pipe end or
+    /// stream, as `2>&1` makes them.
+    pub fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Stdout(_), Self::Stdout(_)) | (Self::Stderr(_), Self::Stderr(_)) => true,
+            (Self::File(a), Self::File(b)) => Arc::ptr_eq(a, b),
+            (Self::PipeWriter(a), Self::PipeWriter(b)) => Arc::ptr_eq(a, b),
+            (Self::Stream(a), Self::Stream(b)) => {
+                a.target_id().is_some_and(|id| Some(id) == b.target_id())
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Clone for OpenFile {
@@ -836,6 +880,10 @@ mod mem_pipe {
             Some(self)
         }
 
+        fn target_id(&self) -> Option<usize> {
+            Some(Arc::as_ptr(&self.0).addr())
+        }
+
         fn clone_box(&self) -> Box<dyn super::Stream> {
             Box::new(self.clone())
         }
@@ -1164,6 +1212,21 @@ mod mem_pipe_tests {
 
     /// Bytes written are read back in order. With the writer still open, an empty read is an
     /// error, not end-of-stream; once the writer drops it is a clean EOF.
+    #[test]
+    fn descriptors_that_share_a_target_are_recognised() {
+        let (_, writer) = super::test_pipe(8);
+        let (_, other) = super::test_pipe(8);
+        assert!(writer.same_target(&writer.clone()));
+        assert!(!writer.same_target(&other));
+        let (sink, _) = super::memory_sink(64);
+        assert!(sink.same_target(&sink.clone()));
+        assert!(!sink.same_target(&writer));
+        let file = super::OpenFile::File(std::sync::Arc::new(tempfile::tempfile().unwrap()));
+        let second = super::OpenFile::File(std::sync::Arc::new(tempfile::tempfile().unwrap()));
+        assert!(file.same_target(&file.clone()));
+        assert!(!file.same_target(&second));
+    }
+
     #[test]
     fn round_trips_bytes_then_reports_eof_on_writer_drop() {
         let (mut reader, mut writer) = mem_pipe::pipe(mem_pipe::DEFAULT_CAPACITY);

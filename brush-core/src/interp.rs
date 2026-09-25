@@ -45,6 +45,13 @@ pub struct ExecutionParameters {
     pub suppress_errexit: bool,
     /// Embedder context, cloned into stages and substitutions rather than installed globally.
     context: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Whether the command these parameters are for reads a pipe or has its own redirection of
+    /// standard input; the commands inside it then keep that input when run in the background.
+    pub(crate) stdin_redirected: bool,
+    /// Whether a background command keeps standard input instead of reading /dev/null: the
+    /// subshell it runs in reads a pipe or redirected input, or a compound command around it
+    /// does (bash's `stdin_redir`).
+    pub(crate) async_stdin_kept: bool,
 }
 
 impl ExecutionParameters {
@@ -323,7 +330,7 @@ async fn execute_list(
 
             if run_async {
                 #[cfg(target_arch = "wasm32")]
-                if shell.jobs().running_count(shell.processes()) >= jobs::MAX_RUNNING_JOBS {
+                if !job_slot_available(shell).await {
                     writeln!(
                         params.stderr(shell),
                         "bash: fork: retry: Resource temporarily unavailable"
@@ -334,6 +341,10 @@ async fn execute_list(
                 }
                 let job = spawn_async_ao_list_in_task(ao_list, shell, params);
                 let job_formatted = job.to_pid_style_string();
+                let last_pid = job.representative_pid();
+                if let Some(pid) = last_pid {
+                    shell.set_last_background_pid(pid);
+                }
 
                 if shell.options().interactive && !shell.is_subshell() {
                     writeln!(params.stderr(shell), "{job_formatted}")?;
@@ -364,8 +375,8 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
 ) -> &'a jobs::Job {
     use crate::execution::process;
     let table = shell.processes().clone();
-    let command_line = ao_list.to_string();
-    let leader = table.allocate(shell.own_pid(), command_line.clone());
+    let command_line = jobs::job_text(ao_list);
+    let leader = table.allocate_job(shell.own_pid(), command_line.clone());
 
     let mut cloned_shell = shell.clone();
     let mut cloned_params = params.clone();
@@ -374,15 +385,18 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     cloned_shell.set_own_pid(leader);
     // Bash resets caught handlers in asynchronous subshells; ignored signals stay ignored.
     cloned_shell.traps_mut().reset_caught_for_subshell();
-    if let Ok(null) = openfiles::null() {
+    // Its input is /dev/null, unless a pipe or redirection around it provides one.
+    if !params.async_stdin_kept
+        && let Ok(null) = openfiles::null()
+    {
         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
     }
 
-    let mut dispositions = process::Dispositions::from_traps(cloned_shell.traps());
-    // Without job control, asynchronous commands ignore SIGINT.
-    dispositions.int = crate::traps::PipeDisposition::Ignored;
-    // Register now, so `kill $!` and `kill %1` reach the job before its task first runs.
-    let leader_process = process::NumberedProcess::register(&table, leader, dispositions);
+    let dispositions = process::Dispositions::from_traps(cloned_shell.traps());
+    // Register now, so `kill $!` and `kill %1` reach the job before its task first runs. Without
+    // job control, it ignores INT and QUIT once it runs.
+    let leader_process =
+        process::NumberedProcess::register(&table, leader, dispositions).in_background();
 
     // A single background pipeline reports one number per stage; `$!` is the last stage.
     let stage_processes: VecDeque<_> = if ao_list.additional.is_empty()
@@ -397,7 +411,9 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
             .iter()
             .map(|command| {
                 let pid = table.allocate(leader, command.to_string());
-                leader_process.register_child(pid, dispositions.for_exec())
+                leader_process
+                    .register_child(pid, dispositions.for_exec())
+                    .in_background()
             })
             .collect()
     } else {
@@ -410,48 +426,120 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     cloned_shell.set_stage_processes(stage_processes);
 
     // Bash forks once for `( list ) &`: the subshell is the job itself, so its traps are the job's.
-    let subshell_body = sole_subshell_body(ao_list).cloned();
-    let join_handle = spawn_command_task(shell.execution_services(), async move {
-        leader_process
-            .run(async move {
+    let subshell_body =
+        sole_subshell_body(ao_list).map(|(list, redirects)| (list.clone(), redirects.cloned()));
+    // The job outlives the subshell, stage or child shell that starts it, as an orphan does.
+    // The job is a subshell: it runs only an EXIT trap it sets itself, when it ends.
+    cloned_shell.traps_mut().reset_exit_for_subshell();
+    let join_handle = process::spawn_job(&shell.execution_services(), &table, async move {
+        let completed = std::cell::Cell::new(false);
+        let result = leader_process
+            .run(async {
                 let result = match subshell_body {
-                    Some(list) => match list.execute(&mut cloned_shell, &cloned_params).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let mut stderr = cloned_params.stderr(&cloned_shell);
-                            let _ = cloned_shell.display_error(&mut stderr, &error);
-                            error.into_result(&cloned_shell)
+                    Some((list, redirects)) => {
+                        // `( list ) >log &` is the same one process, its output redirected. Its
+                        // own background commands keep an input it redirects.
+                        let mut redirected = Ok(());
+                        if redirects
+                            .iter()
+                            .flat_map(|redirects| &redirects.0)
+                            .any(redirects_stdin)
+                        {
+                            cloned_params.async_stdin_kept = true;
                         }
-                    },
+                        for redirect in redirects.iter().flat_map(|redirects| &redirects.0) {
+                            redirected =
+                                setup_redirect(&mut cloned_shell, &mut cloned_params, redirect)
+                                    .await;
+                            if redirected.is_err() {
+                                break;
+                            }
+                        }
+                        let executed = match redirected {
+                            Ok(()) => list.execute(&mut cloned_shell, &cloned_params).await,
+                            Err(error) => Err(error),
+                        };
+                        match executed {
+                            Ok(result) => Ok(result),
+                            Err(error) => {
+                                let mut stderr = cloned_params.stderr(&cloned_shell);
+                                let _ = cloned_shell.display_error(&mut stderr, &error);
+                                Ok(error.into_result(&cloned_shell))
+                            }
+                        }
+                    }
                     None => {
                         cloned_ao_list
                             .execute(&mut cloned_shell, &cloned_params)
-                            .await?
+                            .await
                     }
                 };
+                let result = cloned_shell
+                    .exit_with_trap_in(result, &cloned_params)
+                    .await?;
+                completed.set(true);
                 // A job reports only its status: its `exit`, `break` or `return` must never
                 // act on the shell that later waits for it.
                 Ok(ExecutionResult::from(result.exit_code))
             })
-            .await
+            .await;
+        if !completed.get() {
+            cloned_shell
+                .exit_trap_after_signal(&result, &cloned_params)
+                .await;
+        }
+        result
     });
 
+    let stage_pids_len = stage_pids.len();
     let pids = if stage_pids.is_empty() {
         vec![leader]
     } else {
         stage_pids
+    };
+    if let Some(last) = pids.last() {
+        table.set_shown_pid(leader, *last);
+    }
+    let stages = if stage_pids_len > 1 {
+        jobs::stage_texts(&ao_list.first)
+    } else {
+        Vec::new()
     };
     shell.jobs_mut().add_as_current(jobs::Job::new_numbered(
         [jobs::JobTask::Internal(join_handle)],
         command_line,
         leader,
         pids,
+        stages,
     ))
 }
 
-/// The body of a background list that is exactly one plain `( list )`.
+/// Turns the jobs already started get to finish before the job cap refuses another one.
 #[cfg(target_arch = "wasm32")]
-const fn sole_subshell_body(ao_list: &ast::AndOrList) -> Option<&ast::CompoundList> {
+const JOB_SLOT_TURNS: usize = 64;
+
+/// Whether another background job may start: fewer than [`jobs::MAX_RUNNING_JOBS`] run in the
+/// whole session. Starting a job does not run it, so a tight `&` loop reaches the cap with jobs
+/// that have not had a turn yet; they get a few turns to finish before the cap refuses a job.
+#[cfg(target_arch = "wasm32")]
+async fn job_slot_available(shell: &Shell<impl extensions::ShellExtensions>) -> bool {
+    let services = shell.execution_services();
+    for _ in 0..JOB_SLOT_TURNS {
+        if shell.processes().running_jobs() < jobs::MAX_RUNNING_JOBS {
+            return true;
+        }
+        (services.yield_now)().await;
+    }
+    shell.processes().running_jobs() < jobs::MAX_RUNNING_JOBS
+}
+
+/// The body of a background list that is exactly one `( list )`, and its redirections. A
+/// redirection to an output process substitution runs only after its command, so a subshell
+/// with one keeps its own process.
+#[cfg(target_arch = "wasm32")]
+fn sole_subshell_body(
+    ao_list: &ast::AndOrList,
+) -> Option<(&ast::CompoundList, Option<&ast::RedirectList>)> {
     let pipeline = &ao_list.first;
     if !ao_list.additional.is_empty() || pipeline.bang || pipeline.timed.is_some() {
         return None;
@@ -460,9 +548,24 @@ const fn sole_subshell_body(ao_list: &ast::AndOrList) -> Option<&ast::CompoundLi
         [
             ast::Command::Compound(
                 ast::CompoundCommand::Subshell(ast::SubshellCommand { list, .. }),
-                None,
+                redirects,
             ),
-        ] => Some(list),
+        ] if redirects.as_ref().is_none_or(|redirects| {
+            !redirects.0.iter().any(|redirect| {
+                matches!(
+                    redirect,
+                    ast::IoRedirect::File(_, _, ast::IoFileRedirectTarget::ProcessSubstitution(..))
+                        | ast::IoRedirect::NamedFd(
+                            _,
+                            _,
+                            ast::IoFileRedirectTarget::ProcessSubstitution(..)
+                        )
+                )
+            })
+        }) =>
+        {
+            Some((list, redirects.as_ref()))
+        }
         _ => None,
     }
 }
@@ -494,7 +597,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
 
     shell.jobs_mut().add_as_current(jobs::Job::new(
         [jobs::JobTask::Internal(join_handle)],
-        ao_list.to_string(),
+        jobs::job_text(ao_list),
         jobs::JobState::Running,
     ))
 }
@@ -590,7 +693,16 @@ impl Execute for ast::Pipeline {
                 .await;
         #[cfg(target_arch = "wasm32")]
         spawned._stage_tasks.cancel_and_join().await;
-        let mut result = wait_result?;
+        let (mut result, last_signal) = wait_result?;
+        // A foreground command a signal ended is reported as bash reports it. Its signal is not
+        // reported again by the commands around it.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(signal) = last_signal {
+            report_signal_death(shell, &params, self, signal)?;
+            result.terminating_signal = None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = last_signal;
 
         // Invert the exit code if requested.
         if self.bang {
@@ -708,8 +820,10 @@ async fn spawn_pipeline_processes(
         let mut cmd_params = params.clone();
 
         // Install pipes.
+        cmd_params.stdin_redirected = false;
         if let Some(Some(reader)) = pipe_readers.pop() {
             cmd_params.open_files.set_fd(OpenFiles::STDIN_FD, reader);
+            cmd_params.stdin_redirected = true;
         }
         if let Some(Some(writer)) = pipe_writers.pop() {
             cmd_params.open_files.set_fd(OpenFiles::STDOUT_FD, writer);
@@ -721,12 +835,8 @@ async fn spawn_pipeline_processes(
         {
             if !run_in_current_shell {
                 let stage_process = shell.take_stage_process();
-                let mut stage_shell = shell.clone();
-                if let Some(stage_process) = &stage_process {
-                    stage_shell.set_own_pid(stage_process.pid());
-                }
                 let join_handle =
-                    spawn_pipeline_stage(stage_shell, command.clone(), cmd_params, stage_process);
+                    spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params, stage_process);
                 stage_tasks.0.push(join_handle.abort_handle());
                 spawn_results.push_back(ExecutionSpawnResult::StartedTask(join_handle));
                 continue;
@@ -818,6 +928,21 @@ impl Drop for StageTasks {
     }
 }
 
+/// Registers a new numbered process for `subshell`, a copy of the shell about to run as a
+/// subshell, and makes it the subshell's `$BASHPID`. It inherits the running process's
+/// dispositions (caught handlers reset) and the subshell's own PIPE disposition.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn subshell_process(
+    subshell: &mut Shell<impl extensions::ShellExtensions>,
+) -> crate::execution::process::NumberedProcess {
+    use crate::execution::process;
+    let table = subshell.processes().clone();
+    let pid = table.allocate(subshell.own_pid(), String::new());
+    subshell.set_own_pid(pid);
+    let dispositions = process::inherited_dispositions(subshell.traps().pipe_disposition());
+    process::NumberedProcess::register(&table, pid, dispositions)
+}
+
 /// Runs one pipeline stage as its own task on `wasm32`, in a copy of the shell (as a subshell).
 ///
 /// Stages share one thread and hand control to each other at the yield points in the in-memory
@@ -831,39 +956,92 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     params: ExecutionParameters,
     numbered: Option<crate::execution::process::NumberedProcess>,
 ) -> crate::execution::CommandTask {
-    use crate::execution::process;
     let services = shell.execution_services();
     shell.traps_mut().reset_pipe_for_subshell();
-    let disposition = shell.traps().pipe_disposition();
+    // A stage is a subshell: it runs only an EXIT trap it sets itself, when it ends.
+    shell.traps_mut().reset_exit_for_subshell();
+    // It is a process of its own, with its own `$BASHPID`: a background pipeline registered its
+    // stages already.
+    let numbered = match numbered {
+        Some(numbered) => {
+            shell.set_own_pid(numbered.pid());
+            numbered
+        }
+        None => subshell_process(&mut shell),
+    };
     services.spawn(async move {
-        let body = async move {
+        let completed = std::cell::Cell::new(false);
+        let body = async {
             let context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut shell),
                 process_group_id: None,
             };
-            match command
-                .execute_in_pipeline(context, params)
-                .await?
-                .wait()
-                .await?
-            {
-                ExecutionWaitResult::Completed(result) => Ok(result),
-                ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
-            }
+            let result = match command.execute_in_pipeline(context, params.clone()).await {
+                Ok(spawned) => match spawned.wait().await {
+                    Ok(ExecutionWaitResult::Completed(result)) => Ok(result),
+                    Ok(ExecutionWaitResult::Stopped(_)) => Ok(ExecutionResult::stopped()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let result = shell.exit_with_trap_in(result, &params).await;
+            completed.set(true);
+            // A stage is a subshell: its `exit`, `break` or `return` ends only the stage.
+            result.map(|result| ExecutionResult {
+                terminating_signal: result.terminating_signal,
+                ..ExecutionResult::from(result.exit_code)
+            })
         };
-        match numbered {
-            Some(numbered) => numbered.run(body).await,
-            None => process::run_process(disposition, body).await,
+        let result = numbered.run(body).await;
+        if !completed.get() {
+            shell.exit_trap_after_signal(&result, &params).await;
         }
+        result
     })
 }
 
+/// Reports a foreground command that `signal` ended, as bash does: TERM with its description
+/// and the command, other signals (but INT and PIPE) with the line and the process number too,
+/// unless the shell traps them.
+#[cfg(target_arch = "wasm32")]
+fn report_signal_death(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    pipeline: &ast::Pipeline,
+    signal: u8,
+) -> Result<(), error::Error> {
+    use crate::execution::process::signals;
+    if matches!(signal, signals::INT | signals::PIPE) {
+        return Ok(());
+    }
+    let description = traps::signal_description(signal);
+    let text = jobs::pipeline_text(pipeline);
+    if signal == signals::TERM {
+        writeln!(params.stderr(shell), "{description:<27}{text}")?;
+    } else if !traps::TrapSignal::try_from(i32::from(signal))
+        .is_ok_and(|trapped| shell.traps().handles(trapped))
+    {
+        let pid = shell
+            .processes()
+            .last_signaled_child(shell.own_pid())
+            .map_or_else(String::new, |pid| pid.to_string());
+        let prefix = shell.diagnostic_prefix();
+        writeln!(
+            params.stderr(shell),
+            "{prefix}{pid:>5} {description:<27}{text}"
+        )?;
+    }
+    Ok(())
+}
+
+/// Waits for a pipeline's processes and records their statuses. Also returns the signal that
+/// ended the last one, if one did.
 async fn wait_for_pipeline_processes_and_update_status(
     pipeline: &ast::Pipeline,
     mut process_spawn_results: VecDeque<ExecutionSpawnResult>,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
-) -> Result<ExecutionResult, error::Error> {
+) -> Result<(ExecutionResult, Option<u8>), error::Error> {
     let mut result = ExecutionResult::success();
     let mut stopped_children = vec![];
     let mut last_failure_exit_code: Option<(ExecutionExitCode, Option<u8>)> = None;
@@ -903,6 +1081,8 @@ async fn wait_for_pipeline_processes_and_update_status(
         }
     }
 
+    let last_signal = result.terminating_signal;
+
     // Apply pipefail semantics if enabled
     if shell.options().return_last_failure_from_pipeline {
         if let Some((failure_exit_code, terminating_signal)) = last_failure_exit_code {
@@ -930,7 +1110,7 @@ async fn wait_for_pipeline_processes_and_update_status(
         writeln!(params.stderr(shell), "\r{formatted}")?;
     }
 
-    Ok(result)
+    Ok((result, last_signal))
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -960,6 +1140,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                     for redirect in &redirects.0 {
                         setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await?;
                     }
+                    if redirects.0.iter().any(redirects_stdin) {
+                        params.stdin_redirected = true;
+                    }
                 }
 
                 let result = compound.execute(&mut pipeline_context.shell, &params).await;
@@ -988,11 +1171,37 @@ impl Execute for ast::CompoundCommand {
         shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
+        // As in bash, a background command reads /dev/null, unless the subshell it runs in, or a
+        // compound command around it, reads a pipe or redirects standard input.
+        let stdin_redirected = params.stdin_redirected;
+        let inner_params;
+        let params = if stdin_redirected {
+            inner_params = ExecutionParameters {
+                stdin_redirected: false,
+                async_stdin_kept: true,
+                ..params.clone()
+            };
+            &inner_params
+        } else {
+            params
+        };
         match self {
             Self::BraceGroup(ast::BraceGroupCommand { list, .. }) => {
                 list.execute(shell, params).await
             }
             Self::Subshell(ast::SubshellCommand { list, .. }) => {
+                // A new subshell keeps input for background commands only if it reads a pipe or
+                // redirected input itself.
+                let subshell_params;
+                let params = if params.async_stdin_kept == stdin_redirected {
+                    params
+                } else {
+                    subshell_params = ExecutionParameters {
+                        async_stdin_kept: stdin_redirected,
+                        ..params.clone()
+                    };
+                    &subshell_params
+                };
                 // Clone off a new subshell, and run the body of the subshell there.
                 // TODO(source-info): Do we need to reset the line number?
                 let mut subshell = shell.clone();
@@ -1004,19 +1213,30 @@ impl Execute for ast::CompoundCommand {
                 subshell.loop_depth = 0;
                 // Nor does it list the jobs around it, as a pipeline stage does.
                 subshell.jobs_mut().jobs.clear();
+                // It is a process of its own, with its own `$BASHPID`.
                 #[cfg(target_arch = "wasm32")]
-                let disposition = subshell.traps().pipe_disposition();
+                let numbered_subshell = subshell_process(&mut subshell);
+                #[cfg(target_arch = "wasm32")]
+                let completed = std::cell::Cell::new(false);
                 let body = async {
                     let result = list.execute(&mut subshell, params).await;
-                    subshell.exit_with_trap(result).await
+                    let result = subshell.exit_with_trap_in(result, params).await;
+                    #[cfg(target_arch = "wasm32")]
+                    completed.set(true);
+                    result
                 };
 
                 // Handle errors within the subshell context to prevent fatal errors
                 // from propagating to the parent shell.
                 #[cfg(target_arch = "wasm32")]
-                let execution = crate::execution::process::run_process(disposition, body).await;
+                let execution = numbered_subshell.run(body).await;
                 #[cfg(not(target_arch = "wasm32"))]
                 let execution = body.await;
+                // A signal ended the subshell before its commands finished.
+                #[cfg(target_arch = "wasm32")]
+                if !completed.get() {
+                    subshell.exit_trap_after_signal(&execution, params).await;
+                }
                 let subshell_result = match execution {
                     Ok(result) => result,
                     Err(error) => {
@@ -1030,7 +1250,15 @@ impl Execute for ast::CompoundCommand {
                 };
 
                 // Preserve the subshell's exit code, but don't honor any of its requests to exit
-                // the shell, break out of loops, etc.
+                // the shell, break out of loops, etc. A signal that ended it is reported by the
+                // pipeline it belongs to.
+                #[cfg(target_arch = "wasm32")]
+                if !completed.get() {
+                    return Ok(ExecutionResult {
+                        terminating_signal: subshell_result.terminating_signal,
+                        ..ExecutionResult::from(subshell_result.exit_code)
+                    });
+                }
                 Ok(ExecutionResult::from(subshell_result.exit_code))
             }
             Self::ForClause(f) => f.execute(shell, params).await,
@@ -1858,6 +2086,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 Ok(spawned) if !pending.is_empty() => {
                     // The command must finish writing before the substitutions read it.
                     let completed = ExecutionResult::from(spawned.wait().await?);
+                    start_persistent_output_substitutions(parent_shell, &pending);
                     run_pending_output_substitutions(parent_shell, &pending).await;
                     Ok(completed.into())
                 }
@@ -2607,6 +2836,19 @@ fn setup_redirect_output_and_error_to(
     Ok(())
 }
 
+/// Whether `redirect` redirects standard input.
+pub(crate) fn redirects_stdin(redirect: &ast::IoRedirect) -> bool {
+    match redirect {
+        ast::IoRedirect::File(fd, kind, _) => {
+            fd.unwrap_or_else(|| get_default_fd_for_redirect_kind(kind)) == OpenFiles::STDIN_FD
+        }
+        ast::IoRedirect::HereDocument(fd, _) | ast::IoRedirect::HereString(fd, _) => {
+            fd.unwrap_or(OpenFiles::STDIN_FD) == OpenFiles::STDIN_FD
+        }
+        ast::IoRedirect::OutputAndError(..) | ast::IoRedirect::NamedFd(..) => false,
+    }
+}
+
 const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> ShellFd {
     match kind {
         ast::IoFileRedirectKind::Read => 0,
@@ -2689,6 +2931,26 @@ async fn setup_process_substitution(
     // writes and runs, with that as its input, once the command has finished.
     let mut child_params = params.clone();
     child_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+    // The list's standard descriptors are the command's as they are now, even if the command
+    // (`exec`) then changes the shell's.
+    for fd in [
+        OpenFiles::STDIN_FD,
+        OpenFiles::STDOUT_FD,
+        OpenFiles::STDERR_FD,
+    ] {
+        if matches!(
+            child_params.open_files.fd_entry(fd),
+            openfiles::OpenFileEntry::NotSpecified
+        ) && let Some(file) = params.try_fd(shell, fd)
+        {
+            child_params.open_files.set_fd(fd, file);
+        }
+    }
+    // As bash does, count down from 63 for a free descriptor.
+    let fd = (1..=63)
+        .rev()
+        .find(|fd| !params.open_files.contains_fd(*fd))
+        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
     let target_file = match kind {
         ast::ProcessSubstitutionKind::Read => {
             let (sink, output) = openfiles::memory_sink(openfiles::MAX_SUBSTITUTION_BYTES);
@@ -2707,16 +2969,11 @@ async fn setup_process_substitution(
                 list: subshell_cmd.list.clone(),
                 params: child_params,
                 input,
+                fd,
             });
             sink
         }
     };
-
-    // As bash does, count down from 63 for a free descriptor.
-    let fd = (1..=63)
-        .rev()
-        .find(|fd| !params.open_files.contains_fd(*fd))
-        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
     Ok((fd, target_file))
 }
 
@@ -2736,6 +2993,8 @@ pub(crate) struct PendingOutputSubstitution {
     list: ast::CompoundList,
     params: ExecutionParameters,
     input: std::sync::Arc<std::sync::Mutex<openfiles::Captured>>,
+    /// The descriptor the command sees it as (`/dev/fd/63`).
+    fd: ShellFd,
 }
 
 /// The output substitutions one command has set up, shared by the clones of its parameters.
@@ -2761,6 +3020,22 @@ impl PendingOutputSubstitutions {
             .is_empty()
     }
 
+    /// Takes out the substitutions `keep` selects.
+    fn take_where(
+        &self,
+        mut keep: impl FnMut(&PendingOutputSubstitution) -> bool,
+    ) -> Vec<PendingOutputSubstitution> {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (taken, left) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|s| keep(s));
+        *pending = left;
+        taken
+    }
+
     fn take(&self) -> Vec<PendingOutputSubstitution> {
         std::mem::take(
             &mut *self
@@ -2778,6 +3053,72 @@ impl ExecutionParameters {
     fn own_output_substitutions(&mut self) -> PendingOutputSubstitutions {
         self.output_substitutions = PendingOutputSubstitutions::default();
         self.output_substitutions.clone()
+    }
+}
+
+/// `exec` made these substitutions' sinks descriptors of the shell itself: what writes to them
+/// is the rest of the shell. Each such list starts now, as a process alongside the shell reading
+/// through a pipe what is written, as bash's does, and ends once every descriptor writing to it
+/// is closed. Like a background job, it runs in the session's job scope.
+#[cfg(target_arch = "wasm32")]
+fn start_persistent_output_substitutions(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    pending: &PendingOutputSubstitutions,
+) {
+    use crate::execution::process;
+    let held = |shell: &Shell<_>, substitution: &PendingOutputSubstitution| {
+        shell
+            .open_files()
+            .iter_fds()
+            .any(|(_, file)| openfiles::is_memory_sink_of(file, &substitution.input))
+    };
+    for substitution in pending.take_where(|substitution| held(shell, substitution)) {
+        let (reader, writer) = openfiles::open_mem_pipe();
+        let fds: Vec<ShellFd> = shell
+            .open_files()
+            .iter_fds()
+            .filter(|(_, file)| openfiles::is_memory_sink_of(file, &substitution.input))
+            .map(|(fd, _)| fd)
+            .collect();
+        // The list's own shell must not hold the pipe it reads, or its input never ends.
+        let mut subshell = shell.clone();
+        for fd in &fds {
+            subshell.open_files_mut().remove_fd(*fd);
+        }
+        for fd in fds {
+            // The descriptor the substitution was opened on closes with the command, as in bash.
+            if fd == substitution.fd {
+                shell.open_files_mut().remove_fd(fd);
+            } else {
+                shell.open_files_mut().set_fd(fd, writer.clone());
+            }
+        }
+        drop(writer);
+        let mut params = substitution.params;
+        params.open_files.set_fd(OpenFiles::STDIN_FD, reader);
+        let table = shell.processes().clone();
+        let pid = table.allocate_substitution(shell.own_pid(), format!(">({})", substitution.list));
+        shell.set_last_background_pid(pid);
+        let dispositions = process::Dispositions::from_traps(shell.traps()).for_exec();
+        let numbered =
+            process::NumberedProcess::register(&table, pid, dispositions).in_background();
+        subshell.set_own_pid(pid);
+        subshell.traps_mut().reset_pipe_for_subshell();
+        subshell.traps_mut().reset_exit_for_subshell();
+        subshell.loop_depth = 0;
+        let list = substitution.list;
+        drop(process::spawn_job(
+            &shell.execution_services(),
+            &table,
+            async move {
+                numbered
+                    .run(async {
+                        let result = list.execute(&mut subshell, &params).await;
+                        subshell.exit_with_trap_in(result, &params).await
+                    })
+                    .await
+            },
+        ));
     }
 }
 
