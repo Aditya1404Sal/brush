@@ -2298,6 +2298,19 @@ async fn apply_assignment_unchecked(
             name
         }
     };
+    // Assigning through a circular nameref fails, as a readonly variable does in bash.
+    if shell.env().is_circular_nameref(variable_name) {
+        writeln!(
+            params.stderr(shell),
+            "{}warning: {variable_name}: circular name reference",
+            shell.diagnostic_prefix()
+        )?;
+        return Err(error::Error::from(error::ErrorKind::ReadonlyVariableNamed(
+            variable_name.clone(),
+        ))
+        .into_reported());
+    }
+
     // Assigning through a nameref assigns to the variable it names, and a nameref to an array
     // element (`declare -n ref='arr[1]'`) to that element, just as `arr[1]=value` would.
     let mut resolved_name = shell

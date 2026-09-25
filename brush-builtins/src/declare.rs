@@ -323,6 +323,24 @@ impl DeclareCommand {
             return Ok(false);
         }
 
+        // A nameref to itself is refused at the top level; in a function bash only warns.
+        if self.make_nameref.to_bool() == Some(true)
+            && matches!(&initial_value, Some(ShellValueLiteral::Scalar(target)) if *target == name)
+        {
+            if !create_var_local {
+                context.report(format_args!(
+                    "{name}: nameref variable self references not allowed"
+                ))?;
+                return Ok(false);
+            }
+            context.report(format_args!("warning: {name}: circular name reference"))?;
+            writeln!(
+                context.stderr(),
+                "{}warning: {name}: circular name reference",
+                context.shell.diagnostic_prefix()
+            )?;
+        }
+
         // Figure out where we should look.
         let lookup = if create_var_local {
             EnvironmentLookup::OnlyInCurrentLocal

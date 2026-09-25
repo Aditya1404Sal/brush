@@ -284,6 +284,36 @@ impl ShellEnvironment {
         resolved
     }
 
+    /// Whether following the nameref `name` comes back to a nameref already followed
+    /// (`declare -n a=b b=a`), which bash reports as a circular name reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to resolve.
+    pub fn is_circular_nameref(&self, name: &str) -> bool {
+        let mut seen: Vec<&str> = vec![];
+        let mut current = name;
+        loop {
+            let Some((_, var)) = self.get_raw(current) else {
+                return false;
+            };
+            if !var.is_treated_as_nameref() {
+                return false;
+            }
+            let ShellValue::String(target) = var.value() else {
+                return false;
+            };
+            if target.is_empty() || target == current {
+                return false;
+            }
+            seen.push(current);
+            if seen.contains(&target.as_str()) {
+                return true;
+            }
+            current = target;
+        }
+    }
+
     /// The array element a nameref names (`declare -n ref='arr[1]'`), as the array's name and the
     /// subscript as written, or `None` when `name` does not resolve to an element.
     ///

@@ -2062,6 +2062,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::Parameter::Named(n) => {
                 if !env::valid_variable_name(n.as_str()) {
                     Err(error::ErrorKind::BadSubstitution(n.clone()).into())
+                } else if self.shell.env().is_circular_nameref(n) {
+                    // Bash warns and expands nothing.
+                    let _ = writeln!(
+                        self.params.stderr(self.shell),
+                        "{}warning: {n}: circular name reference",
+                        self.shell.diagnostic_prefix()
+                    );
+                    self.undefined_expansion(parameter, allow_unset_vars)
                 } else if let Some((_, var)) = self.shell.env().get(n) {
                     if matches!(var.value(), ShellValue::Unset(_)) {
                         self.undefined_expansion(parameter, allow_unset_vars)
