@@ -2196,6 +2196,16 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 };
                 Ok(Expansion::from(ExpansionPiece::Splittable(value)))
             }
+            brush_parser::word::ParameterExpr::BadSubstitution { text, .. }
+                if text.starts_with('`') =>
+            {
+                // Bash quotes the rest of the here-document from the backquote; it fails only the
+                // command whose here-document it is.
+                Err(error::ErrorKind::BadSubstitution(format!(
+                    "bad substitution: no closing \"`\" in {text}"
+                ))
+                .into())
+            }
             brush_parser::word::ParameterExpr::BadSubstitution { text, transform } => {
                 // As in bash, this ends a non-interactive shell; a transformation that does not
                 // exist ends `bash -c` with 127, as an unset variable does. The diagnostic

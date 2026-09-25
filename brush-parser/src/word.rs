@@ -456,9 +456,10 @@ pub enum ParameterExpr {
         /// Whether the value is `REPLY` (`${| ...; }`) rather than the output.
         reply: bool,
     },
-    /// A `${...}` that is not a valid expansion, which is an error when the word is expanded.
+    /// A `${...}` that is not a valid expansion, or a backquote left open in a here-document,
+    /// which is an error when the word is expanded.
     BadSubstitution {
-        /// The text, from `${` through `}`.
+        /// The text, from `${` through `}`, or from the backquote through the end of the body.
         text: String,
         /// Whether it is a parameter followed by a `@` transformation that does not exist.
         transform: bool,
@@ -1131,7 +1132,14 @@ peg::parser! {
             command_substitution() /
             parameter_expansion() /
             heredoc_escape_sequence() /
-            heredoc_literal_text()
+            heredoc_literal_text() /
+            // A backquote left open is an error when the body is expanded, as in bash.
+            "`" rest:$([_]*) {
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution {
+                    text: std::format!("`{rest}"),
+                    transform: false,
+                })
+            }
 
         rule heredoc_escape_sequence() -> WordPiece =
             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }

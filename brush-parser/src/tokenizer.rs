@@ -134,12 +134,31 @@ pub enum TokenizerError {
     MissingHereTag(String),
 
     /// An unterminated here document sequence was encountered at the end of the input stream.
-    #[error("unterminated here document sequence; tag(s) [{0}] found at: [{1}]")]
-    UnterminatedHereDocuments(String, String),
+    #[error(
+        "unterminated here document sequence; tag(s) [{}] found at: [{}]",
+        .0.iter().map(|d| d.tag.as_str()).collect::<Vec<_>>().join(", "),
+        .0.iter().map(|d| d.position.to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    UnterminatedHereDocuments(Vec<UnterminatedHereDocument>),
 
     /// An I/O error occurred while reading from the input stream.
     #[error("failed to read input")]
     ReadError(#[from] std::io::Error),
+}
+
+/// A here-document that the input ended in before its delimiter.
+#[derive(Clone, Debug)]
+pub struct UnterminatedHereDocument {
+    /// Its tag, as written (`'EOF'`).
+    pub tag: String,
+    /// The delimiter it wants: its tag without quoting.
+    pub delimiter: String,
+    /// Where its tag is.
+    pub position: SourcePosition,
+    /// The line read last before its body began, which bash names in its warning: the line
+    /// that ends its command for the first here-document there, otherwise the line the previous
+    /// here-document ended on, or the last line when the input ended first.
+    pub line: usize,
 }
 
 impl TokenizerError {
@@ -223,6 +242,8 @@ struct CrossTokenParseState {
     command_position: bool,
     /// How many nested constructs (`$(...)`, `${...}` and the like) are being tokenized.
     nested_constructs: u32,
+    /// The line read last before the body of the here-document being read began.
+    here_body_after_line: usize,
     /// Are we in the parentheses of a compound array assignment (`a=(...)`)?
     compound_assignment: bool,
 }
@@ -418,6 +439,8 @@ impl TokenParseState {
             HereState::NextLineIsHereDoc => {
                 if self.is_newline() {
                     cross_token_state.here_state = HereState::InHereDocs;
+                    cross_token_state.here_body_after_line =
+                        last_line_read(&cross_token_state.cursor);
                 } else {
                     cross_token_state.here_state = HereState::NextLineIsHereDoc;
                 }
@@ -479,6 +502,8 @@ impl TokenParseState {
                     cross_token_state.here_state = HereState::None;
                 } else {
                     cross_token_state.here_state = HereState::InHereDocs;
+                    cross_token_state.here_body_after_line =
+                        last_line_read(&cross_token_state.cursor);
                 }
 
                 return Ok(None);
@@ -579,6 +604,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 arithmetic_expansion: false,
                 command_position: true,
                 nested_constructs: 0,
+                here_body_after_line: 0,
                 compound_assignment: false,
             },
         }
@@ -857,24 +883,46 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                         continue;
                     }
 
-                    let tag_names = self
+                    // The input can end on a here-document's tag (`cat <<EOF`).
+                    if matches!(
+                        self.cross_state.here_state,
+                        HereState::CurrentTokenIsHereTag { .. }
+                    ) && state.started_token()
+                    {
+                        state.delimit_current_token(
+                            TokenEndReason::EndOfInput,
+                            &mut self.cross_state,
+                        )?;
+                    }
+
+                    // The body being read began after `here_body_after_line`; any other starts
+                    // at the end of the input.
+                    let last_line = last_line_read(&self.cross_state.cursor);
+                    let reading_body = matches!(self.cross_state.here_state, HereState::InHereDocs);
+                    let documents = self
                         .cross_state
                         .current_here_tags
                         .iter()
-                        .map(|tag| tag.tag.trim())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let tag_positions = self
-                        .cross_state
-                        .current_here_tags
-                        .iter()
-                        .map(|tag| std::format!("{}", tag.position))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(TokenizerError::UnterminatedHereDocuments(
-                        tag_names,
-                        tag_positions,
-                    ));
+                        .enumerate()
+                        .map(|(i, tag)| {
+                            let tag_text = tag.tag.trim();
+                            UnterminatedHereDocument {
+                                tag: tag_text.to_owned(),
+                                delimiter: if tag.tag_was_escaped_or_quoted {
+                                    unquote_str(tag_text)
+                                } else {
+                                    tag_text.to_owned()
+                                },
+                                position: tag.position.clone(),
+                                line: if i == 0 && reading_body {
+                                    self.cross_state.here_body_after_line
+                                } else {
+                                    last_line
+                                },
+                            }
+                        })
+                        .collect();
+                    return Err(TokenizerError::UnterminatedHereDocuments(documents));
                 }
 
                 result = state
@@ -1624,6 +1672,16 @@ impl CaseTracker {
 }
 
 /// Whether `s` is a valid variable name.
+/// The line of the last character read, given the position after it: the line before when that
+/// character was a newline.
+const fn last_line_read(cursor: &SourcePosition) -> usize {
+    if cursor.column == 1 && cursor.line > 1 {
+        cursor.line - 1
+    } else {
+        cursor.line
+    }
+}
+
 fn is_valid_name(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -1995,6 +2053,32 @@ echo after
             ["cat", "<<", "${x}", "body\n", "${x}", "\n"]
         );
         Ok(())
+    }
+
+    #[test]
+    fn tokenize_unterminated_here_documents() {
+        let open = |input: &str| -> Vec<(String, String, usize)> {
+            match tokenize_str(input) {
+                Err(TokenizerError::UnterminatedHereDocuments(documents)) => documents
+                    .into_iter()
+                    .map(|d| (d.tag, d.delimiter, d.line))
+                    .collect(),
+                other => panic!("{input:?}: {other:?}"),
+            }
+        };
+        let doc = |tag: &str, delimiter: &str, line| (tag.to_owned(), delimiter.to_owned(), line);
+        // Bash names the line read last before each body began.
+        assert_eq!(
+            open("cat <<\"A, B\" <<'C'\nhello\n"),
+            [doc("\"A, B\"", "A, B", 1), doc("'C'", "C", 2)]
+        );
+        assert_eq!(
+            open("echo\ncat <<A <<B <<C\na\nA\nb"),
+            [doc("B", "B", 4), doc("C", "C", 5)]
+        );
+        assert_eq!(open("cat <<A; x=$(\necho)\nb"), [doc("A", "A", 2)]);
+        // The input can end on the tag itself.
+        assert_eq!(open("echo a; cat <<A"), [doc("A", "A", 1)]);
     }
 
     #[test]
