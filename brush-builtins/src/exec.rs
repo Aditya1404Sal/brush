@@ -73,13 +73,37 @@ impl builtins::Command for ExecCommand {
                 command_and_args: self.args.clone(),
                 ..Default::default()
             };
+            // Bash's own wording for a target `exec` cannot find ("NAME: not found") differs
+            // from the generic "command not found" the `command` builtin below produces for an
+            // ordinary lookup failure. And unlike an ordinary command, a failed `exec` always
+            // ends a non-interactive shell: there is no process image left for the rest of the
+            // script to run in, exactly as there would be none after a successful one.
+            let diagnostic_prefix = context.shell.diagnostic_prefix();
+            let mut stderr = context.params.stderr(context.shell);
             let shell = context.shell;
             let inner = brush_core::ExecutionContext {
                 shell: &mut *shell,
                 command_name: context.command_name,
                 params: context.params,
             };
-            let mut result = command.execute(inner).await?;
+            let mut result = match command.execute(inner).await {
+                Ok(result) => result,
+                Err(error) => {
+                    use std::io::Write as _;
+                    let (message, exit_code) = match error.kind() {
+                        brush_core::ErrorKind::CommandNotFound(name) => (
+                            std::format!("{name}: not found"),
+                            brush_core::ExecutionExitCode::NotFound,
+                        ),
+                        _ => (
+                            error.to_string(),
+                            brush_core::ExecutionExitCode::from(&error),
+                        ),
+                    };
+                    let _ = writeln!(stderr, "{diagnostic_prefix}exec: {message}");
+                    brush_core::ExecutionResult::new(exit_code.into())
+                }
+            };
             shell
                 .traps_mut()
                 .remove_handlers(brush_core::traps::TrapSignal::Exit);
