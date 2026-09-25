@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::io::Write;
 
-use brush_core::{ExecutionResult, builtins, error, jobs};
+use brush_core::{ExecutionResult, builtins, jobs};
 
 /// Manage jobs.
 #[derive(Parser)]
@@ -39,76 +39,93 @@ impl builtins::Command for JobsCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         // As bash does, notice the jobs that have finished: they are listed once, as Done.
-        let finished = context.shell.jobs_mut().poll()?;
-        let mut listed: Vec<&jobs::Job> = context
+        let mut finished = context.shell.jobs_mut().poll()?;
+        let mut result = ExecutionResult::success();
+
+        // The jobs to list: those the specs name, or all of them.
+        let mut selected: Option<Vec<u64>> = None;
+        if !self.job_specs.is_empty() {
+            let mut serials = Vec::new();
+            for spec in &self.job_specs {
+                let found = finished
+                    .iter()
+                    .find(|(job, _)| spec_matches(job, spec))
+                    .map(|(job, _)| job.serial)
+                    .or_else(|| {
+                        context
+                            .shell
+                            .jobs_mut()
+                            .find_job_spec(spec)
+                            .ok()
+                            .map(|job| job.serial)
+                    });
+                match found {
+                    Some(serial) => serials.push(serial),
+                    None => {
+                        context.report(format_args!("{spec}: no such job"))?;
+                        result = ExecutionResult::general_error();
+                    }
+                }
+            }
+            selected = Some(serials);
+        }
+
+        let mut listed: Vec<&mut jobs::Job> = context
             .shell
-            .jobs()
+            .jobs_mut()
             .jobs
-            .iter()
-            .chain(finished.iter().map(|(job, _)| job))
+            .iter_mut()
+            .chain(finished.iter_mut().map(|(job, _)| job))
+            .filter(|job| {
+                selected
+                    .as_ref()
+                    .is_none_or(|serials| serials.contains(&job.serial))
+            })
             .collect();
         listed.sort_by_key(|job| job.id);
 
-        if self.also_show_pids {
-            #[cfg(target_arch = "wasm32")]
-            {
-                // As bash lays it out: `[N]+  1234 Running                    cmd &`.
-                for job in &listed {
-                    let pid = job
-                        .pids()
-                        .first()
-                        .map_or_else(String::new, ToString::to_string);
-                    writeln!(
-                        context.stdout(),
-                        "[{}]{} {pid:>5} {:<27}{}",
-                        job.id,
-                        job.annotation(),
-                        job.state.to_string(),
-                        job.display_command()
-                    )?;
+        let mut out = String::new();
+        for job in listed {
+            if self.running_jobs_only && !matches!(job.state, jobs::JobState::Running) {
+                continue;
+            }
+            if self.stopped_jobs_only && !matches!(job.state, jobs::JobState::Stopped) {
+                continue;
+            }
+            if self.list_changed_only && !job.changed_since_listed() {
+                continue;
+            }
+            job.mark_listed();
+            if self.show_pids_only {
+                // A pipeline's first process leads its group.
+                if let Some(pid) = job
+                    .pids()
+                    .first()
+                    .copied()
+                    .or_else(|| job.representative_pid())
+                {
+                    out.push_str(&format!("{pid}\n"));
                 }
-                return Ok(ExecutionResult::success());
+            } else if self.also_show_pids {
+                #[cfg(target_arch = "wasm32")]
+                for line in job.long_lines() {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                return brush_core::error::unimp("jobs -l");
+            } else {
+                out.push_str(&format!("{job}\n"));
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            return error::unimp("jobs -l");
         }
-        if self.list_changed_only {
-            return error::unimp("jobs -n");
-        }
-
-        if self.job_specs.is_empty() {
-            for job in listed {
-                self.display_job(&context, job)?;
-            }
-        } else {
-            return error::unimp("jobs with job specs");
-        }
-
-        Ok(ExecutionResult::success())
+        context.stdout().write_all(out.as_bytes())?;
+        Ok(result)
     }
 }
 
-impl JobsCommand {
-    fn display_job(
-        &self,
-        context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
-        job: &jobs::Job,
-    ) -> Result<(), brush_core::Error> {
-        if self.running_jobs_only && !matches!(job.state, jobs::JobState::Running) {
-            return Ok(());
-        }
-        if self.stopped_jobs_only && !matches!(job.state, jobs::JobState::Stopped) {
-            return Ok(());
-        }
-
-        if self.show_pids_only {
-            if let Some(pid) = job.representative_pid() {
-                writeln!(context.stdout(), "{pid}")?;
-            }
-        } else {
-            writeln!(context.stdout(), "{job}")?;
-        }
-
-        Ok(())
-    }
+/// Whether a job the table just dropped as finished is the one `spec` names by number.
+fn spec_matches(job: &jobs::Job, spec: &str) -> bool {
+    spec.strip_prefix('%')
+        .and_then(|id| id.parse::<usize>().ok())
+        .is_some_and(|id| id == job.id)
 }

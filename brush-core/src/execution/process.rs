@@ -184,6 +184,8 @@ pub(super) struct ProcessState {
     /// A background job's process, which starts ignoring INT and QUIT once it runs.
     background: Cell<bool>,
     started: Cell<bool>,
+    /// Whether its body is being polled now, so processes nested in it run inside that poll.
+    polling: Cell<bool>,
     pending: RefCell<Vec<u8>>,
     handling: Cell<bool>,
     waker: RefCell<Option<Waker>>,
@@ -202,6 +204,7 @@ impl ProcessState {
             stopped: Cell::new(false),
             background: Cell::new(false),
             started: Cell::new(false),
+            polling: Cell::new(false),
             pending: RefCell::new(Vec::new()),
             handling: Cell::new(false),
             waker: RefCell::new(None),
@@ -417,6 +420,7 @@ impl<F: Future<Output = Result<ExecutionResult, Error>>> Future for ProcessFutur
         }
         let _process = install(Some(self.state.clone()));
         let _tasks = super::RestoreScope(super::CURRENT_SCOPE.replace(Some(self.tasks.clone())));
+        let _polling = Polling::enter(&self.state);
         let result = self.body.as_mut().poll(cx);
         // A failed write or a delivered signal can happen in the very poll that completes the body.
         if let Some(signal) = self.state.terminated.get() {
@@ -424,6 +428,21 @@ impl<F: Future<Output = Result<ExecutionResult, Error>>> Future for ProcessFutur
         } else {
             result
         }
+    }
+}
+
+/// Marks a process's body as being polled, until dropped.
+struct Polling(Rc<ProcessState>, bool);
+
+impl Polling {
+    fn enter(state: &Rc<ProcessState>) -> Self {
+        Self(state.clone(), state.polling.replace(true))
+    }
+}
+
+impl Drop for Polling {
+    fn drop(&mut self) {
+        self.0.polling.set(self.1);
     }
 }
 
@@ -456,6 +475,11 @@ async fn run_state(
     }
     .await;
     tasks.cancel_and_join().await;
+    // A signal that ended the process this one runs inside (`kill 0`, `kill $$` in a
+    // substitution) ends that one here, before it runs anything else: its poll sees it.
+    if current().is_some_and(|parent| parent.polling.get() && parent.terminated.get().is_some()) {
+        std::future::pending::<()>().await;
+    }
     result
 }
 

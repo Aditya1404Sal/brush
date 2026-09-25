@@ -97,6 +97,47 @@ impl TrapSignal {
     }
 }
 
+/// How a process that `signal` ended is described, as the C library's `strsignal` on Linux with
+/// musl words it: `Terminated`, `Killed`, `User defined signal 1`, `RT35`.
+pub fn signal_description(signal: u8) -> String {
+    const NAMES: [&str; 31] = [
+        "Hangup",
+        "Interrupt",
+        "Quit",
+        "Illegal instruction",
+        "Trace/breakpoint trap",
+        "Aborted",
+        "Bus error",
+        "Arithmetic exception",
+        "Killed",
+        "User defined signal 1",
+        "Segmentation fault",
+        "User defined signal 2",
+        "Broken pipe",
+        "Alarm clock",
+        "Terminated",
+        "Stack fault",
+        "Child process status",
+        "Continued",
+        "Stopped (signal)",
+        "Stopped",
+        "Stopped (tty input)",
+        "Stopped (tty output)",
+        "Urgent I/O condition",
+        "CPU time limit exceeded",
+        "File size limit exceeded",
+        "Virtual timer expired",
+        "Profiling timer expired",
+        "Window changed",
+        "I/O possible",
+        "Power failure",
+        "Bad system call",
+    ];
+    NAMES
+        .get(usize::from(signal).wrapping_sub(1))
+        .map_or_else(|| std::format!("RT{signal}"), |name| (*name).to_owned())
+}
+
 /// Lists the numbered signals among `it` as bash's `kill -l` and `trap -l` do: ` 1) SIGHUP`,
 /// five to a line, separated by tabs.
 ///

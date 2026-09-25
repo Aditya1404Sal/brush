@@ -462,6 +462,12 @@ pub struct Job {
     /// How the job ended, once it has: its status and the signal that ended it, if one did.
     final_status: Option<(u8, Option<u8>)>,
 
+    /// The text of each stage, for a background pipeline of several stages.
+    stages: Vec<String>,
+
+    /// Whether `jobs` has shown the job in its current state.
+    listed: bool,
+
     /// The command line of the job.
     pub command_line: String,
 
@@ -487,9 +493,122 @@ impl Display for Job {
             "[{}]{}  {:<27}{}",
             self.id,
             self.annotation,
-            self.state.to_string(),
+            self.status_text(),
             self.display_command()
         )
+    }
+}
+
+/// The text bash shows for a job's command: the command as a function body would print it, but
+/// with subshells and brace groups on one line, `( a; b )` and `{ a; b; }`.
+pub(crate) fn job_text(ao_list: &brush_parser::ast::AndOrList) -> String {
+    let mut text = String::new();
+    push_and_or(&mut text, ao_list);
+    text
+}
+
+/// A pipeline's text, as bash shows a job's.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(dead_code, reason = "only WASM reports signal deaths")
+)]
+pub(crate) fn pipeline_text(pipeline: &brush_parser::ast::Pipeline) -> String {
+    let mut text = String::new();
+    push_pipeline(&mut text, pipeline);
+    text
+}
+
+/// The text of each stage of a background pipeline, as `jobs -l` shows them.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(dead_code, reason = "only WASM numbers pipeline stages")
+)]
+pub(crate) fn stage_texts(pipeline: &brush_parser::ast::Pipeline) -> Vec<String> {
+    pipeline
+        .seq
+        .iter()
+        .map(|command| {
+            let mut text = String::new();
+            push_command(&mut text, command);
+            text
+        })
+        .collect()
+}
+
+fn push_and_or(text: &mut String, ao_list: &brush_parser::ast::AndOrList) {
+    use brush_parser::ast::AndOr;
+    push_pipeline(text, &ao_list.first);
+    for next in &ao_list.additional {
+        let (operator, pipeline) = match next {
+            AndOr::And(pipeline) => (" && ", pipeline),
+            AndOr::Or(pipeline) => (" || ", pipeline),
+        };
+        text.push_str(operator);
+        push_pipeline(text, pipeline);
+    }
+}
+
+fn push_pipeline(text: &mut String, pipeline: &brush_parser::ast::Pipeline) {
+    use std::fmt::Write as _;
+    if let Some(timed) = &pipeline.timed {
+        let _ = write!(text, "{timed} ");
+    }
+    if pipeline.bang {
+        text.push_str("! ");
+    }
+    for (index, command) in pipeline.seq.iter().enumerate() {
+        if index > 0 {
+            text.push_str(" | ");
+        }
+        push_command(text, command);
+    }
+}
+
+fn push_command(text: &mut String, command: &brush_parser::ast::Command) {
+    use brush_parser::ast::{Command, CompoundCommand};
+    use std::fmt::Write as _;
+    let (open, list, close, redirects) = match command {
+        Command::Compound(CompoundCommand::Subshell(subshell), redirects) => {
+            ("( ", &subshell.list, " )", redirects)
+        }
+        Command::Compound(CompoundCommand::BraceGroup(group), redirects) => {
+            ("{ ", &group.list, "; }", redirects)
+        }
+        other => {
+            let _ = write!(text, "{other}");
+            return;
+        }
+    };
+    text.push_str(open);
+    let items = &list.0;
+    for (index, brush_parser::ast::CompoundListItem(ao_list, separator)) in items.iter().enumerate()
+    {
+        push_and_or(text, ao_list);
+        let last = index + 1 == items.len();
+        match separator {
+            brush_parser::ast::SeparatorOperator::Async => {
+                text.push_str(" &");
+                if !last {
+                    text.push(' ');
+                }
+            }
+            brush_parser::ast::SeparatorOperator::Sequence if !last => text.push_str("; "),
+            brush_parser::ast::SeparatorOperator::Sequence => {}
+        }
+    }
+    // A group ends its list with `;`, unless its last command runs in the background.
+    let close = if close == "; }"
+        && items
+            .last()
+            .is_some_and(|item| matches!(item.1, brush_parser::ast::SeparatorOperator::Async))
+    {
+        " }"
+    } else {
+        close
+    };
+    text.push_str(close);
+    if let Some(redirects) = redirects {
+        let _ = write!(text, " {redirects}");
     }
 }
 
@@ -510,6 +629,8 @@ impl Job {
             serial: 0,
             reaped: false,
             final_status: None,
+            stages: Vec::new(),
+            listed: false,
             tasks: tasks.into_iter().collect(),
             pgid: None,
             annotation: JobAnnotation::None,
@@ -529,6 +650,70 @@ impl Job {
         }
     }
 
+    /// The job's state as `jobs` shows it: `Running`, `Stopped`, and once it has finished,
+    /// `Done`, `Exit N` or how a signal ended it (`Terminated`).
+    pub fn status_text(&self) -> String {
+        match (&self.state, self.final_status) {
+            (JobState::Done, Some((_, Some(signal)))) => traps::signal_description(signal),
+            (JobState::Done, Some((code, None))) if code != 0 => std::format!("Exit {code}"),
+            (state, _) => state.to_string(),
+        }
+    }
+
+    /// The lines `jobs -l` shows for the job, as bash lays them out: the job line with the first
+    /// process's number, then one line per further pipeline stage.
+    pub fn long_lines(&self) -> Vec<String> {
+        let pid = |index: usize| {
+            self.pids
+                .get(index)
+                .map_or_else(String::new, ToString::to_string)
+        };
+        let suffix = if matches!(self.state, JobState::Running) {
+            " &"
+        } else {
+            ""
+        };
+        if self.stages.len() < 2 {
+            return vec![std::format!(
+                "[{}]{} {:>5} {:<27}{}",
+                self.id,
+                self.annotation,
+                pid(0),
+                self.status_text(),
+                self.display_command()
+            )];
+        }
+        let last = self.stages.len() - 1;
+        self.stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| {
+                let suffix = if index == last { suffix } else { "" };
+                if index == 0 {
+                    std::format!(
+                        "[{}]{} {:>5} {:<27}{stage}{suffix}",
+                        self.id,
+                        self.annotation,
+                        pid(0),
+                        self.status_text()
+                    )
+                } else {
+                    std::format!("{:>10}{:26}| {stage}{suffix}", pid(index), "")
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `jobs -n` has something new to say about this job; listing it says it.
+    pub const fn changed_since_listed(&self) -> bool {
+        !self.listed
+    }
+
+    /// Records that `jobs` has shown this job in its current state.
+    pub const fn mark_listed(&mut self) {
+        self.listed = true;
+    }
+
     /// A copy of this job for listing only (see `listing_only`).
     fn listing_copy(&self) -> Self {
         Self {
@@ -539,6 +724,8 @@ impl Job {
             serial: self.serial,
             reaped: self.reaped,
             final_status: self.final_status,
+            stages: self.stages.clone(),
+            listed: self.listed,
             command_line: self.command_line.clone(),
             state: self.state.clone(),
             leader: self.leader,
@@ -557,6 +744,7 @@ impl Job {
         command_line: String,
         leader: crate::process_table::Pid,
         pids: Vec<crate::process_table::Pid>,
+        stages: Vec<String>,
     ) -> Self
     where
         I: IntoIterator<Item = JobTask>,
@@ -564,6 +752,7 @@ impl Job {
         let mut job = Self::new(tasks, command_line, JobState::Running);
         job.leader = Some(leader);
         job.pids = pids;
+        job.stages = stages;
         job
     }
 
@@ -648,6 +837,7 @@ impl Job {
         tracing::debug!(target: trace_categories::JOBS, "Job {} has completed.", self.id);
 
         self.state = JobState::Done;
+        self.listed = false;
         if let Some(Ok(result)) = &result {
             self.record_final_status(result);
         }

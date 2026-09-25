@@ -315,7 +315,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
 ) -> &'a jobs::Job {
     use crate::execution::process;
     let table = shell.processes().clone();
-    let command_line = ao_list.to_string();
+    let command_line = jobs::job_text(ao_list);
     let leader = table.allocate_job(shell.own_pid(), command_line.clone());
 
     let mut cloned_shell = shell.clone();
@@ -406,6 +406,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         result
     });
 
+    let stage_pids_len = stage_pids.len();
     let pids = if stage_pids.is_empty() {
         vec![leader]
     } else {
@@ -414,11 +415,17 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     if let Some(last) = pids.last() {
         table.set_shown_pid(leader, *last);
     }
+    let stages = if stage_pids_len > 1 {
+        jobs::stage_texts(&ao_list.first)
+    } else {
+        Vec::new()
+    };
     shell.jobs_mut().add_as_current(jobs::Job::new_numbered(
         [jobs::JobTask::Internal(join_handle)],
         command_line,
         leader,
         pids,
+        stages,
     ))
 }
 
@@ -486,7 +493,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
 
     shell.jobs_mut().add_as_current(jobs::Job::new(
         [jobs::JobTask::Internal(join_handle)],
-        ao_list.to_string(),
+        jobs::job_text(ao_list),
         jobs::JobState::Running,
     ))
 }
@@ -582,7 +589,16 @@ impl Execute for ast::Pipeline {
                 .await;
         #[cfg(target_arch = "wasm32")]
         spawned._stage_tasks.cancel_and_join().await;
-        let mut result = wait_result?;
+        let (mut result, last_signal) = wait_result?;
+        // A foreground command a signal ended is reported as bash reports it. Its signal is not
+        // reported again by the commands around it.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(signal) = last_signal {
+            report_signal_death(shell, &params, self, signal)?;
+            result.terminating_signal = None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = last_signal;
 
         // Invert the exit code if requested.
         if self.bang {
@@ -880,12 +896,48 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     })
 }
 
+/// Reports a foreground command that `signal` ended, as bash does: TERM with its description
+/// and the command, other signals (but INT and PIPE) with the line and the process number too,
+/// unless the shell traps them.
+#[cfg(target_arch = "wasm32")]
+fn report_signal_death(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    pipeline: &ast::Pipeline,
+    signal: u8,
+) -> Result<(), error::Error> {
+    use crate::execution::process::signals;
+    if matches!(signal, signals::INT | signals::PIPE) {
+        return Ok(());
+    }
+    let description = traps::signal_description(signal);
+    let text = jobs::pipeline_text(pipeline);
+    if signal == signals::TERM {
+        writeln!(params.stderr(shell), "{description:<27}{text}")?;
+    } else if !traps::TrapSignal::try_from(i32::from(signal))
+        .is_ok_and(|trapped| shell.traps().handles(trapped))
+    {
+        let pid = shell
+            .processes()
+            .last_signaled_child(shell.own_pid())
+            .map_or_else(String::new, |pid| pid.to_string());
+        let prefix = shell.diagnostic_prefix();
+        writeln!(
+            params.stderr(shell),
+            "{prefix}{pid:>5} {description:<27}{text}"
+        )?;
+    }
+    Ok(())
+}
+
+/// Waits for a pipeline's processes and records their statuses. Also returns the signal that
+/// ended the last one, if one did.
 async fn wait_for_pipeline_processes_and_update_status(
     pipeline: &ast::Pipeline,
     mut process_spawn_results: VecDeque<ExecutionSpawnResult>,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
-) -> Result<ExecutionResult, error::Error> {
+) -> Result<(ExecutionResult, Option<u8>), error::Error> {
     let mut result = ExecutionResult::success();
     let mut stopped_children = vec![];
     let mut last_failure_exit_code: Option<(ExecutionExitCode, Option<u8>)> = None;
@@ -925,6 +977,8 @@ async fn wait_for_pipeline_processes_and_update_status(
         }
     }
 
+    let last_signal = result.terminating_signal;
+
     // Apply pipefail semantics if enabled
     if shell.options().return_last_failure_from_pipeline {
         if let Some((failure_exit_code, terminating_signal)) = last_failure_exit_code {
@@ -952,7 +1006,7 @@ async fn wait_for_pipeline_processes_and_update_status(
         writeln!(params.stderr(shell), "\r{formatted}")?;
     }
 
-    Ok(result)
+    Ok((result, last_signal))
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -1092,7 +1146,15 @@ impl Execute for ast::CompoundCommand {
                 };
 
                 // Preserve the subshell's exit code, but don't honor any of its requests to exit
-                // the shell, break out of loops, etc.
+                // the shell, break out of loops, etc. A signal that ended it is reported by the
+                // pipeline it belongs to.
+                #[cfg(target_arch = "wasm32")]
+                if !completed.get() {
+                    return Ok(ExecutionResult {
+                        terminating_signal: subshell_result.terminating_signal,
+                        ..ExecutionResult::from(subshell_result.exit_code)
+                    });
+                }
                 Ok(ExecutionResult::from(subshell_result.exit_code))
             }
             Self::ForClause(f) => f.execute(shell, params).await,

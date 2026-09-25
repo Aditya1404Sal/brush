@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::Write;
 
 use brush_core::{ExecutionExitCode, ExecutionResult, builtins, error};
 
@@ -76,8 +77,13 @@ impl builtins::Command for WaitCommand {
                 let Some(job) = jobs.jobs.iter_mut().find(|job| job.serial == serial) else {
                     continue;
                 };
+                let fresh = !job.is_reaped();
                 match interruptible(job.wait()).await? {
-                    Ok(_) => jobs.remove_finished(serial, None),
+                    Ok(status) => {
+                        let notice = fresh.then(|| death_notice(job, &status)).flatten();
+                        jobs.remove_finished(serial, None);
+                        report_death(&context, notice)?;
+                    }
                     Err(interrupted) => return Ok(interrupted),
                 }
             }
@@ -132,16 +138,56 @@ impl builtins::Command for WaitCommand {
                 return error::unimp("wait with process IDs");
             };
             let serial = job.serial;
+            let fresh = !job.is_reaped();
             match interruptible(job.wait()).await? {
                 Ok(status) => {
+                    let notice = fresh.then(|| death_notice(job, &status)).flatten();
                     context.shell.jobs_mut().mark_reaped(serial, &status);
+                    report_death(&context, notice)?;
                     result = status;
                 }
                 Err(interrupted) => return Ok(interrupted),
             }
         }
+        // `wait` returns a status; the job's signal did not end `wait` itself.
+        result.terminating_signal = None;
         Ok(result)
     }
+}
+
+/// What bash reports about a job a signal ended, when it waits for one: every signal but INT,
+/// TERM and PIPE, with the process number and the command. Returns the signal and that text.
+fn death_notice(job: &brush_core::jobs::Job, status: &ExecutionResult) -> Option<(u8, String)> {
+    let signal = status
+        .terminating_signal
+        .filter(|signal| !matches!(signal, 2 | 13 | 15))?;
+    let pid = job
+        .pids()
+        .first()
+        .map_or_else(String::new, ToString::to_string);
+    let description = brush_core::traps::signal_description(signal);
+    Some((
+        signal,
+        format!("{pid:>5} {description:<27}{}", job.command_line),
+    ))
+}
+
+/// Writes a [`death_notice`], unless the shell traps the signal.
+fn report_death(
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    notice: Option<(u8, String)>,
+) -> Result<(), brush_core::Error> {
+    let Some((signal, text)) = notice else {
+        return Ok(());
+    };
+    if brush_core::traps::TrapSignal::try_from(i32::from(signal))
+        .is_ok_and(|trapped| context.shell.traps().handles(trapped))
+    {
+        return Ok(());
+    }
+    let prefix = context.shell.diagnostic_prefix();
+    writeln!(context.stderr(), "{prefix}{text}")?;
+    Ok(())
 }
 
 /// `wait -n`: waits for the next of this shell's jobs to finish, among those `ids` name if any,
@@ -189,8 +235,10 @@ async fn wait_next(
             };
             if let Some(result) = job.poll_done()? {
                 let status = result?;
+                let notice = death_notice(job, &status);
                 jobs.remove_finished(serial, Some(&status));
-                return Ok(status);
+                report_death(&context, notice)?;
+                return Ok(ExecutionResult::new(u8::from(status.exit_code)));
             }
         }
         if let Some(signal) = brush_core::execution::process::pending_trapped_signal() {

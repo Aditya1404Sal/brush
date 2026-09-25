@@ -241,6 +241,21 @@ impl ProcessTable {
             .is_some_and(|entry| entry.status == ProcessStatus::Running)
     }
 
+    /// The most recently started process `ppid` started, other than a background job, that a
+    /// signal ended: the one a foreground death notice names.
+    pub fn last_signaled_child(&self, ppid: Pid) -> Option<Pid> {
+        self.lock()
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.ppid == ppid
+                    && !entry.job
+                    && matches!(entry.status, ProcessStatus::Signaled(_))
+            })
+            .max_by_key(|entry| entry.order)
+            .map(|entry| entry.pid)
+    }
+
     /// How many background jobs are running in the whole session, however deeply nested and
     /// whether or not a shell still lists them.
     pub fn running_jobs(&self) -> usize {
