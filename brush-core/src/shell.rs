@@ -554,10 +554,17 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         Ok(())
     }
 
-    /// The name diagnostics start with: the shell's name (`$0`), as bash uses.
+    /// The name diagnostics start with: the shell's name (`$0`), as bash uses -- except while
+    /// sourcing a file, where bash names the file being sourced instead. `source`/`.` does not
+    /// itself change `$0` (see [`Self::current_shell_name`]), but bash's own diagnostics from
+    /// within a sourced file are still that file's name, not `$0`.
     pub fn diagnostic_name(&self) -> String {
-        self.current_shell_name()
-            .map_or_else(|| "bash".to_owned(), |n| n.to_string())
+        for frame in self.call_stack.iter() {
+            if frame.frame_type.is_run_script() || frame.frame_type.is_sourced_script() {
+                return frame.frame_type.name().into_owned();
+            }
+        }
+        self.name.clone().unwrap_or_else(|| "bash".to_owned())
     }
 
     /// The prefix bash puts on a diagnostic: `NAME: line N: ` in a script or command string,
