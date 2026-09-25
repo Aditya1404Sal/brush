@@ -223,6 +223,8 @@ struct CrossTokenParseState {
     command_position: bool,
     /// How many nested constructs (`$(...)`, `${...}` and the like) are being tokenized.
     nested_constructs: u32,
+    /// Are we in the parentheses of a compound array assignment (`a=(...)`)?
+    compound_assignment: bool,
 }
 
 /// Options controlling how the tokenizer operates.
@@ -249,6 +251,8 @@ impl Default for TokenizerOptions {
 /// A tokenizer for shell scripts.
 pub(crate) struct Tokenizer<'a, R: ?Sized + std::io::BufRead> {
     char_reader: std::iter::Peekable<utf8_chars::Chars<'a, R>>,
+    /// A character read and put back (see `peek_second_char`), to be read again first.
+    put_back: Option<char>,
     cross_state: CrossTokenParseState,
     options: TokenizerOptions,
 }
@@ -562,6 +566,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         Tokenizer {
             options: options.clone(),
             char_reader: reader.chars().peekable(),
+            put_back: None,
             cross_state: CrossTokenParseState {
                 cursor: SourcePosition {
                     index: 0,
@@ -574,6 +579,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 arithmetic_expansion: false,
                 command_position: true,
                 nested_constructs: 0,
+                compound_assignment: false,
             },
         }
     }
@@ -584,11 +590,14 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     }
 
     fn next_char(&mut self) -> Result<Option<char>, TokenizerError> {
-        let c = self
-            .char_reader
-            .next()
-            .transpose()
-            .map_err(TokenizerError::ReadError)?;
+        let c = match self.put_back.take() {
+            Some(c) => Some(c),
+            None => self
+                .char_reader
+                .next()
+                .transpose()
+                .map_err(TokenizerError::ReadError)?,
+        };
 
         if let Some(ch) = c {
             if ch == '\n' {
@@ -609,6 +618,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     }
 
     fn peek_char(&mut self) -> Result<Option<char>, TokenizerError> {
+        if let Some(c) = self.put_back {
+            return Ok(Some(c));
+        }
         match self.char_reader.peek() {
             Some(result) => match result {
                 Ok(c) => Ok(Some(*c)),
@@ -616,6 +628,18 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             },
             None => Ok(None),
         }
+    }
+
+    /// Returns the character after the next one (not a newline), consuming neither.
+    fn peek_second_char(&mut self) -> Result<Option<char>, TokenizerError> {
+        let Some(first) = self.next_char()? else {
+            return Ok(None);
+        };
+        let second = self.peek_char();
+        self.put_back = Some(first);
+        self.cross_state.cursor.column -= 1;
+        self.cross_state.cursor.index -= 1;
+        second
     }
 
     pub fn next_token(&mut self) -> Result<TokenizeResult, TokenizerError> {
@@ -628,12 +652,13 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     /// The construct's tokens belong to it, not to the tokens queued up after a pending here tag,
     /// and the pending bodies start on the line after the one the construct ends on, as in bash.
     /// A here-document opened inside the construct is tokenized there.
-    fn set_aside_pending_here_docs(&mut self) -> (HereState, Vec<HereTag>, bool) {
+    fn set_aside_pending_here_docs(&mut self) -> (HereState, Vec<HereTag>, bool, bool) {
         self.cross_state.nested_constructs += 1;
         (
             std::mem::take(&mut self.cross_state.here_state),
             std::mem::take(&mut self.cross_state.current_here_tags),
             std::mem::replace(&mut self.cross_state.command_position, false),
+            std::mem::replace(&mut self.cross_state.compound_assignment, false),
         )
     }
 
@@ -641,10 +666,16 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     /// nested construct left pending after them.
     fn restore_pending_here_docs(
         &mut self,
-        (here_state, mut here_tags, command_position): (HereState, Vec<HereTag>, bool),
+        (here_state, mut here_tags, command_position, compound_assignment): (
+            HereState,
+            Vec<HereTag>,
+            bool,
+            bool,
+        ),
     ) {
         self.cross_state.nested_constructs -= 1;
         self.cross_state.command_position = command_position;
+        self.cross_state.compound_assignment = compound_assignment;
         if here_tags.is_empty() && matches!(here_state, HereState::None) {
             return;
         }
@@ -1250,9 +1281,43 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     }
                 }
             //
+            // As in bash, `<(` or `>(` inside a word (`--file=<(list)`), or starting an element
+            // of a compound array assignment (`a=(<(list))`), is a process substitution read as
+            // part of the word.
+            //
+            } else if matches!(c, '<' | '>')
+                && !self.options.sh_mode
+                && state.unquoted()
+                && !state.in_operator()
+                && !self.cross_state.arithmetic_expansion
+                && if state.started_token() {
+                    !state.only_blanks_so_far()
+                } else {
+                    self.cross_state.compound_assignment
+                }
+                && matches!(self.peek_second_char(), Ok(Some('(')))
+            {
+                self.consume_char()?;
+                state.append_char(c);
+                self.consume_char()?;
+                state.append_char('(');
+
+                let pending = self.set_aside_pending_here_docs();
+                self.consume_nested_construct(&mut state, ')', "(", 1)?;
+                self.restore_pending_here_docs(pending);
+            //
             // If the character *can* start an operator, then it will.
             //
             } else if state.unquoted() && Self::can_start_operator(c) {
+                // `NAME=(` (or `NAME+=(`) opens a compound array assignment, and its `)` closes
+                // it.
+                if c == '(' && state.started_token() {
+                    self.cross_state.compound_assignment =
+                        is_assignment_word(state.current_token())
+                            && state.current_token().ends_with('=');
+                } else if c == ')' {
+                    self.cross_state.compound_assignment = false;
+                }
                 if state.started_token() {
                     result = state.delimit_current_token(
                         TokenEndReason::OperatorStart,
@@ -1928,6 +1993,67 @@ echo after
         assert_eq!(
             strs("cat <<${x}\nbody\n${x}\n")?,
             ["cat", "<<", "${x}", "body\n", "${x}", "\n"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_process_substitutions_in_words() -> Result<()> {
+        let strs = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect())
+        };
+        // Inside a word, or starting an element of a compound array assignment, `<(` and `>(`
+        // are read with the word; at a word's start they are operators, and `<` before anything
+        // else still ends the word.
+        assert_eq!(
+            strs("x=<(echo a) cmd --f=>(cat; echo)z b<c <(d)")?,
+            [
+                "x=<(echo a)",
+                "cmd",
+                "--f=>(cat; echo)z",
+                "b",
+                "<",
+                "c",
+                "<",
+                "(",
+                "d",
+                ")"
+            ]
+        );
+        assert_eq!(
+            strs("a=(<(true) x >(y)) b+=(<(z)); c=( <(w))")?,
+            [
+                "a=", "(", "<(true)", "x", ">(y)", ")", "b+=", "(", "<(z)", ")", ";", "c=", "(",
+                "<(w)", ")"
+            ]
+        );
+        assert_eq!(
+            strs("f (<(x)); (( 1<(2) )); echo $(( 3>(2) ))")?,
+            [
+                "f",
+                "(",
+                "<",
+                "(",
+                "x",
+                ")",
+                ")",
+                ";",
+                "(",
+                "(",
+                "1",
+                "<",
+                "(",
+                "2",
+                ")",
+                ")",
+                ")",
+                ";",
+                "echo",
+                "$(( 3>(2) ))"
+            ]
         );
         Ok(())
     }

@@ -926,7 +926,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         } else {
             &['$', '`', '\\', '\'', '\"', '~', '{']
         };
-        if !word.contains(expansion_chars) {
+        // So is a process substitution (`<(list)`, `>(list)`) in an unquoted word.
+        let process_substitution = !self.heredoc_mode
+            && !self.arithmetic_mode
+            && (word.contains("<(") || word.contains(">("));
+        if !word.contains(expansion_chars) && !process_substitution {
             return Ok(Expansion::from(ExpansionPiece::UnquotedLiteral(
                 word.to_owned(),
             )));
@@ -1304,6 +1308,20 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 cmd_output.truncate(trimmed_len);
 
                 Expansion::from(ExpansionPiece::Splittable(cmd_output))
+            }
+            brush_parser::word::WordPiece::ProcessSubstitution(kind, command) => {
+                let path = if self.disable_command_substitutions {
+                    String::new()
+                } else {
+                    crate::interp::setup_word_process_substitution(
+                        self.shell,
+                        self.params,
+                        &kind,
+                        &command,
+                    )
+                    .await?
+                };
+                Expansion::from(ExpansionPiece::Unsplittable(path))
             }
             brush_parser::word::WordPiece::EscapeSequence(s) => {
                 let Some(escaped) = s.strip_prefix('\\') else {

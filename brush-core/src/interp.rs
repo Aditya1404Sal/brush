@@ -38,6 +38,10 @@ pub struct ExecutionParameters {
     /// for, waiting for it to finish (see `run_pending_output_substitutions`).
     #[cfg(target_arch = "wasm32")]
     pub(crate) output_substitutions: PendingOutputSubstitutions,
+    /// Process substitutions inside the words of the command these parameters are for, set up
+    /// as its words are expanded and waiting to be given to it (see
+    /// `setup_word_process_substitution`).
+    word_process_substitutions: WordProcessSubstitutions,
     /// Policy for how to manage spawned external processes.
     pub process_group_policy: ProcessGroupPolicy,
     /// Whether `errexit` (exit on error) behavior should be
@@ -1648,6 +1652,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         // finished.
         #[cfg(target_arch = "wasm32")]
         let pending = params.own_output_substitutions();
+        params.word_process_substitutions = WordProcessSubstitutions::default();
 
         // Before its words are expanded, the command's text becomes BASH_COMMAND (unless a trap
         // handler is running, whose commands leave it alone) and the DEBUG trap runs, as in bash.
@@ -1676,6 +1681,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let status_change_count_before_expansion = context.shell.last_exit_status_change_count();
 
         for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
+            params.install_word_process_substitutions();
             match item {
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                     if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
@@ -1791,6 +1797,8 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 }
             }
         }
+
+        params.install_word_process_substitutions();
 
         // If we have a command, then execute it.
         if let Some(CommandArg::String(cmd_name)) = args.first() {
@@ -2685,6 +2693,74 @@ async fn setup_process_substitution(
         .find(|fd| !params.open_files.contains_fd(*fd))
         .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
     Ok((fd, target_file))
+}
+
+/// Sets up a process substitution found inside a word (`--file=<(list)`, `x=<(list)`) and
+/// returns the `/dev/fd/N` path that takes its place, as bash does. The descriptor waits in
+/// `params` until the command whose words are being expanded is given it, so it is open for that
+/// command alone; a word expanded for anything else (an assignment by itself, a `for` list) gets
+/// only the path.
+pub(crate) async fn setup_word_process_substitution(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    kind: &ast::ProcessSubstitutionKind,
+    command: &str,
+) -> Result<String, error::Error> {
+    let program = shell.parse_string(command).map_err(|e| {
+        error::Error::from(error::ErrorKind::ParseError(
+            e,
+            crate::SourceInfo::from("main"),
+        ))
+    })?;
+    let subshell = ast::SubshellCommand {
+        list: ast::CompoundList(
+            program
+                .complete_commands
+                .into_iter()
+                .flat_map(|list| list.0)
+                .collect(),
+        ),
+        loc: brush_parser::SourceSpan::default(),
+    };
+    let (_, file) = setup_process_substitution(shell, params, kind, &subshell).await?;
+
+    // As bash does, count down from 63 for a descriptor free in the command and among the
+    // substitutions already waiting for it.
+    let mut waiting = params
+        .word_process_substitutions
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fd = (1..=63)
+        .rev()
+        .find(|fd| {
+            !params.open_files.contains_fd(*fd) && waiting.iter().all(|(other, _)| other != fd)
+        })
+        .ok_or_else(|| error::ErrorKind::Unimplemented("no available file descriptors"))?;
+    waiting.push((fd, file));
+    Ok(std::format!("/dev/fd/{fd}"))
+}
+
+/// The descriptors of the process substitutions inside one command's words, shared by the
+/// clones of its parameters.
+#[derive(Clone, Default)]
+struct WordProcessSubstitutions(std::sync::Arc<std::sync::Mutex<Vec<(ShellFd, OpenFile)>>>);
+
+impl ExecutionParameters {
+    /// Gives the command these parameters are for the descriptors of the process
+    /// substitutions set up while its words were expanded.
+    fn install_word_process_substitutions(&mut self) {
+        let waiting = std::mem::take(
+            &mut *self
+                .word_process_substitutions
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (fd, file) in waiting {
+            self.open_files.set_fd(fd, file);
+        }
+    }
 }
 
 /// An output process substitution waiting for the command that writes to it to finish.

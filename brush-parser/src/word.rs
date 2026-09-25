@@ -57,6 +57,8 @@ pub enum WordPiece {
     CommandSubstitution(String),
     /// A backquoted command substitution.
     BackquotedCommandSubstitution(String),
+    /// A process substitution inside a word (`--file=<(list)`): its kind and its command.
+    ProcessSubstitution(ast::ProcessSubstitutionKind, String),
     /// An escape sequence.
     EscapeSequence(String),
     /// An arithmetic expression.
@@ -845,7 +847,7 @@ peg::parser! {
         pub(crate) rule unexpanded_word() -> Vec<WordPieceWithSource> = traced(<word(<![_]>)>)
 
         rule word<T>(stop_condition: rule<T>) -> Vec<WordPieceWithSource> =
-            tilde:tilde_expr_prefix_with_source()? pieces:word_piece_with_source(<stop_condition()>, false /*in_command*/)* {
+            tilde:tilde_expr_prefix_with_source()? pieces:word_piece_or_process_substitution(<stop_condition()>)* {
                 let mut all_pieces = Vec::new();
                 if let Some(tilde) = tilde {
                     all_pieces.push(tilde);
@@ -853,6 +855,26 @@ peg::parser! {
                 all_pieces.extend(pieces);
                 all_pieces
             }
+
+        // As in bash, `<(list)` and `>(list)` are process substitutions anywhere in an unquoted
+        // word.
+        rule word_piece_or_process_substitution<T>(stop_condition: rule<T>) -> WordPieceWithSource =
+            start_index:position!() piece:process_substitution() end_index:position!() {
+                WordPieceWithSource { piece, start_index, end_index }
+            } /
+            word_piece_with_source(<stop_or_process_substitution(<stop_condition()>)>, false /*in_command*/)
+
+        rule process_substitution() -> WordPiece =
+            "<(" c:command() ")" {
+                WordPiece::ProcessSubstitution(ast::ProcessSubstitutionKind::Read, c.to_owned())
+            } /
+            ">(" c:command() ")" {
+                WordPiece::ProcessSubstitution(ast::ProcessSubstitutionKind::Write, c.to_owned())
+            }
+
+        rule stop_or_process_substitution<T>(stop_condition: rule<T>) -> () =
+            stop_condition() {} /
+            ['<' | '>'] "(" {}
 
         // Takes a word as input.
         pub(crate) rule brace_expansions() -> Option<Vec<BraceExpressionOrText>> =
@@ -1617,6 +1639,44 @@ mod tests {
                 transform: true,
                 ..
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_process_substitutions_in_words() -> Result<()> {
+        let pieces = |word: &str| -> Result<Vec<WordPiece>> {
+            Ok(super::parse(word, &ParserOptions::default())?
+                .into_iter()
+                .map(|p| p.piece)
+                .collect())
+        };
+        let read = ast::ProcessSubstitutionKind::Read;
+        let write = ast::ProcessSubstitutionKind::Write;
+        assert_eq!(
+            pieces("--f=<(echo \"a)\"; case x in x) :;; esac)z")?,
+            [
+                WordPiece::Text("--f=".into()),
+                WordPiece::ProcessSubstitution(read, "echo \"a)\"; case x in x) :;; esac".into()),
+                WordPiece::Text("z".into()),
+            ]
+        );
+        assert_eq!(
+            pieces(">(cat)<(b)")?,
+            [
+                WordPiece::ProcessSubstitution(write, "cat".into()),
+                WordPiece::ProcessSubstitution(ast::ProcessSubstitutionKind::Read, "b".into()),
+            ]
+        );
+        // Quoted or escaped, or not followed by `(`, `<` and `>` are text.
+        assert_eq!(pieces("a<b")?, [WordPiece::Text("a<b".into())]);
+        assert_matches!(
+            pieces("\"<(x)\"")?.as_slice(),
+            [WordPiece::DoubleQuotedSequence(_)]
+        );
+        assert_matches!(
+            pieces("\\<(x)")?.as_slice(),
+            [WordPiece::EscapeSequence(_), WordPiece::Text(_)]
         );
         Ok(())
     }
