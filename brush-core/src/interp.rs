@@ -2509,14 +2509,13 @@ pub(crate) async fn setup_redirect(
         }
 
         ast::IoRedirect::NamedFd(variable, kind, target) => {
-            // `{fd}>&-` closes the descriptor the variable holds.
+            // `{fd}>&-` closes the descriptor the variable holds; bash names the variable when it
+            // holds none.
             if matches!(target, ast::IoFileRedirectTarget::Duplicate(word) if word.value == "-") {
                 let fd = shell
                     .env_str(variable)
                     .and_then(|value| value.parse::<ShellFd>().ok())
-                    .ok_or_else(|| {
-                        error::ErrorKind::AmbiguousRedirect(format!("{{{variable}}}"))
-                    })?;
+                    .ok_or_else(|| error::ErrorKind::AmbiguousRedirect(variable.clone()))?;
                 params.open_files.remove_fd(fd);
                 return Ok(());
             }
@@ -2549,6 +2548,14 @@ pub(crate) async fn setup_redirect(
 
                     // Diagnostics name the file as the script did, not its absolute path.
                     let written_path = expanded_fields.remove(0);
+                    // An empty name names no file (not the working directory).
+                    if written_path.is_empty() {
+                        return Err(error::ErrorKind::RedirectionFailure(
+                            written_path,
+                            "No such file or directory".to_owned(),
+                        )
+                        .into());
+                    }
                     let expanded_file_path: PathBuf =
                         shell.absolute_path(Path::new(written_path.as_str()));
 
@@ -2674,8 +2681,13 @@ pub(crate) async fn setup_redirect(
                             .map_err(|_| error::ErrorKind::InvalidRedirection)?;
 
                         // Reference the same open file as the source fd (shared handle; no OS-level duplication).
+                        // Bash names a descriptor that is not open as the script wrote it (`$fd`).
                         let Some(target_file) = params.try_fd(shell, source_fd_num) else {
-                            return Err(error::ErrorKind::BadFileDescriptor(source_fd_num).into());
+                            return Err(error::ErrorKind::RedirectionFailure(
+                                word.value.trim_end_matches('-').to_owned(),
+                                "Bad file descriptor".to_owned(),
+                            )
+                            .into());
                         };
 
                         params.open_files.set_fd(fd_num, target_file);
@@ -2690,8 +2702,9 @@ pub(crate) async fn setup_redirect(
                         return Err(error::ErrorKind::InvalidRedirection.into());
                     }
 
-                    if dash {
-                        // Ignore a descriptor that is not open.
+                    // Ignore a descriptor that is not open; moving one onto itself (`>&1-`) keeps it.
+                    let moved_onto_itself = closed_fd == fd_num && !expanded.is_empty();
+                    if dash && !moved_onto_itself {
                         params.open_files.remove_fd(closed_fd);
                     }
                 }
@@ -2772,6 +2785,14 @@ fn setup_redirect_output_and_error_to(
     file_path: &str,
     append: bool,
 ) -> Result<(), error::Error> {
+    // An empty name names no file (not the working directory).
+    if file_path.is_empty() {
+        return Err(error::ErrorKind::RedirectionFailure(
+            String::new(),
+            "No such file or directory".to_owned(),
+        )
+        .into());
+    }
     let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
 
     // `set -C` guards `&>` and `>&word` as it guards `>`: an existing regular file is refused.
