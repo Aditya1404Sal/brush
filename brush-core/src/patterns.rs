@@ -545,6 +545,12 @@ pub(crate) fn remove_smallest_matching_prefix<'a>(
 ) -> Result<&'a str, error::Error> {
     if let Some(pattern) = pattern {
         let re = pattern.to_regex(true, true)?;
+
+        // The shortest prefix is the empty one (`${x#*}` removes nothing), as in bash.
+        if re.is_match("")? {
+            return Ok(s);
+        }
+
         let mut indices = s.char_indices();
 
         #[allow(
@@ -600,6 +606,12 @@ pub(crate) fn remove_smallest_matching_suffix<'a>(
 ) -> Result<&'a str, error::Error> {
     if let Some(pattern) = pattern {
         let re = pattern.to_regex(true, true)?;
+
+        // The shortest suffix is the empty one (`${x%*}` removes nothing), as in bash.
+        if re.is_match("")? {
+            return Ok(s);
+        }
+
         #[allow(
             clippy::string_slice,
             reason = "because we get the indices from char_indices()"
@@ -743,6 +755,15 @@ mod tests {
         assert_eq!(
             remove_smallest_matching_prefix("🚀🚀🚀rocket", Some(&Pattern::from("🚀")))?,
             "🚀🚀rocket"
+        );
+        // A pattern that matches the empty string removes nothing.
+        assert_eq!(
+            remove_smallest_matching_prefix("abc", Some(&Pattern::from("*")))?,
+            "abc"
+        );
+        assert_eq!(
+            remove_smallest_matching_suffix("abc", Some(&Pattern::from("*")))?,
+            "abc"
         );
         Ok(())
     }
