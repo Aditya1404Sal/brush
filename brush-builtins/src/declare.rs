@@ -309,6 +309,28 @@ impl DeclareCommand {
         // Extract the variable name and the initial value being assigned (if any).
         let (name, assigned_index, initial_value, name_is_array, append) =
             Self::declaration_to_name_and_value(declaration)?;
+
+        // A readonly variable is refused before its new value is evaluated, and an array cannot
+        // lose its array attribute (`declare +a`), as in bash.
+        let current_lookup = if create_var_local {
+            EnvironmentLookup::OnlyInCurrentLocal
+        } else {
+            EnvironmentLookup::Anywhere
+        };
+        if let Some(var) = self.existing_variable(context.shell, name.as_str(), current_lookup) {
+            if var.is_readonly() && initial_value.is_some() {
+                return Err(ErrorKind::ReadonlyVariable.into());
+            }
+            let removes_array = self.make_indexed_array.to_bool() == Some(false)
+                || self.make_associative_array.to_bool() == Some(false);
+            if removes_array && var.value().is_array() {
+                context.report(format_args!(
+                    "{name}: cannot destroy array variables in this way"
+                ))?;
+                return Ok(false);
+            }
+        }
+
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -` saves the `set` options, to restore when the function returns.
@@ -403,10 +425,11 @@ impl DeclareCommand {
             if var.is_readonly() && (initial_value.is_some() || self.changes_type()) {
                 return Err(ErrorKind::ReadonlyVariable.into());
             }
-            if self.make_associative_array.is_some() {
+            // `+a` and `+A` convert nothing.
+            if self.make_associative_array.to_bool() == Some(true) {
                 var.convert_to_associative_array()?;
             }
-            if self.make_indexed_array.is_some() {
+            if self.make_indexed_array.to_bool() == Some(true) {
                 var.convert_to_indexed_array()?;
             }
 
@@ -420,9 +443,9 @@ impl DeclareCommand {
 
             self.apply_attributes_after_update(var, verb)?;
         } else {
-            let unset_type = if self.make_indexed_array.is_some() {
+            let unset_type = if self.make_indexed_array.to_bool() == Some(true) {
                 ShellValueUnsetType::IndexedArray
-            } else if self.make_associative_array.is_some() {
+            } else if self.make_associative_array.to_bool() == Some(true) {
                 ShellValueUnsetType::AssociativeArray
             } else if name_is_array {
                 ShellValueUnsetType::IndexedArray
