@@ -1400,6 +1400,19 @@ async fn run_substitution_command_in(
     // The substitution's lines are numbered on from the command it is part of.
     shell.begin_nested_code();
 
+    // `set -v` echoes the here-documents of a `$( )` each time it runs, as bash reads them
+    // again from the command printed back.
+    if !backquoted && shell.options().print_shell_input_lines {
+        use std::io::Write as _;
+        let lines: Vec<&str> = command.lines().collect();
+        let mut stderr = params.stderr(shell);
+        for (first, last) in interp::here_document_lines(&command) {
+            for line in lines.get(first - 1..last).unwrap_or_default() {
+                let _ = writeln!(stderr, "{line}");
+            }
+        }
+    }
+
     // Its last command may run in place of the substitution's process, as bash's does.
     shell.exec_last = Some(if backquoted {
         interp::CommandString::Backquoted

@@ -488,7 +488,7 @@ async fn execute_program(
             shell.no_fork = NoFork::for_command_string(program_ast, kind, input.as_deref());
         }
         let mut next_input_line = 1;
-        let mut quiet_lines: Option<std::collections::HashSet<usize>> = None;
+        let mut quiet_lines: Option<SubstitutionLines> = None;
 
         for (index, command) in program_ast.complete_commands.iter().enumerate() {
             shell.begin_command_unit(program, index);
@@ -507,7 +507,23 @@ async fn execute_program(
                         .skip(next_input_line - 1)
                         .take(end + 1 - next_input_line)
                     {
-                        if !quiet.contains(&(number + 1)) {
+                        // A here-document's lines in a substitution are echoed as bash reads
+                        // them while it parses the substitution: once, or twice in double
+                        // quotes. (It echoes them again each time the substitution runs.)
+                        if let Some((_, last, times)) = quiet
+                            .here_documents
+                            .iter()
+                            .find(|(first, _, _)| *first == number + 1)
+                        {
+                            let block: Vec<&str> =
+                                input.lines().skip(number).take(last - number).collect();
+                            for _ in 0..*times {
+                                for line in &block {
+                                    let _ = writeln!(stderr, "{line}");
+                                }
+                            }
+                        }
+                        if !quiet.inside.contains(&(number + 1)) {
                             let _ = writeln!(stderr, "{line}");
                         }
                     }
@@ -2793,31 +2809,43 @@ async fn setup_command_redirects(
     Ok(true)
 }
 
-/// The input lines `set -v` does not echo: bash reads the lines after the first of a multi-line
-/// `$( )` while it parses the substitution, and echoes none of them.
+/// The input lines of multi-line `$( )`s, as `set -v` echoes them.
+#[derive(Default)]
+struct SubstitutionLines {
+    /// The lines after the first of each: bash reads them while it parses the substitution, and
+    /// echoes none of them.
+    inside: std::collections::HashSet<usize>,
+    /// The first and last lines of the here-documents among them (the body and the delimiter),
+    /// which bash echoes as it reads them, and how many times: once, or twice for a substitution
+    /// in double quotes, which bash parses twice.
+    here_documents: Vec<(usize, usize, usize)>,
+}
+
+/// The input lines of multi-line `$( )`s (see [`SubstitutionLines`]).
 fn lines_inside_substitutions(
     input: &str,
     options: &brush_parser::ParserOptions,
-) -> std::collections::HashSet<usize> {
+) -> SubstitutionLines {
     fn substitutions(
         pieces: &[brush_parser::word::WordPieceWithSource],
-        found: &mut Vec<(usize, usize)>,
+        quoted: bool,
+        found: &mut Vec<(usize, usize, bool)>,
     ) {
         for piece in pieces {
             match &piece.piece {
                 brush_parser::word::WordPiece::CommandSubstitution(_) => {
-                    found.push((piece.start_index, piece.end_index));
+                    found.push((piece.start_index, piece.end_index, quoted));
                 }
                 brush_parser::word::WordPiece::DoubleQuotedSequence(inner)
                 | brush_parser::word::WordPiece::GettextDoubleQuotedSequence(inner) => {
-                    substitutions(inner, found);
+                    substitutions(inner, true, found);
                 }
                 _ => (),
             }
         }
     }
 
-    let mut lines = std::collections::HashSet::new();
+    let mut lines = SubstitutionLines::default();
     let Ok(tokens) = brush_parser::tokenize_str(input) else {
         return lines;
     };
@@ -2832,16 +2860,51 @@ fn lines_inside_substitutions(
             continue;
         };
         let mut found = vec![];
-        substitutions(&pieces, &mut found);
-        for (start, end) in found {
+        substitutions(&pieces, false, &mut found);
+        for (start, end, quoted) in found {
             let (Some(before), Some(inside)) = (text.get(..start), text.get(start..end)) else {
                 continue;
             };
             let first_line = span.start.line + before.matches('\n').count();
-            lines.extend(first_line + 1..=first_line + inside.matches('\n').count());
+            lines
+                .inside
+                .extend(first_line + 1..=first_line + inside.matches('\n').count());
+            // Line 1 of the substitution's command is `first_line`.
+            let command = inside
+                .strip_prefix("$(")
+                .and_then(|command| command.strip_suffix(')'))
+                .unwrap_or_default();
+            let times = if quoted { 2 } else { 1 };
+            lines.here_documents.extend(
+                here_document_lines(command)
+                    .into_iter()
+                    .map(|(first, last)| (first_line + first - 1, first_line + last - 1, times)),
+            );
         }
     }
     lines
+}
+
+/// The first and last lines of each here-document's body and delimiter in `command`, counted
+/// from its first line: the tokenizer gives a here-document's operator and tag, then its body,
+/// whose lines are followed by the delimiter's.
+pub(crate) fn here_document_lines(command: &str) -> Vec<(usize, usize)> {
+    let Ok(tokens) = brush_parser::tokenize_str(command) else {
+        return vec![];
+    };
+    let mut found = vec![];
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        if !matches!(token, brush_parser::Token::Operator(op, _) if op == "<<" || op == "<<-") {
+            continue;
+        }
+        let (Some(_tag), Some(body)) = (tokens.next(), tokens.next()) else {
+            break;
+        };
+        let first = body.location().start.line;
+        found.push((first, first + body.to_str().matches('\n').count()));
+    }
+    found
 }
 
 /// What happens before a simple command's words are expanded: its text becomes `BASH_COMMAND`
