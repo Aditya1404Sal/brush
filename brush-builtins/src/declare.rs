@@ -392,15 +392,23 @@ impl DeclareCommand {
 
         // An indexed array's subscripts, in a compound assignment or an element's
         // (`declare 'a[i+1]=v'`), are evaluated arithmetically (an associative array's are
-        // words); one that is empty or counts back past the start fails the declaration once the
-        // elements before it are assigned, as in bash.
+        // words). In a compound assignment, one that is empty or counts back past the start
+        // fails the declaration once the elements before it are assigned, abandoning the
+        // command; an element's (`declare 'a[-5]=v'`) fails the declaration as `a[-5]=v` would,
+        // and the variable is still declared, as in bash.
         let mut outcome = Ok(true);
         let initial_value = match initial_value {
             Some(ShellValueLiteral::Array(literal))
                 if !self.assigns_associative(context, &name, current_lookup) =>
             {
-                let existing = context.shell.env().get(&name).map(|(_, var)| var.value());
-                let keys = brush_core::variables::IndexedLiteralKeys::new(existing, append);
+                // An element is assigned into the array as it stands.
+                let existing = self
+                    .existing_variable(context.shell, name.as_str(), current_lookup)
+                    .map(|var| var.value());
+                let keys = brush_core::variables::IndexedLiteralKeys::new(
+                    existing,
+                    append || assigned_index.is_some(),
+                );
                 let (literal, failed) = brush_core::arithmetic::resolve_indexed_array_literal(
                     context.shell,
                     &context.params,
@@ -408,10 +416,23 @@ impl DeclareCommand {
                     literal,
                 )
                 .await?;
-                if let Some(failed) = failed {
-                    outcome = Err(failed);
+                match (failed, &assigned_index) {
+                    (Some(_), Some(index)) => {
+                        writeln!(
+                            context.stderr(),
+                            "{}{name}[{index}]: bad array subscript",
+                            context.shell.diagnostic_prefix()
+                        )?;
+                        outcome = Ok(false);
+                        None
+                    }
+                    (failed, _) => {
+                        if let Some(failed) = failed {
+                            outcome = Err(failed);
+                        }
+                        Some(ShellValueLiteral::Array(literal))
+                    }
                 }
-                Some(ShellValueLiteral::Array(literal))
             }
             // Once an associative array's first element has a subscript, every element needs one.
             Some(ShellValueLiteral::Array(ArrayLiteral(elements)))
