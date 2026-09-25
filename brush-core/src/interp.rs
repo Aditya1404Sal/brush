@@ -2775,6 +2775,23 @@ async fn apply_assignment_unchecked(
                 expansion::basic_expand_assignment_word(shell, params, unexpanded_value).await?;
             ShellValueLiteral::Scalar(value)
         }
+        // A command's own variable is a string, as in bash: an array written before a command
+        // is the text of its elements, `(1 2)`, expanded as one assignment word.
+        ast::AssignmentValue::Array(unexpanded_values)
+            if creation_scope == EnvironmentScope::Command =>
+        {
+            let text = unexpanded_values
+                .iter()
+                .map(|(key, value)| match key {
+                    Some(key) => format!("[{}]={}", key.value, value.value),
+                    None => value.value.clone(),
+                })
+                .join(" ");
+            let word = ast::Word::from(format!("({text})"));
+            ShellValueLiteral::Scalar(
+                expansion::basic_expand_assignment_word(shell, params, &word).await?,
+            )
+        }
         ast::AssignmentValue::Array(unexpanded_values) => {
             let mut elements = vec![];
             for (unexpanded_key, unexpanded_value) in unexpanded_values {
