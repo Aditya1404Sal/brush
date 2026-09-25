@@ -1759,6 +1759,14 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let mut command_takes_assignments = false;
         let mut redirect_failed = false;
 
+        // `set -x` traces a simple command to the standard error it had before its own
+        // redirections, as bash does.
+        let trace_params = context
+            .shell
+            .options()
+            .print_commands_and_arguments
+            .then(|| params.clone());
+
         // Capture the status change count before expansion, so we can detect
         // if expansion (e.g., command substitution) set an exit status.
         let status_change_count_before_expansion = context.shell.last_exit_status_change_count();
@@ -1896,7 +1904,15 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 process_group_id: context.process_group_id,
             };
 
-            let result = execute_command(context, params, cmd_name, &assignments, &args).await;
+            let result = execute_command(
+                context,
+                params,
+                trace_params.as_ref(),
+                cmd_name,
+                &assignments,
+                &args,
+            )
+            .await;
             #[cfg(target_arch = "wasm32")]
             let result = match result {
                 Ok(spawned) if !pending.is_empty() => {
@@ -1926,6 +1942,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     assignment,
                     &mut context.shell,
                     &params,
+                    trace_params.as_ref().unwrap_or(&params),
                     false,
                     None,
                     EnvironmentScope::Global,
@@ -1962,6 +1979,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 async fn execute_command<T: Into<String>>(
     mut context: PipelineExecutionContext<'_, impl extensions::ShellExtensions>,
     params: ExecutionParameters,
+    trace_params: Option<&ExecutionParameters>,
     cmd_name: T,
     assignments: &[&ast::Assignment],
     args: &[CommandArg],
@@ -1977,6 +1995,7 @@ async fn execute_command<T: Into<String>>(
             assignment,
             guard.shell(),
             &params,
+            trace_params.unwrap_or(&params),
             true,
             Some(EnvironmentScope::Command),
             EnvironmentScope::Command,
@@ -1993,7 +2012,7 @@ async fn execute_command<T: Into<String>>(
         guard
             .shell()
             .trace_command(
-                &params,
+                trace_params.unwrap_or(&params),
                 args.iter().map(|arg| arg.quote_for_tracing()).join(" "),
             )
             .await;
@@ -2133,6 +2152,7 @@ async fn apply_assignment(
     assignment: &ast::Assignment,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
+    trace_params: &ExecutionParameters,
     export: bool,
     required_scope: Option<EnvironmentScope>,
     creation_scope: EnvironmentScope,
@@ -2143,6 +2163,7 @@ async fn apply_assignment(
         assignment,
         shell,
         params,
+        trace_params,
         export,
         required_scope,
         creation_scope,
@@ -2171,6 +2192,7 @@ async fn apply_assignment_unchecked(
     assignment: &ast::Assignment,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
+    trace_params: &ExecutionParameters,
     mut export: bool,
     required_scope: Option<EnvironmentScope>,
     creation_scope: EnvironmentScope,
@@ -2257,7 +2279,10 @@ async fn apply_assignment_unchecked(
     if shell.options().print_commands_and_arguments {
         let op = if assignment.append { "+=" } else { "=" };
         shell
-            .trace_command(params, std::format!("{}{op}{new_value}", assignment.name))
+            .trace_command(
+                trace_params,
+                std::format!("{}{op}{new_value}", assignment.name),
+            )
             .await;
     }
 
