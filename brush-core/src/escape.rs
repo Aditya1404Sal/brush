@@ -120,8 +120,9 @@ pub fn expand_backslash_escapes(
                     octal_chars.push('0');
                 }
 
-                let value = int_utils::parse::<u8>(octal_chars.as_str(), 8)?;
-                result.push(value);
+                // Bash keeps the low byte of a value above \377.
+                let value = int_utils::parse::<u32>(octal_chars.as_str(), 8)?;
+                result.push(low_byte(value));
             }
             'x' => {
                 // Consume 1-2 valid hex chars (or unlimited with braces in ANSI-C mode)
@@ -192,12 +193,7 @@ pub fn expand_backslash_escapes(
                     result.append(escape_cmd.to_string().into_bytes().as_mut());
                 } else {
                     let value = int_utils::parse::<u16>(hex_chars.as_str(), 16)?;
-                    if let Some(decoded) = char::from_u32(u32::from(value)) {
-                        result.append(decoded.to_string().into_bytes().as_mut());
-                    } else {
-                        result.push(b'\\');
-                        result.append(escape_cmd.to_string().into_bytes().as_mut());
-                    }
+                    push_code_point(&mut result, u32::from(value));
                 }
             }
             'U' => {
@@ -219,12 +215,7 @@ pub fn expand_backslash_escapes(
                     result.append(escape_cmd.to_string().into_bytes().as_mut());
                 } else {
                     let value = int_utils::parse::<u32>(hex_chars.as_str(), 16)?;
-                    if let Some(decoded) = char::from_u32(value) {
-                        result.append(decoded.to_string().into_bytes().as_mut());
-                    } else {
-                        result.push(b'\\');
-                        result.append(escape_cmd.to_string().into_bytes().as_mut());
-                    }
+                    push_code_point(&mut result, value);
                 }
             }
             first_octal @ '1'..='7' if matches!(mode, EscapeExpansionMode::AnsiCQuotes) => {
@@ -245,8 +236,9 @@ pub fn expand_backslash_escapes(
                     octal_chars.push(next_c);
                 }
 
-                let value = int_utils::parse::<u8>(octal_chars.as_str(), 8)?;
-                result.push(value);
+                // Bash keeps the low byte of a value above \377.
+                let value = int_utils::parse::<u32>(octal_chars.as_str(), 8)?;
+                result.push(low_byte(value));
             }
             unknown => {
                 // Not a valid escape sequence.
@@ -264,6 +256,33 @@ pub fn expand_backslash_escapes(
     }
 
     Ok((result, true))
+}
+
+/// The low byte of an octal escape's value (`\777` is 0xff), as bash takes it.
+const fn low_byte(value: u32) -> u8 {
+    value.to_le_bytes()[0]
+}
+
+/// Appends the UTF-8 encoding of a `\u` or `\U` escape's code point. Like bash, a code point
+/// that is not a character (a surrogate, or above U+10FFFF) gets the same encoding scheme's bytes,
+/// up to six of them, and one above 0x7FFFFFFF gets nothing.
+fn push_code_point(result: &mut Vec<u8>, value: u32) {
+    if let Some(c) = char::from_u32(value) {
+        let mut buffer = [0; 4];
+        result.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
+        return;
+    }
+    let (lead, count): (u8, u32) = match value {
+        0..=0xFFFF => (0xE0, 2),
+        0x1_0000..=0x1F_FFFF => (0xF0, 3),
+        0x20_0000..=0x3FF_FFFF => (0xF8, 4),
+        0x400_0000..=0x7FFF_FFFF => (0xFC, 5),
+        _ => return,
+    };
+    result.push(lead | low_byte(value >> (6 * count)));
+    for shift in (0..count).rev() {
+        result.push(0x80 | (low_byte(value >> (6 * shift)) & 0x3F));
+    }
 }
 
 /// Quoting mode to use for escaping.
@@ -536,6 +555,24 @@ mod tests {
             .unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn test_ansi_c_bytes_beyond_characters() {
+        let expand = |s: &str| {
+            expand_backslash_escapes(s, EscapeExpansionMode::AnsiCQuotes)
+                .unwrap()
+                .0
+        };
+        // An octal value above \377 keeps its low byte.
+        assert_eq!(expand(r"\777"), [0xff]);
+        assert_eq!(expand(r"a\400b"), b"a");
+        // Code points that are not characters get their encoding's bytes, as in bash.
+        assert_eq!(expand(r"\ud800"), [0xed, 0xa0, 0x80]);
+        assert_eq!(expand(r"\U00110000"), [0xf4, 0x90, 0x80, 0x80]);
+        assert_eq!(expand(r"\U00200000"), [0xf8, 0x88, 0x80, 0x80, 0x80]);
+        assert_eq!(expand(r"\U7fffffff"), [0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf]);
+        assert_eq!(expand(r"x\UFFFFFFFFy"), b"xy");
     }
 
     #[test]
