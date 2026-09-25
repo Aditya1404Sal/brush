@@ -45,6 +45,13 @@ pub struct ExecutionParameters {
     pub suppress_errexit: bool,
     /// Embedder context, cloned into stages and substitutions rather than installed globally.
     context: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Whether the command these parameters are for reads a pipe or has its own redirection of
+    /// standard input; the commands inside it then keep that input when run in the background.
+    pub(crate) stdin_redirected: bool,
+    /// Whether a background command keeps standard input instead of reading /dev/null: the
+    /// subshell it runs in reads a pipe or redirected input, or a compound command around it
+    /// does (bash's `stdin_redir`).
+    pub(crate) async_stdin_kept: bool,
 }
 
 impl ExecutionParameters {
@@ -318,7 +325,10 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     cloned_shell.set_own_pid(leader);
     // Bash resets caught handlers in asynchronous subshells; ignored signals stay ignored.
     cloned_shell.traps_mut().reset_caught_for_subshell();
-    if let Ok(null) = openfiles::null() {
+    // Its input is /dev/null, unless a pipe or redirection around it provides one.
+    if !params.async_stdin_kept
+        && let Ok(null) = openfiles::null()
+    {
         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
     }
 
@@ -690,8 +700,10 @@ async fn spawn_pipeline_processes(
         let mut cmd_params = params.clone();
 
         // Install pipes.
+        cmd_params.stdin_redirected = false;
         if let Some(Some(reader)) = pipe_readers.pop() {
             cmd_params.open_files.set_fd(OpenFiles::STDIN_FD, reader);
+            cmd_params.stdin_redirected = true;
         }
         if let Some(Some(writer)) = pipe_writers.pop() {
             cmd_params.open_files.set_fd(OpenFiles::STDOUT_FD, writer);
@@ -970,6 +982,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                     for redirect in &redirects.0 {
                         setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await?;
                     }
+                    if redirects.0.iter().any(redirects_stdin) {
+                        params.stdin_redirected = true;
+                    }
                 }
 
                 let result = compound.execute(&mut pipeline_context.shell, &params).await;
@@ -998,11 +1013,37 @@ impl Execute for ast::CompoundCommand {
         shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
+        // As in bash, a background command reads /dev/null, unless the subshell it runs in, or a
+        // compound command around it, reads a pipe or redirects standard input.
+        let stdin_redirected = params.stdin_redirected;
+        let inner_params;
+        let params = if stdin_redirected {
+            inner_params = ExecutionParameters {
+                stdin_redirected: false,
+                async_stdin_kept: true,
+                ..params.clone()
+            };
+            &inner_params
+        } else {
+            params
+        };
         match self {
             Self::BraceGroup(ast::BraceGroupCommand { list, .. }) => {
                 list.execute(shell, params).await
             }
             Self::Subshell(ast::SubshellCommand { list, .. }) => {
+                // A new subshell keeps input for background commands only if it reads a pipe or
+                // redirected input itself.
+                let subshell_params;
+                let params = if params.async_stdin_kept == stdin_redirected {
+                    params
+                } else {
+                    subshell_params = ExecutionParameters {
+                        async_stdin_kept: stdin_redirected,
+                        ..params.clone()
+                    };
+                    &subshell_params
+                };
                 // Clone off a new subshell, and run the body of the subshell there.
                 // TODO(source-info): Do we need to reset the line number?
                 let mut subshell = shell.clone();
@@ -2627,6 +2668,19 @@ fn setup_redirect_output_and_error_to(
     params.open_files.set_fd(OpenFiles::STDERR_FD, stderr_file);
 
     Ok(())
+}
+
+/// Whether `redirect` redirects standard input.
+pub(crate) fn redirects_stdin(redirect: &ast::IoRedirect) -> bool {
+    match redirect {
+        ast::IoRedirect::File(fd, kind, _) => {
+            fd.unwrap_or_else(|| get_default_fd_for_redirect_kind(kind)) == OpenFiles::STDIN_FD
+        }
+        ast::IoRedirect::HereDocument(fd, _) | ast::IoRedirect::HereString(fd, _) => {
+            fd.unwrap_or(OpenFiles::STDIN_FD) == OpenFiles::STDIN_FD
+        }
+        ast::IoRedirect::OutputAndError(..) | ast::IoRedirect::NamedFd(..) => false,
+    }
 }
 
 const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> ShellFd {

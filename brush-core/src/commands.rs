@@ -910,6 +910,9 @@ pub(crate) async fn invoke_shell_function(
         for redirect in &redirects.0 {
             interp::setup_redirect(context.shell, &mut context.params, redirect).await?;
         }
+        if redirects.0.iter().any(interp::redirects_stdin) {
+            context.params.stdin_redirected = true;
+        }
     }
 
     let positional_args = args.iter().map(|a| a.to_string());
