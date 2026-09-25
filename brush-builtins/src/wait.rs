@@ -1,5 +1,7 @@
 use clap::Parser;
 use std::io::Write;
+#[cfg(target_arch = "wasm32")]
+use std::task::Poll;
 
 use brush_core::{ExecutionExitCode, ExecutionResult, builtins, error};
 
@@ -216,34 +218,60 @@ async fn wait_next(
         return Ok(ExecutionExitCode::from(127).into());
     }
     // Report exactly one finished job per call, oldest first, so simultaneous completions are not
-    // lost between successive `wait -n` calls.
-    loop {
+    // lost between successive `wait -n` calls. Polling registers this task to be woken when a
+    // job ends or a trapped signal arrives, so `wait -n` sleeps instead of polling in a loop.
+    let next = std::future::poll_fn(|cx| {
         let jobs = context.shell.jobs_mut();
-        let candidates: Vec<u64> = jobs
-            .jobs
-            .iter()
-            .filter(|job| !job.is_listing_copy() && !job.is_reaped())
-            .filter(|job| wanted.is_empty() || wanted.contains(&job.serial))
-            .map(|job| job.serial)
-            .collect();
-        if candidates.is_empty() {
-            return Ok(ExecutionExitCode::from(127).into());
-        }
-        for serial in candidates {
-            let Some(job) = jobs.jobs.iter_mut().find(|job| job.serial == serial) else {
+        let mut any = false;
+        for job in &mut jobs.jobs {
+            if job.is_listing_copy()
+                || job.is_reaped()
+                || !(wanted.is_empty() || wanted.contains(&job.serial))
+            {
                 continue;
-            };
-            if let Some(result) = job.poll_done()? {
-                let status = result?;
-                let notice = death_notice(job, &status);
-                jobs.remove_finished(serial, Some(&status));
-                report_death(&context, notice)?;
-                return Ok(ExecutionResult::new(u8::from(status.exit_code)));
+            }
+            any = true;
+            match job.poll_done_cx(cx) {
+                Ok(Some(result)) => {
+                    return Poll::Ready(result.map(|status| Next::Finished(job.serial, status)));
+                }
+                Ok(None) => {}
+                Err(error) => return Poll::Ready(Err(error)),
             }
         }
-        if let Some(signal) = brush_core::execution::process::pending_trapped_signal() {
-            return Ok(ExecutionExitCode::from(128 + signal).into());
+        if !any {
+            return Poll::Ready(Ok(Next::NoJob));
         }
-        (context.shell.execution_services().yield_now)().await;
+        match brush_core::execution::process::pending_trapped_signal() {
+            Some(signal) => Poll::Ready(Ok(Next::Trapped(signal))),
+            None => Poll::Pending,
+        }
+    })
+    .await?;
+    match next {
+        Next::Finished(serial, status) => {
+            let jobs = context.shell.jobs_mut();
+            let notice = jobs
+                .jobs
+                .iter()
+                .find(|job| job.serial == serial)
+                .and_then(|job| death_notice(job, &status));
+            jobs.remove_finished(serial, Some(&status));
+            report_death(&context, notice)?;
+            Ok(ExecutionResult::new(u8::from(status.exit_code)))
+        }
+        Next::NoJob => Ok(ExecutionExitCode::from(127).into()),
+        Next::Trapped(signal) => Ok(ExecutionExitCode::from(128 + signal).into()),
     }
+}
+
+/// What ends a `wait -n`.
+#[cfg(target_arch = "wasm32")]
+enum Next {
+    /// This job, by serial, finished with this status.
+    Finished(u64, ExecutionResult),
+    /// There is no job to wait for.
+    NoJob,
+    /// A signal with a trap arrived.
+    Trapped(u8),
 }

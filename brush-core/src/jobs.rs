@@ -88,22 +88,27 @@ impl JobTask {
     }
 
     /// Polls the task for completion. Returns `Some(result)` if the task has completed,
-    /// or `None` if it is still running. The result is the execution result of the task.
-    /// Behaves in a best-effort manner; if an internal error occurs during polling,
-    /// it will return `None`.
-    fn poll(&mut self) -> Option<Result<ExecutionResult, error::Error>> {
+    /// or `None` if it is still running; `cx`'s waker is woken when an internal task completes
+    /// (an external process is only checked). Behaves in a best-effort manner; if an internal
+    /// error occurs during polling, it will return `None`.
+    fn poll_cx(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Option<Result<ExecutionResult, error::Error>> {
         match self {
             Self::External(process) => {
                 let check_result = process.poll();
                 check_result.map(|polled_result| polled_result.map(|output| output.into()))
             }
-            Self::Internal(handle) => match handle.now_or_never() {
-                Some(Ok(inner)) => Some(inner),
+            Self::Internal(handle) => match handle.poll_unpin(cx) {
+                std::task::Poll::Ready(Ok(inner)) => Some(inner),
                 // A cancelled (aborted) task must still be reapable: report it as killed rather
                 // than pending forever.
-                Some(Err(e)) if e.is_cancelled() => Some(Ok(ExecutionResult::new(137))),
+                std::task::Poll::Ready(Err(e)) if e.is_cancelled() => {
+                    Some(Ok(ExecutionResult::new(137)))
+                }
                 // Panicked task: preserve the existing best-effort behavior.
-                Some(Err(_)) | None => None,
+                std::task::Poll::Ready(Err(_)) | std::task::Poll::Pending => None,
             },
         }
     }
@@ -814,6 +819,17 @@ impl Job {
     pub fn poll_done(
         &mut self,
     ) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
+        self.poll_done_cx(&mut std::task::Context::from_waker(
+            futures::task::noop_waker_ref(),
+        ))
+    }
+
+    /// As [`Self::poll_done`], registering `cx`'s waker to be woken when the job's task
+    /// completes, so a waiter can sleep until then instead of polling in a loop.
+    pub fn poll_done_cx(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
         let mut result: Option<Result<ExecutionResult, error::Error>> = None;
         if self.listing_only {
             return Ok(None);
@@ -823,7 +839,7 @@ impl Job {
 
         while !self.tasks.is_empty() {
             let task = &mut self.tasks[0];
-            match task.poll() {
+            match task.poll_cx(cx) {
                 Some(r) => {
                     self.tasks.remove(0);
                     result = Some(r);
@@ -977,5 +993,41 @@ impl Job {
     pub fn process_group_id(&self) -> Option<sys::process::ProcessId> {
         // TODO(jobs): Don't assume that the first PID is the PGID.
         self.pgid.or_else(|| self.representative_pid())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waiter_on_a_job_sleeps_until_the_job_ends() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tokio::task::LocalSet::new().run_until(async {
+                let handle = tokio::task::spawn_local(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(ExecutionResult::new(4))
+                });
+                let mut job =
+                    Job::new([JobTask::Internal(handle)], "job".into(), JobState::Running);
+                let mut polls = 0;
+                let result = std::future::poll_fn(|cx| {
+                    polls += 1;
+                    match job.poll_done_cx(cx) {
+                        Ok(Some(result)) => std::task::Poll::Ready(result),
+                        Ok(None) => std::task::Poll::Pending,
+                        Err(error) => std::task::Poll::Ready(Err(error)),
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(u8::from(result.exit_code), 4);
+                // Polled once to register, once when the job ended: no busy polling.
+                assert!(polls <= 3, "polled {polls} times");
+                assert!(matches!(job.state, JobState::Done));
+            }));
     }
 }
