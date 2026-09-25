@@ -1075,6 +1075,31 @@ mod tests {
     }
 
     #[test]
+    fn compound_assignment_arguments_need_an_assignment_builtin() {
+        for source in [
+            "declare x=(a b)",
+            "x=1 export y=(a)",
+            "f() { local l=(a); }",
+            "eval x=(a)",
+            "declare -a y x=(a b) z=(c)",
+        ] {
+            assert!(diagnose(source).is_empty(), "{source:?}");
+        }
+        for source in [
+            "echo x=(a b)",
+            "builtin declare x=(a)",
+            "'declare' x=(a)",
+            "true x=(a)",
+        ] {
+            assert_eq!(
+                diagnose(source).first().map(String::as_str),
+                Some("line 1: syntax error near unexpected token `('"),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compound_assignment_errors_exit_one() {
         let status = |source: &str| {
             let options = crate::ParserOptions::default();

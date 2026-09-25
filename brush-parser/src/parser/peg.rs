@@ -554,7 +554,7 @@ peg::parser! {
             }
 
         rule simple_command() -> ast::SimpleCommand =
-            prefix:cmd_prefix() word_and_suffix:(word_or_name:cmd_word() suffix:cmd_suffix()? { (word_or_name, suffix) })? {
+            prefix:cmd_prefix() word_and_suffix:(word_or_name:cmd_word() suffix:cmd_suffix(assignment_builtin(word_or_name))? { (word_or_name, suffix) })? {
                 match word_and_suffix {
                     Some((word_or_name, suffix)) => {
                         ast::SimpleCommand { prefix: Some(prefix), word_or_name: Some(ast::Word::from(word_or_name)), suffix }
@@ -564,7 +564,7 @@ peg::parser! {
                     }
                 }
             } /
-            word_or_name:cmd_name() suffix:cmd_suffix()? {
+            word_or_name:cmd_name() suffix:cmd_suffix(assignment_builtin(word_or_name))? {
                 ast::SimpleCommand { prefix: None, word_or_name: Some(ast::Word::from(word_or_name)), suffix } } /
             expected!("simple command")
 
@@ -583,7 +583,9 @@ peg::parser! {
                 }
             )+ { ast::CommandPrefix(p) }
 
-        rule cmd_suffix() -> ast::CommandSuffix =
+        // After an assignment builtin (`declare`, `local` and the rest), `NAME=(...)` is a
+        // compound assignment; after any other command, as in bash, its `(` is out of place.
+        rule cmd_suffix(compound_assignments: bool) -> ast::CommandSuffix =
             s:(
                 non_posix_extensions_enabled() sub:process_substitution() {
                     let (kind, subshell) = sub;
@@ -592,6 +594,7 @@ peg::parser! {
                 i:io_redirect() {
                     ast::CommandPrefixOrSuffixItem::IoRedirect(i)
                 } /
+                !(!is_true(compound_assignments) [Token::Word(_, _)] specific_operator("("))
                 assignment_and_word:assignment_word() {
                     let (assignment, word) = assignment_and_word;
                     ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, word)
@@ -600,6 +603,8 @@ peg::parser! {
                     ast::CommandPrefixOrSuffixItem::Word(ast::Word::from(w))
                 }
             )+ { ast::CommandSuffix(s) }
+
+        rule is_true(value: bool) = &[_] {? if value { Ok(()) } else { Err("false") } }
 
         rule redirect_list() -> ast::RedirectList =
             r:io_redirect()+ { ast::RedirectList(r) } /
@@ -945,6 +950,15 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
 
         result
     }
+}
+
+/// Whether bash takes `NAME=(...)` arguments of the command word `token` as compound assignments:
+/// the word must be one of its assignment builtins, written as is.
+fn assignment_builtin(token: &Token) -> bool {
+    matches!(
+        token.to_str(),
+        "alias" | "declare" | "eval" | "export" | "local" | "readonly" | "typeset"
+    )
 }
 
 /// The variable name in `{name}`: a letter or underscore, then letters, digits and underscores.
