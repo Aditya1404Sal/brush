@@ -588,6 +588,34 @@ pub(crate) async fn basic_expand_arithmetic_text(
     expander.basic_expand_to_str(text).await
 }
 
+/// The output of the command substitution of `command` (backquoted or not), as it replaces the
+/// substitution: without null bytes, which it warns of, or trailing newlines.
+pub(crate) async fn command_substitution_output(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: String,
+    backquoted: bool,
+) -> Result<String, error::Error> {
+    let mut output =
+        commands::invoke_command_in_subshell_and_get_output(shell, params, command, backquoted)
+            .await?;
+
+    // Strips null bytes from command substitution output for compatibility.
+    if output.contains('\0') {
+        writeln!(
+            params.stderr(shell),
+            "{}warning: command substitution: ignored null byte in input",
+            shell.diagnostic_prefix(),
+        )?;
+        output.retain(|c| c != '\0');
+    }
+
+    // We trim trailing newlines, per spec.
+    let trimmed_len = output.trim_end_matches('\n').len();
+    output.truncate(trimmed_len);
+    Ok(output)
+}
+
 /// Applies all basic expansion to the given word (represented as a string),
 /// with custom expander options.
 ///
@@ -2660,32 +2688,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         s: String,
         backquoted: bool,
     ) -> Result<Expansion, error::Error> {
-        let mut cmd_output = if !self.disable_command_substitutions {
-            commands::invoke_command_in_subshell_and_get_output(
-                self.shell,
-                self.params,
-                s,
-                backquoted,
-            )
-            .await?
-        } else {
+        let cmd_output = if self.disable_command_substitutions {
             String::new()
+        } else {
+            command_substitution_output(self.shell, self.params, s, backquoted).await?
         };
-
-        // Strips null bytes from command substitution output for compatibility.
-        if cmd_output.contains('\0') {
-            writeln!(
-                self.params.stderr(self.shell),
-                "{}warning: command substitution: ignored null byte in input",
-                self.shell.diagnostic_prefix(),
-            )?;
-            cmd_output.retain(|c| c != '\0');
-        }
-
-        // We trim trailing newlines, per spec.
-        let trimmed_len = cmd_output.trim_end_matches('\n').len();
-        cmd_output.truncate(trimmed_len);
-
         Ok(Expansion::from(ExpansionPiece::Splittable(cmd_output)))
     }
 

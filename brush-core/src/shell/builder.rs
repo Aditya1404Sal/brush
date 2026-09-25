@@ -262,6 +262,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             exit_trace_level: 0,
             pending_input: None,
             debug_trap_ran: false,
+            stage_command: false,
             prompt_guard: None,
             paren_subshell: false,
             stage_subshell: false,

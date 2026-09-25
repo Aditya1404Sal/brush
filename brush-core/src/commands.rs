@@ -305,6 +305,11 @@ pub struct SimpleCommand<'a, SE: extensions::ShellExtensions> {
     /// process.
     #[allow(clippy::type_complexity)]
     pub post_execute: Option<fn(&mut Shell<SE>) -> Result<(), error::Error>>,
+
+    /// Whether the command's last argument becomes `$_` once it runs: not for a pipeline stage's
+    /// own command, which bash runs in the stage's process as it exits (see
+    /// [`Shell::stage_command`]).
+    pub(crate) record_last_arg: bool,
 }
 
 impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
@@ -335,6 +340,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             process_group_id: None,
             argv0: None,
             post_execute: None,
+            record_last_arg: true,
         }
     }
 
@@ -417,8 +423,10 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             } else {
                 // Bash updates $_ even when the command is not found, so mirror
                 // that here before reporting the error.
-                let last_arg = Self::take_last_arg(&self.args);
-                self.shell.update_last_arg_variable(last_arg);
+                if self.record_last_arg {
+                    let last_arg = Self::take_last_arg(&self.args);
+                    self.shell.update_last_arg_variable(last_arg);
+                }
 
                 if let Some(post_execute) = self.post_execute {
                     let _ = post_execute(&mut self.shell);
@@ -467,6 +475,14 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         args.last().map(ToString::to_string)
     }
 
+    /// The last argument of a command that has run, moved out of its arguments for `$_`.
+    fn into_last_arg(mut args: Vec<CommandArg>) -> Option<String> {
+        args.pop().map(|arg| match arg {
+            CommandArg::String(arg) => arg,
+            arg @ CommandArg::Assignment(_) => arg.to_string(),
+        })
+    }
+
     async fn execute_via_builtin(
         self,
         builtin: builtins::Registration<SE>,
@@ -510,7 +526,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         command_name: String,
         args: Vec<CommandArg>,
     ) -> ExecutionSpawnResult {
-        let last_arg = Self::take_last_arg(&args);
+        // The stage's shell ends with the builtin, recording no `$_` (see
+        // [`Shell::stage_command`]).
         let join_handle = tokio::task::spawn_blocking(move || {
             let cmd_context = ExecutionContext {
                 shell: &mut shell,
@@ -519,12 +536,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             };
 
             let rt = tokio::runtime::Handle::current();
-            let result = rt.block_on(execute_builtin_command(&builtin, cmd_context, args));
-
-            // Update $_ after command execution.
-            shell.update_last_arg_variable(last_arg);
-
-            result
+            rt.block_on(execute_builtin_command(&builtin, cmd_context, args))
         });
 
         ExecutionSpawnResult::StartedTask(join_handle)
@@ -538,7 +550,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         command_name: String,
         args: Vec<CommandArg>,
     ) -> Result<ExecutionSpawnResult, error::Error> {
-        let last_arg = Self::take_last_arg(&args);
+        // The stage's shell ends with the builtin, recording no `$_` (see
+        // [`Shell::stage_command`]).
         let cmd_context = ExecutionContext {
             shell: &mut shell,
             command_name,
@@ -546,10 +559,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         };
 
         let result = execute_builtin_command(&builtin, cmd_context, args).await;
-
-        // Update $_ after command execution (mirrors the native path, which does this regardless of
-        // the builtin's success).
-        shell.update_last_arg_variable(last_arg);
 
         // Propagate errors the same way the native `StartedTask` does: the error surfaces when the
         // pipeline waits on this stage, not swallowed into a `Completed` result.
@@ -561,7 +570,10 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         builtin: builtins::Registration<SE>,
     ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
-        let last_arg = Self::take_last_arg(&self.args);
+        // The builtin takes its arguments, so `$_` gets its own copy of the last.
+        let last_arg = self
+            .record_last_arg
+            .then(|| Self::take_last_arg(&self.args));
         #[cfg(any(target_arch = "wasm32", test))]
         let mut cleanup = crate::shell::FrameGuard::new(
             &mut shell,
@@ -582,7 +594,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         let result = execute_builtin_command(&builtin, cmd_context, self.args).await;
 
         // Update $_ after command execution.
-        shell.update_last_arg_variable(last_arg);
+        if let Some(last_arg) = last_arg {
+            shell.update_last_arg_variable(last_arg);
+        }
 
         #[cfg(not(any(target_arch = "wasm32", test)))]
         if let Some(post_execute) = self.post_execute {
@@ -599,7 +613,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         func_registration: functions::Registration,
     ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
-        let last_arg = Self::take_last_arg(&self.args);
         #[cfg(any(target_arch = "wasm32", test))]
         let mut cleanup = crate::shell::FrameGuard::new(
             &mut shell,
@@ -623,8 +636,11 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // $_ is reset *after* the function body runs, to the last argument of
         // the invocation (or the function name itself if zero args). Any
         // mutations made inside the body are overwritten — this matches bash,
-        // where the caller observes only the invocation's last argument.
-        shell.update_last_arg_variable(last_arg);
+        // where the caller observes only the invocation's last argument. It
+        // takes that argument, which the call no longer needs.
+        if self.record_last_arg {
+            shell.update_last_arg_variable(Self::into_last_arg(self.args));
+        }
 
         #[cfg(not(any(target_arch = "wasm32", test)))]
         if let Some(post_execute) = self.post_execute {
@@ -636,7 +652,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 
     fn execute_via_external(self, path: &Path) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
-        let last_arg = Self::take_last_arg(&self.args);
 
         let cmd_context = ExecutionContext {
             shell: &mut shell,
@@ -653,8 +668,11 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             &self.args[1..],
         );
 
-        // Update $_ after command execution.
-        shell.update_last_arg_variable(last_arg);
+        // Update $_ after command execution, with the last argument, which the process has
+        // been given.
+        if self.record_last_arg {
+            shell.update_last_arg_variable(Self::into_last_arg(self.args));
+        }
 
         if let Some(post_execute) = self.post_execute {
             let _ = post_execute(&mut shell);
@@ -1394,6 +1412,19 @@ async fn run_substitution_command_in(
         brush_parser::reprint_comsub_text(&command, &shell.parser_options()).unwrap_or(command)
     };
     let parse_result = shell.parse_string(command.as_str());
+
+    // A command that does not parse (a prompt's, or one in backquotes, read only as it runs) is
+    // reported as bash reports a substitution's: from `command substitution`, its lines numbered
+    // on from the command it is part of.
+    if let Err(error) = &parse_result {
+        let lines = brush_parser::bash_diagnostic(error, &command, &shell.parser_options());
+        let error = error::Error::from(error::ErrorKind::SyntaxError {
+            origin: "command substitution".to_owned(),
+            lines: error::shift_diagnostic_lines(lines, shell.line_number().saturating_sub(1)),
+        });
+        let _ = shell.display_error(&mut params.stderr(shell), &error);
+        return Ok(ExecutionResult::new(2));
+    }
 
     // Check for a command that is only an input redirection ("< file").
     // If detected, emulate `cat file` to stdout and return immediately.

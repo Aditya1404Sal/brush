@@ -1205,6 +1205,7 @@ async fn spawn_pipeline_processes(
                 let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
                 let mut stage_shell = shell.clone();
                 stage_shell.debug_trap_ran = debug_trap_ran;
+                stage_shell.stage_command = matches!(command, ast::Command::Simple(_));
                 stage_shell.stage_subshell = true;
                 stage_shell.paren_subshell = false;
                 if stage_adds_no_subshell(command) {
@@ -1227,6 +1228,7 @@ async fn spawn_pipeline_processes(
             let debug_trap_ran = stage_debug_trap(shell, params, command).await?;
             let mut stage_shell = shell.clone();
             stage_shell.debug_trap_ran = debug_trap_ran;
+            stage_shell.stage_command = matches!(command, ast::Command::Simple(_));
             stage_shell.stage_subshell = true;
             stage_shell.paren_subshell = false;
             if stage_adds_no_subshell(command) {
@@ -2545,6 +2547,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         if !std::mem::take(&mut context.shell.debug_trap_ran) {
             before_simple_command(&mut context.shell, &params, self).await?;
         }
+        let record_last_arg = !std::mem::take(&mut context.shell.stage_command);
 
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
@@ -2689,6 +2692,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 
         // If we have a command, then execute it.
         if let Some(CommandArg::String(cmd_name)) = args.first() {
+            let cmd_name = cmd_name.clone();
             let mut stderr = params.stderr(&context.shell);
 
             let (owned_shell, parent_shell) = match context.shell {
@@ -2717,10 +2721,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 trace_params.as_ref(),
                 cmd_name,
                 &assignments,
-                &args,
+                args,
                 &redirects,
                 &mut stderr,
                 no_fork.names(self).then_some(no_fork),
+                record_last_arg,
             )
             .await;
             #[cfg(target_arch = "wasm32")]
@@ -2764,7 +2769,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // Assignment-only statements clear $_ (set to empty string).
             // This matches bash behavior where assignments don't have a "last
             // argument".
-            context.shell.update_last_arg_variable(None);
+            if record_last_arg {
+                context.shell.update_last_arg_variable(None);
+            }
 
             // Then the redirections; one that fails fails the statement, but the assignments
             // still took effect, as in bash.
@@ -3065,10 +3072,11 @@ async fn execute_command<T: Into<String>>(
     trace_params: Option<&ExecutionParameters>,
     cmd_name: T,
     assignments: &[&ast::Assignment],
-    args: &[CommandArg],
+    args: Vec<CommandArg>,
     redirects: &[&ast::IoRedirect],
     stderr: &mut OpenFile,
     no_fork: Option<NoFork>,
+    record_last_arg: bool,
 ) -> Result<ExecutionSpawnResult, error::Error> {
     // Push a new ephemeral environment scope for the duration of the command. We'll
     // set command-scoped variable assignments after doing so, and revert them before
@@ -3097,7 +3105,7 @@ async fn execute_command<T: Into<String>>(
                 let shell = guard.shell();
                 if shell.options().posix_mode
                     && !shell.options().interactive
-                    && runs_special_builtin(shell, args)
+                    && runs_special_builtin(shell, &args)
                 {
                     return Err(error.into_fatal());
                 }
@@ -3157,7 +3165,7 @@ async fn execute_command<T: Into<String>>(
         .shell()
         .env_mut()
         .take_scope(EnvironmentScope::Command)?;
-    let redirected = setup_command_redirects(guard.shell(), &mut params, redirects, args).await;
+    let redirected = setup_command_redirects(guard.shell(), &mut params, redirects, &args).await;
     guard
         .shell()
         .env_mut()
@@ -3172,13 +3180,13 @@ async fn execute_command<T: Into<String>>(
     drop(guard);
 
     if let Some(no_fork) = no_fork {
-        exec_in_place(&mut context.shell, no_fork, args, &params);
+        exec_in_place(&mut context.shell, no_fork, &args, &params);
     }
 
     // Construct the command struct.
-    let mut cmd =
-        commands::SimpleCommand::new(context.shell, params, cmd_name.into(), args.iter().cloned());
+    let mut cmd = commands::SimpleCommand::new(context.shell, params, cmd_name.into(), args);
     cmd.process_group_id = context.process_group_id;
+    cmd.record_last_arg = record_last_arg;
 
     // Arrange to pop off that ephemeral environment scope.
     cmd.post_execute = Some(|shell| shell.env_mut().pop_scope(EnvironmentScope::Command));

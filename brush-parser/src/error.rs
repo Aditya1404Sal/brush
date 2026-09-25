@@ -181,6 +181,10 @@ pub fn bash_diagnostic(
                 vec![std::format!(
                     "line {line}: unexpected EOF while looking for matching `)'"
                 )]
+            } else if let Some(rejected) =
+                rejected_token(&tokens).and_then(|index| tokens.get(index))
+            {
+                near(rejected.to_str(), rejected.location().start.line)
             } else if let Some((token, line)) = misplaced_last(&tokens) {
                 near(token, line)
             } else if let Some(line) = open_function_parenthesis(&tokens) {
@@ -197,6 +201,12 @@ pub fn bash_diagnostic(
         }
         ParseError::Tokenizing { inner, .. } => {
             use tokenizer::TokenizerError as T;
+            // Bash reads a token only as its parser wants one, so a token its grammar rejects
+            // before the text that cannot be read (`fi) $(echo`) is what it reports.
+            let read = tokens_read(source, options);
+            if let Some(rejected) = rejected_token(&read).and_then(|index| read.get(index)) {
+                return near(rejected.to_str(), rejected.location().start.line);
+            }
             let (line, closing) = match inner {
                 T::UnterminatedDoubleQuote(position) => (position.line, '"'),
                 T::UnterminatedSingleQuote(position) | T::UnterminatedAnsiCQuote(position) => {
@@ -689,7 +699,7 @@ pub fn command_substitution_diagnostic(
     first_line: usize,
     options: &crate::ParserOptions,
 ) -> Vec<String> {
-    let lines = match tokenizer::command_substitution_len(text, &options.tokenizer_options()) {
+    let mut lines = match tokenizer::command_substitution_len(text, &options.tokenizer_options()) {
         Err(inner) => bash_diagnostic(
             &ParseError::Tokenizing {
                 inner,
@@ -715,21 +725,17 @@ pub fn command_substitution_diagnostic(
             };
             match error {
                 None => vec![],
-                Some(error) => {
-                    let mut lines = bash_diagnostic(&error, text, options);
-                    // Bash names what it was looking for when the token is not the `)`.
-                    if let Some(first) = lines.first_mut() {
-                        if first.contains("syntax error near unexpected token `")
-                            && !first.ends_with("`)'")
-                        {
-                            first.push_str(" while looking for matching `)'");
-                        }
-                    }
-                    lines
-                }
+                Some(error) => bash_diagnostic(&error, text, options),
             }
         }
     };
+    // Bash names what it was looking for when the token is not the `)`, also when it met the token
+    // before text it could not read (`$(fi) $(echo`, `$(echo (a)`).
+    if let Some(first) = lines.first_mut() {
+        if first.contains("syntax error near unexpected token `") && !first.ends_with("`)'") {
+            first.push_str(" while looking for matching `)'");
+        }
+    }
     // The lines are numbered from the substitution's first line.
     lines
         .into_iter()
@@ -845,8 +851,10 @@ fn unexpected_token(
         let word = rest.split_whitespace().next().unwrap_or("newline");
         return (word.to_owned(), position.line);
     };
-    if index > 0
-        && matches!(tokens[index].to_str(), ";" | "\n" | "&" | ")")
+    if let Some(rejected) = rejected_token(tokens).filter(|rejected| *rejected <= index) {
+        index = rejected;
+    } else if index > 0
+        && matches!(tokens[index].to_str(), ";" | "\n" | "&")
         && RESERVED.contains(&tokens[index - 1].to_str())
     {
         index -= 1;
@@ -865,6 +873,104 @@ fn unexpected_token(
         text => text,
     };
     (text.to_owned(), token.location().start.line)
+}
+
+/// The tokens of `source` up to the first that cannot be read.
+fn tokens_read(source: &str, options: &crate::ParserOptions) -> Vec<crate::Token> {
+    let mut reader = std::io::BufReader::new(source.as_bytes());
+    let mut tokenizer = tokenizer::Tokenizer::new(&mut reader, &options.tokenizer_options());
+    let mut tokens = vec![];
+    while let Ok(result) = tokenizer.next_token() {
+        match result {
+            tokenizer::TokenizeResult {
+                token: Some(token), ..
+            } => tokens.push(token),
+            tokenizer::TokenizeResult {
+                reason: tokenizer::TokenEndReason::EndOfInput,
+                ..
+            } => break,
+            _ => (),
+        }
+    }
+    tokens
+}
+
+/// The first of `tokens` that bash's grammar rejects where the parser here reads on: a reserved
+/// word where a command starts that closes nothing open there (`fi)`, `then x`), which bash
+/// never reads as a command's name; or what follows `name (` other than its `)` (`echo (a)`),
+/// which bash reads as the start of a function definition.
+fn rejected_token(tokens: &[crate::Token]) -> Option<usize> {
+    // The compound commands open, each by the reserved word it last read.
+    let mut open: Vec<&str> = Vec::new();
+    let mut command_start = true;
+    let mut function_name = false;
+    for (index, token) in tokens.iter().enumerate() {
+        let text = token.to_str();
+        match token {
+            crate::Token::Operator(..) => {
+                match text {
+                    "(" if command_start => open.push("("),
+                    ")" if open.last() == Some(&"(") => {
+                        open.pop();
+                    }
+                    _ => {}
+                }
+                command_start = matches!(
+                    text,
+                    ";" | "\n" | "&" | "&&" | "||" | "|" | "|&" | "(" | ")" | ";;" | ";&" | ";;&"
+                );
+            }
+            crate::Token::Word(..) if command_start => {
+                let top = open.last().copied();
+                let fits = match text {
+                    "then" => matches!(top, Some("if" | "elif")),
+                    "elif" | "else" => top == Some("then"),
+                    "fi" => matches!(top, Some("then" | "else")),
+                    "do" => matches!(top, Some("while" | "until" | "for" | "select")),
+                    "done" => top == Some("do"),
+                    "esac" => top == Some("case"),
+                    "}" => top == Some("{"),
+                    _ => true,
+                };
+                if !fits {
+                    return Some(index);
+                }
+                match text {
+                    "if" | "while" | "until" | "for" | "select" | "case" | "{" => open.push(text),
+                    "then" | "elif" | "else" | "do" => {
+                        open.pop();
+                        open.push(text);
+                    }
+                    "fi" | "done" | "esac" | "}" => {
+                        open.pop();
+                    }
+                    _ if !function_name
+                        && !tokenizer::is_assignment_word(text)
+                        && tokens
+                            .get(index + 1)
+                            .is_some_and(|next| next.to_str() == "(")
+                        && tokens
+                            .get(index + 2)
+                            .is_some_and(|after| !matches!(after.to_str(), ")" | "\n")) =>
+                    {
+                        return Some(index + 2);
+                    }
+                    _ => {}
+                }
+                function_name = text == "function";
+                command_start = matches!(
+                    text,
+                    "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "{" | "!" | "time"
+                );
+            }
+            // The name after `function` is followed by the function's body.
+            crate::Token::Word(..) => {
+                command_start = function_name;
+                function_name = false;
+            }
+        }
+    }
+    None
 }
 
 /// The innermost compound command still open at the end of `tokens`, and the line it began on.
@@ -943,6 +1049,36 @@ mod tests {
             .err()
             .map(|error| bash_diagnostic(&error, source, &options))
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn names_a_reserved_word_that_closes_nothing() {
+        for (source, token) in [
+            ("fi)", "fi"),
+            ("then x", "then"),
+            ("then", "then"),
+            ("echo hi;fi)", "fi"),
+            ("{ a; })", ")"),
+            ("if a; then b; fi)", ")"),
+            ("function f { a; }\nfi", "fi"),
+            ("case x in a) b;; esac\ndone", "done"),
+            ("for i in a; do b; done; fi", "fi"),
+            ("while a; do if b; then c; fi; done )", ")"),
+            ("echo (a)", "a"),
+            ("echo (a", "a"),
+            ("fi) $(echo z", "fi"),
+            ("fi \"a", "fi"),
+            ("a=(x | y)", "|"),
+        ] {
+            assert_eq!(
+                diagnose(source)[0],
+                format!(
+                    "line {}: syntax error near unexpected token `{token}'",
+                    source.lines().count()
+                ),
+                "{source}"
+            );
+        }
     }
 
     #[test]
