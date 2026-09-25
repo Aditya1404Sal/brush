@@ -832,7 +832,11 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
             };
             let result = shell.exit_with_trap_in(result, &params).await;
             completed.set(true);
-            result
+            // A stage is a subshell: its `exit`, `break` or `return` ends only the stage.
+            result.map(|result| ExecutionResult {
+                terminating_signal: result.terminating_signal,
+                ..ExecutionResult::from(result.exit_code)
+            })
         };
         let result = match numbered {
             Some(numbered) => numbered.run(body).await,
