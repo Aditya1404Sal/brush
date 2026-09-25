@@ -2419,13 +2419,15 @@ async fn apply_assignment_unchecked(
         }
     };
 
-    // Assigning to an integer variable evaluates the value arithmetically.
+    // Assigning to an integer variable evaluates the value arithmetically, and a value that does
+    // not evaluate ends the shell, as in bash.
     let new_value = if shell
         .env()
         .get(variable_name)
         .is_some_and(|(_, existing)| existing.is_treated_as_integer())
     {
-        arithmetic::eval_integer_literal(shell, new_value)?
+        arithmetic::eval_integer_literal(shell, new_value)
+            .map_err(|error| error::Error::from(error).into_fatal())?
     } else {
         new_value
     };

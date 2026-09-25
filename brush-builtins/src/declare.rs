@@ -542,7 +542,8 @@ impl DeclareCommand {
     }
 
     /// A value assigned to an integer variable (already one, or made one by this declaration)
-    /// is evaluated arithmetically, as in bash.
+    /// is evaluated arithmetically, as in bash, where a value that does not evaluate ends the
+    /// shell.
     fn evaluate_if_integer(
         &self,
         context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
@@ -560,7 +561,7 @@ impl DeclareCommand {
         match value {
             Some(value) if becomes_integer => Ok(Some(
                 brush_core::arithmetic::eval_integer_literal(context.shell, value)
-                    .map_err(brush_core::Error::from)?,
+                    .map_err(|error| brush_core::Error::from(error).into_fatal())?,
             )),
             value => Ok(value),
         }

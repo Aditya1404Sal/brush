@@ -747,6 +747,14 @@ async fn call_builtin(
                     ))
                     .into_fatal();
                 }
+                // A value an integer variable cannot take ends the shell, named by the builtin.
+                error::ErrorKind::EvalError(_) if inner.is_fatal() => {
+                    return error::Error::from(error::ErrorKind::BuiltinError(
+                        Box::new(e),
+                        builtin_name,
+                    ))
+                    .into_fatal();
+                }
                 _ => (),
             }
         }

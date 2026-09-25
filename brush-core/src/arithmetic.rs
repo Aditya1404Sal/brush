@@ -5,6 +5,10 @@ use std::borrow::Cow;
 use crate::{ExecutionParameters, Shell, env, expansion, extensions, variables};
 use brush_parser::ast;
 
+mod syntax;
+
+pub use syntax::SyntaxError;
+
 /// Maximum recursion depth for arithmetic variable dereference chains
 /// (e.g., a=b, b=c, c=a would cycle through variable dereferences).
 const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
@@ -37,8 +41,12 @@ pub enum EvalError {
     FailedToUpdateEnvironment,
 
     /// Failed to parse an arithmetic expression.
-    #[error("syntax error: operand expected")]
+    #[error("arithmetic syntax error: operand expected")]
     ParseError(String),
+
+    /// A malformed expression, with the error and the token bash names.
+    #[error("{0}")]
+    Syntax(Box<SyntaxError>),
 
     /// Error expanding an unset variable.
     #[error("{0}: unbound variable")]
@@ -107,12 +115,7 @@ pub(crate) async fn expand_and_eval(
         .map_err(|_e| EvalError::FailedToExpandExpression(expr.to_owned()))?;
 
     // Now parse.
-    let expr = brush_parser::arithmetic::parse(&expanded_self).map_err(|_e| {
-        EvalError::InExpression(
-            expanded_self.clone(),
-            Box::new(EvalError::ParseError(expanded_self.clone())),
-        )
-    })?;
+    let expr = parse(&expanded_self)?;
 
     // Trace if applicable.
     if trace_if_needed && shell.options().print_commands_and_arguments {
@@ -121,10 +124,26 @@ pub(crate) async fn expand_and_eval(
             .await;
     }
 
-    // Now evaluate. Bash names the expression without its leading whitespace.
-    expr.eval(shell).map_err(|error| {
-        EvalError::InExpression(expanded_self.trim_start().to_owned(), Box::new(error))
-    })
+    // Now evaluate.
+    expr.eval(shell)
+        .map_err(|error| EvalError::in_expression(&expanded_self, error))
+}
+
+/// Parses an arithmetic expression, failing as bash reports a malformed one.
+///
+/// # Arguments
+///
+/// * `text` - The (already expanded) expression.
+pub fn parse(text: &str) -> Result<ast::ArithmeticExpr, EvalError> {
+    match brush_parser::arithmetic::parse(text) {
+        // Bash's grammar is stricter than the parser's in places (`-a=1`), so an expression bash
+        // rejects fails even when it parses.
+        Ok(expr) => match syntax::check(text) {
+            Some(error) => Err(EvalError::Syntax(Box::new(error))),
+            None => Ok(expr),
+        },
+        Err(_) => Err(EvalError::Syntax(Box::new(syntax::diagnose(text)))),
+    }
 }
 
 /// Bash's wording for an arithmetic error: `EXPR: message (error token is "TOKEN")`, where the
@@ -133,11 +152,12 @@ fn in_expression_message(expr: &str, error: &EvalError) -> String {
     let token = match error {
         EvalError::DivideByZero => expr
             .rsplit_once(['/', '%'])
-            .map(|(_, rest)| rest.trim().to_owned()),
+            .map(|(_, rest)| rest.to_owned()),
         EvalError::NegativeExponent => expr
             .rsplit_once("**")
             .map(|(_, rest)| rest.trim().trim_start_matches('-').to_owned()),
         EvalError::ParseError(_) => expr.trim_end().chars().last().map(String::from),
+        EvalError::RecursionLimitExceeded => Some(expr.to_owned()),
         _ => None,
     };
     match (error, token) {
@@ -167,9 +187,9 @@ pub fn eval_integer_assignment(
     if value.trim().is_empty() {
         return Ok(0);
     }
-    let expr = brush_parser::arithmetic::parse(value)
-        .map_err(|_e| EvalError::ParseError(value.to_owned()))?;
-    expr.eval(shell)
+    parse(value)?
+        .eval(shell)
+        .map_err(|error| EvalError::in_expression(value, error))
 }
 
 /// Evaluates every value in an assignment to an integer variable (see
@@ -312,8 +332,8 @@ fn deref_lvalue(
         }
     };
 
-    let parsed_value = brush_parser::arithmetic::parse(value_str.as_ref())
-        .map_err(|_err| EvalError::ParseError(value_str.to_string()))?;
+    let value_str = value_str.into_owned();
+    let parsed_value = parse(&value_str)?;
 
     // Literals don't need depth tracking — they can't cause recursion.
     // Only increment depth when the parsed value requires further evaluation
@@ -322,12 +342,15 @@ fn deref_lvalue(
         return eval_expr_impl(&parsed_value, shell, depth);
     }
 
+    // Bash allows 1024 nested expressions, counting the one the reference is in.
     let new_depth = depth + 1;
-    if new_depth > MAX_VARIABLE_DEREF_DEPTH {
+    if new_depth >= MAX_VARIABLE_DEREF_DEPTH {
         return Err(EvalError::RecursionLimitExceeded);
     }
 
+    // An error in the value names the value, as bash evaluates it as an expression of its own.
     eval_expr_impl(&parsed_value, shell, new_depth)
+        .map_err(|error| EvalError::in_expression(&value_str, error))
 }
 
 fn apply_unary_op(
@@ -516,9 +539,10 @@ fn element_key(
     if associative {
         return Ok(index.to_owned());
     }
-    let index_expr = brush_parser::arithmetic::parse(index)
-        .map_err(|_err| EvalError::ParseError(index.to_owned()))?;
-    Ok(eval_expr_impl(&index_expr, shell, depth)?.to_string())
+    let index_expr = parse(index)?;
+    Ok(eval_expr_impl(&index_expr, shell, depth)
+        .map_err(|error| EvalError::in_expression(index, error))?
+        .to_string())
 }
 
 /// The error for an assignment the environment refused: bash names a readonly variable.
@@ -532,6 +556,20 @@ fn assignment_error(error: &crate::error::Error) -> EvalError {
 }
 
 impl EvalError {
+    /// The error in the named expression, which bash reports with the expression (without its
+    /// leading blanks). An error already located in an expression, such as one in a variable's
+    /// value, keeps that one.
+    #[must_use]
+    pub fn in_expression(expression: &str, error: Self) -> Self {
+        match error {
+            Self::Syntax(_) | Self::InExpression(..) => error,
+            error => Self::InExpression(
+                syntax::without_leading_blanks(expression).to_owned(),
+                Box::new(error),
+            ),
+        }
+    }
+
     /// The variable, if the error is an unset variable under `set -u`, which ends the shell
     /// rather than failing only the command.
     pub fn unset_variable(&self) -> Option<&str> {

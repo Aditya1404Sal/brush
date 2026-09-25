@@ -31,8 +31,7 @@ impl builtins::Command for LetCommand {
         }
 
         for expr in &self.exprs {
-            let evaluated = match brush_parser::arithmetic::parse(expr.as_str())
-                .map_err(|_err| EvalError::ParseError(expr.clone()))
+            let evaluated = match brush_core::arithmetic::parse(expr.as_str())
                 .and_then(|parsed| parsed.eval(context.shell))
             {
                 Ok(evaluated) => evaluated,
@@ -73,7 +72,7 @@ fn report(
             context.shell.diagnostic_prefix()
         )?;
     } else {
-        context.report(EvalError::InExpression(expr.to_owned(), Box::new(error)))?;
+        context.report(EvalError::in_expression(expr, error))?;
     }
     Ok(ExecutionResult::general_error())
 }
