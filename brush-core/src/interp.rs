@@ -2420,11 +2420,13 @@ async fn apply_assignment_unchecked(
     };
 
     // Assigning to an integer variable evaluates the value arithmetically, and a value that does
-    // not evaluate ends the shell, as in bash.
-    let new_value = if shell
-        .env()
-        .get(variable_name)
-        .is_some_and(|(_, existing)| existing.is_treated_as_integer())
+    // not evaluate ends the shell, as in bash. A prefix assignment (`n=1+2 cmd`) makes a new
+    // variable for the command, without the attribute, so it keeps its text.
+    let new_value = if creation_scope != EnvironmentScope::Command
+        && shell
+            .env()
+            .get(variable_name)
+            .is_some_and(|(_, existing)| existing.is_treated_as_integer())
     {
         arithmetic::eval_integer_literal(shell, new_value)
             .map_err(|error| error::Error::from(error).into_fatal())?
