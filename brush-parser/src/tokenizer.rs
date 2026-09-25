@@ -1339,6 +1339,19 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 self.consume_array_subscript(&mut state)?;
             }
             //
+            // A word of a compound array assignment that starts with `[` starts with a subscript
+            // (`a=([ 1 ]=x)`): as in bash, read through the matching `]` as part of the word,
+            // blanks included.
+            else if c == '['
+                && self.cross_state.compound_assignment
+                && self.cross_state.nested_constructs == 0
+                && !state.started_token()
+            {
+                self.consume_char()?;
+                state.append_char(c);
+                self.consume_array_subscript(&mut state)?;
+            }
+            //
             // [Extension]
             // If extended globbing is enabled, the last consumed character is an
             // unquoted start of an extglob pattern, *and* if the current character
@@ -2247,6 +2260,28 @@ echo after
             strs("if true; then e[a[1] > 0]=v; fi")?,
             ["if", "true", ";", "then", "e[a[1] > 0]=v", ";", "fi"]
         );
+        // So is a leading subscript in a compound assignment's elements, blanks and all.
+        assert_eq!(
+            strs("b=([ 1 ]=x [2]=y [ a[0] ]=z [ 1 ] =w c) m+=(\n[ k\t]=v)")?,
+            [
+                "b=",
+                "(",
+                "[ 1 ]=x",
+                "[2]=y",
+                "[ a[0] ]=z",
+                "[ 1 ]",
+                "=w",
+                "c",
+                ")",
+                "m+=",
+                "(",
+                "\n",
+                "[ k\t]=v",
+                ")"
+            ]
+        );
+        // Not elsewhere.
+        assert_eq!(strs("echo [ 1 ]")?, ["echo", "[", "1", "]"]);
         // A case pattern's `)` inside a substitution does not close it.
         assert_eq!(
             strs("x=$(case a in a) echo m;; (b|c) echo n;; esac); y=$( (echo s) )")?,

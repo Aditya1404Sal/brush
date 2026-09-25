@@ -737,6 +737,16 @@ async fn call_builtin(
                 error::ErrorKind::ReadonlyVariableNamed(name) => {
                     return error::ErrorKind::ReadonlyVariableNamed(name.clone()).into();
                 }
+                // A compound assignment's subscript that fails ends the shell, unnamed by the
+                // builtin, as in bash.
+                error::ErrorKind::SubscriptEvalError(text) if inner.is_fatal() => {
+                    return error::Error::from(error::ErrorKind::SubscriptEvalError(text.clone()))
+                        .into_fatal();
+                }
+                error::ErrorKind::BadArraySubscript(text) if inner.is_fatal() => {
+                    return error::Error::from(error::ErrorKind::BadArraySubscript(text.clone()))
+                        .into_fatal();
+                }
                 // `command nosuch` reports the command, as bash does, not `command`.
                 error::ErrorKind::CommandNotFound(name) => {
                     return error::ErrorKind::CommandNotFound(name.clone()).into();

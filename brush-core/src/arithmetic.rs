@@ -233,6 +233,136 @@ pub fn eval_integer_literal(
     })
 }
 
+/// Resolves the subscripts of a compound assignment to an indexed array.
+///
+/// As bash's `assign_compound_array_list` does, each subscript (already expanded, as an
+/// element's words are) is expanded again and evaluated arithmetically, in order, and the
+/// elements are placed by [`place_indexed_array_literal`]. An error in a subscript ends the
+/// shell, as in bash.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to use for evaluation.
+/// * `params` - The execution parameters to use.
+/// * `name` - The array variable being assigned.
+/// * `append` - Whether the assignment appends (`a+=(...)`).
+/// * `literal` - The expanded elements.
+pub async fn resolve_indexed_array_literal(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    name: &str,
+    append: bool,
+    literal: variables::ArrayLiteral,
+) -> Result<variables::ArrayLiteral, crate::error::Error> {
+    let mut evaluated = Vec::with_capacity(literal.0.len());
+    for (key, value) in literal.0 {
+        let key = match key {
+            Some(key) if key.is_empty() => return Err(bad_subscript(&key, &value)),
+            Some(key) => {
+                let index = expand_and_eval(shell, params, &key, false)
+                    .await
+                    .map_err(|error| subscript_error(&error))?;
+                Some((index, key))
+            }
+            None => None,
+        };
+        evaluated.push((key, value));
+    }
+    place_indexed_array_literal(shell, name, append, evaluated)
+}
+
+/// Evaluates the (expanded) subscript of an element of a compound assignment to an indexed
+/// array; an error, or an empty subscript, ends the shell, as in bash.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to use for evaluation.
+/// * `key` - The expanded subscript.
+/// * `value` - The element's expanded value.
+pub fn eval_indexed_array_subscript(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    key: &str,
+    value: &str,
+) -> Result<i64, crate::error::Error> {
+    if key.is_empty() {
+        return Err(bad_subscript(key, value));
+    }
+    parse(key)
+        .and_then(|expr| {
+            expr.eval(shell)
+                .map_err(|error| EvalError::in_expression(key, error))
+        })
+        .map_err(|error| subscript_error(&error))
+}
+
+/// Bash's `err_badarraysub` for an element: `[KEY]=VALUE: bad array subscript`.
+fn bad_subscript(key: &str, value: &str) -> crate::error::Error {
+    crate::error::Error::from(crate::error::ErrorKind::BadArraySubscript(format!(
+        "[{key}]={value}"
+    )))
+    .into_fatal()
+}
+
+fn subscript_error(error: &EvalError) -> crate::error::Error {
+    crate::error::Error::from(crate::error::ErrorKind::SubscriptEvalError(
+        error.to_string(),
+    ))
+    .into_fatal()
+}
+
+/// Places the elements of a compound assignment to an indexed array, subscripts evaluated.
+///
+/// As in bash, a negative subscript counts back from one past the highest index assigned so far
+/// (the existing elements' too when appending), and an element without one follows the element
+/// before. Every element of the result names its index.
+///
+/// # Arguments
+///
+/// * `shell` - The shell holding the array.
+/// * `name` - The array variable being assigned.
+/// * `append` - Whether the assignment appends (`a+=(...)`).
+/// * `elements` - Each element's evaluated subscript and its text, if it has one, and value.
+pub fn place_indexed_array_literal(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    name: &str,
+    append: bool,
+    elements: Vec<(Option<(i64, String)>, String)>,
+) -> Result<variables::ArrayLiteral, crate::error::Error> {
+    use variables::ShellValue;
+    let mut highest = if append {
+        shell
+            .env()
+            .get(name)
+            .and_then(|(_, var)| match var.value() {
+                ShellValue::IndexedArray(values) => values.keys().next_back().copied(),
+                ShellValue::String(_) => Some(0),
+                _ => None,
+            })
+    } else {
+        None
+    };
+    let mut next = highest.map_or(0, |highest| highest + 1);
+    let mut placed = Vec::with_capacity(elements.len());
+    for (key, value) in elements {
+        let index = match key {
+            None => next,
+            Some((mut index, key)) => {
+                if index < 0 {
+                    let end = highest.map_or(0, |highest| {
+                        i64::try_from(highest).unwrap_or(i64::MAX).saturating_add(1)
+                    });
+                    index = index.saturating_add(end);
+                }
+                u64::try_from(index).map_err(|_| bad_subscript(&key, &value))?
+            }
+        };
+        highest = Some(highest.map_or(index, |highest| highest.max(index)));
+        next = index.saturating_add(1);
+        placed.push((Some(index.to_string()), value));
+    }
+    Ok(variables::ArrayLiteral(placed))
+}
+
 /// Trait implemented by evaluatable arithmetic expressions.
 pub trait Evaluatable {
     /// Evaluate the given arithmetic expression, returning the resulting numeric value.

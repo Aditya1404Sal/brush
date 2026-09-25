@@ -351,6 +351,39 @@ impl DeclareCommand {
             }
         }
 
+        // A compound assignment to an indexed array evaluates its subscripts arithmetically;
+        // an associative array's are words.
+        let initial_value = match initial_value {
+            Some(ShellValueLiteral::Array(ArrayLiteral(elements)))
+                if assigned_index.is_none()
+                    && !self.assigns_associative(context, &name, current_lookup) =>
+            {
+                let mut evaluated = Vec::with_capacity(elements.len());
+                for (key, value) in elements {
+                    let key = match key {
+                        Some(key) => Some((
+                            brush_core::arithmetic::eval_indexed_array_subscript(
+                                context.shell,
+                                &key,
+                                &value,
+                            )?,
+                            key,
+                        )),
+                        None => None,
+                    };
+                    evaluated.push((key, value));
+                }
+                Some(ShellValueLiteral::Array(
+                    brush_core::arithmetic::place_indexed_array_literal(
+                        context.shell,
+                        &name,
+                        append,
+                        evaluated,
+                    )?,
+                ))
+            }
+            value => value,
+        };
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -` saves the `set` options, to restore when the function returns.
@@ -538,6 +571,28 @@ impl DeclareCommand {
             shell.env_mut().get_mut_using_policy_raw(name, lookup)
         } else {
             shell.env_mut().get_mut_using_policy(name, lookup)
+        }
+    }
+
+    /// Whether this declaration assigns to an associative array: one it makes (`-A`), or one
+    /// that already is.
+    fn assigns_associative(
+        &self,
+        context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+        name: &str,
+        lookup: EnvironmentLookup,
+    ) -> bool {
+        match self.make_associative_array.to_bool() {
+            Some(associative) => associative,
+            None => self
+                .existing_variable(context.shell, name, lookup)
+                .is_some_and(|var| {
+                    matches!(
+                        var.value(),
+                        ShellValue::AssociativeArray(_)
+                            | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+                    )
+                }),
         }
     }
 

@@ -325,6 +325,15 @@ pub enum ErrorKind {
     #[error("{0}: bad array subscript")]
     ArrayIndexOutOfRange(String),
 
+    /// An element of a compound array assignment (`[-5]=x`) whose subscript names no element.
+    #[error("{0}: bad array subscript")]
+    BadArraySubscript(String),
+
+    /// A subscript of a compound array assignment that does not evaluate; bash names no builtin
+    /// for it, even in `declare` or `local`.
+    #[error("{0}")]
+    SubscriptEvalError(String),
+
     /// Unhandled key code.
     #[error("unhandled key code: {0:?}")]
     UnhandledKeyCode(Vec<u8>),

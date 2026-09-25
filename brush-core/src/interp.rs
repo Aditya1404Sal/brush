@@ -2809,6 +2809,32 @@ async fn apply_assignment_unchecked(
             .await;
     }
 
+    // A compound assignment to an indexed array evaluates its subscripts arithmetically, after
+    // the assignment is traced as written; an associative array's are words.
+    let new_value = match new_value {
+        ShellValueLiteral::Array(literal)
+            if !shell.env().get(variable_name).is_some_and(|(_, var)| {
+                matches!(
+                    var.value(),
+                    ShellValue::AssociativeArray(_)
+                        | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+                )
+            }) =>
+        {
+            ShellValueLiteral::Array(
+                arithmetic::resolve_indexed_array_literal(
+                    shell,
+                    params,
+                    variable_name,
+                    assignment.append,
+                    literal,
+                )
+                .await?,
+            )
+        }
+        value => value,
+    };
+
     // See if we need to eval an array index.
     if let Some(idx) = &array_index {
         // An array subscript is arithmetically evaluated unless the target is an
