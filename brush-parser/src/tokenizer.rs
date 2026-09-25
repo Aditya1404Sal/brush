@@ -108,9 +108,10 @@ pub enum TokenizerError {
     #[error("unterminated extglob near {0}")]
     UnterminatedExtendedGlob(SourcePosition),
 
-    /// An unterminated variable expression was encountered at the end of the input stream.
+    /// An unterminated variable expression was encountered at the end of the input stream; it
+    /// began at the given position.
     #[error("unterminated variable expression")]
-    UnterminatedVariable,
+    UnterminatedVariable(SourcePosition),
 
     /// An unterminated command substitiion was encountered at the end of the input stream.
     #[error("unterminated command substitution")]
@@ -120,6 +121,11 @@ pub enum TokenizerError {
     /// stream; it wanted the given closing character.
     #[error("unterminated expansion")]
     UnterminatedExpansion(char),
+
+    /// An unterminated arithmetic expansion (`$((` or `$[`) was encountered at the end of the
+    /// input stream; it wanted the given closing character, and began at the given position.
+    #[error("unterminated arithmetic expansion")]
+    UnterminatedArithmetic(char, SourcePosition),
 
     /// An error occurred decoding UTF-8 characters in the input stream.
     #[error("failed to decode UTF-8 characters")]
@@ -174,7 +180,8 @@ impl TokenizerError {
                 | Self::UnterminatedBackquote(..)
                 | Self::UnterminatedCommandSubstitution
                 | Self::UnterminatedExpansion(_)
-                | Self::UnterminatedVariable
+                | Self::UnterminatedArithmetic(..)
+                | Self::UnterminatedVariable(..)
                 | Self::UnterminatedExtendedGlob(..)
                 | Self::UnterminatedHereDocuments(..)
         )
@@ -1173,8 +1180,18 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                 self.cross_state.arithmetic_expansion = true;
                             }
 
+                            // Bash names the line an arithmetic expansion left open began on.
+                            let start = self.cross_state.cursor.clone();
                             let pending = self.set_aside_pending_here_docs();
-                            self.consume_nested_construct(&mut state, ')', "(", initial_nesting)?;
+                            self.consume_nested_construct(&mut state, ')', "(", initial_nesting)
+                                .map_err(|error| match error {
+                                    TokenizerError::UnterminatedExpansion(closing)
+                                        if is_arithmetic =>
+                                    {
+                                        TokenizerError::UnterminatedArithmetic(closing, start)
+                                    }
+                                    error => error,
+                                })?;
                             self.restore_pending_here_docs(pending);
 
                             if is_arithmetic {
@@ -1193,8 +1210,15 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                             // some text will be interpreted differently as a result.
                             self.cross_state.arithmetic_expansion = true;
 
+                            let start = self.cross_state.cursor.clone();
                             let pending = self.set_aside_pending_here_docs();
-                            self.consume_nested_construct(&mut state, ']', "[", 1)?;
+                            self.consume_nested_construct(&mut state, ']', "[", 1)
+                                .map_err(|error| match error {
+                                    TokenizerError::UnterminatedExpansion(closing) => {
+                                        TokenizerError::UnterminatedArithmetic(closing, start)
+                                    }
+                                    error => error,
+                                })?;
                             self.restore_pending_here_docs(pending);
 
                             self.cross_state.arithmetic_expansion = false;
@@ -1216,6 +1240,8 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                 continue;
                             }
 
+                            // Bash names the line a parameter expansion left open began on.
+                            let start = self.cross_state.cursor.clone();
                             let pending = self.set_aside_pending_here_docs();
                             let mut pending_here_doc_tokens = vec![];
                             let mut drain_here_doc_tokens = false;
@@ -1275,7 +1301,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                         break;
                                     }
                                     TokenEndReason::EndOfInput => {
-                                        return Err(TokenizerError::UnterminatedVariable);
+                                        return Err(TokenizerError::UnterminatedVariable(start));
                                     }
                                     _ => (),
                                 }
@@ -2406,7 +2432,7 @@ HERE2
     fn tokenize_unterminated_arithmetic_expansion() {
         assert_matches!(
             tokenize_str("$(("),
-            Err(TokenizerError::UnterminatedExpansion(_))
+            Err(TokenizerError::UnterminatedArithmetic(')', _))
         );
     }
 
@@ -2414,7 +2440,7 @@ HERE2
     fn tokenize_unterminated_legacy_arithmetic_expansion() {
         assert_matches!(
             tokenize_str("$["),
-            Err(TokenizerError::UnterminatedExpansion(_))
+            Err(TokenizerError::UnterminatedArithmetic(']', _))
         );
     }
 
@@ -2476,7 +2502,7 @@ HERE2
     fn tokenize_unterminated_parameter_expansion() {
         assert_matches!(
             tokenize_str("${x"),
-            Err(TokenizerError::UnterminatedVariable)
+            Err(TokenizerError::UnterminatedVariable(_))
         );
     }
 

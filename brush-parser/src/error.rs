@@ -190,6 +190,12 @@ pub fn bash_diagnostic(
             } else if let Some(line) = open_function_parenthesis(&tokens) {
                 near("newline", line)
             } else if let Some((keyword, line)) = unclosed_command(&tokens) {
+                if keyword == "((" {
+                    // Bash reads an arithmetic command as a matched pair, as it does `$((`.
+                    return vec![std::format!(
+                        "line {line}: unexpected EOF while looking for matching `)'"
+                    )];
+                }
                 vec![std::format!(
                     "line {end_line}: syntax error: unexpected end of file from `{keyword}' command on line {line}"
                 )]
@@ -217,7 +223,9 @@ pub fn bash_diagnostic(
                     (end_line, ')')
                 }
                 T::UnterminatedExpansion(closing) => (end_line, *closing),
-                T::UnterminatedVariable => (end_line, '}'),
+                // Bash reads these as matched pairs, and names the line one began on.
+                T::UnterminatedArithmetic(closing, start) => (start.line, *closing),
+                T::UnterminatedVariable(start) => (start.line, '}'),
                 _ => return vec![std::format!("line {end_line}: syntax error: {inner}")],
             };
             vec![std::format!(
@@ -973,11 +981,12 @@ fn rejected_token(tokens: &[crate::Token]) -> Option<usize> {
     None
 }
 
-/// The innermost compound command still open at the end of `tokens`, and the line it began on.
+/// The innermost compound command still open at the end of `tokens` (or the outermost `((`
+/// arithmetic command), and the line it began on.
 fn unclosed_command(tokens: &[crate::Token]) -> Option<(String, usize)> {
     let mut open: Vec<(&str, usize)> = Vec::new();
     let mut command_start = true;
-    for token in tokens {
+    for (index, token) in tokens.iter().enumerate() {
         let text = token.to_str();
         let line = token.location().start.line;
         let close = |open: &mut Vec<(&str, usize)>, openers: &[&str]| {
@@ -991,8 +1000,17 @@ fn unclosed_command(tokens: &[crate::Token]) -> Option<(String, usize)> {
         match token {
             crate::Token::Operator(..) => {
                 match text {
+                    // `((` starts an arithmetic command, `(( ))`.
+                    "(" if command_start
+                        && tokens.get(index + 1).is_some_and(|next| {
+                            next.to_str() == "("
+                                && next.location().start.index == token.location().end.index
+                        }) =>
+                    {
+                        open.push(("((", line));
+                    }
                     "(" if command_start => open.push(("(", line)),
-                    ")" => close(&mut open, &["("]),
+                    ")" => close(&mut open, &["(", "(("]),
                     _ => {}
                 }
                 command_start = matches!(
@@ -1019,7 +1037,10 @@ fn unclosed_command(tokens: &[crate::Token]) -> Option<(String, usize)> {
             crate::Token::Word(..) => command_start = false,
         }
     }
-    open.last()
+    // Everything after an open `((` is its expression.
+    open.iter()
+        .find(|(keyword, _)| *keyword == "((")
+        .or_else(|| open.last())
         .map(|(keyword, line)| ((*keyword).to_owned(), *line))
 }
 
@@ -1311,6 +1332,30 @@ mod tests {
         assert_eq!(
             diagnose("echo first\necho $(echo x"),
             ["line 3: unexpected EOF while looking for matching `)'"]
+        );
+    }
+
+    #[test]
+    fn reports_open_matched_pairs_at_the_line_they_began_on() {
+        for (source, closing) in [
+            (":\necho ${a:-b\nc", '}'),
+            (":\necho \"${a\n", '}'),
+            (":\necho $((1+\n2", ')'),
+            (":\necho $[1+\n", ']'),
+            (":\n((1+\n2", ')'),
+            (":\n((\n", ')'),
+        ] {
+            assert_eq!(
+                diagnose(source),
+                [std::format!(
+                    "line 2: unexpected EOF while looking for matching `{closing}'"
+                )],
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            diagnose(":\n( (\n"),
+            ["line 3: syntax error: unexpected end of file from `(' command on line 2"]
         );
     }
 }
