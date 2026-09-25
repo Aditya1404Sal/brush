@@ -2191,6 +2191,13 @@ async fn apply_assignment_unchecked(
                 true
             };
 
+        // An empty subscript names no element (`a[]=v`, or `m[""]=v` in an associative array).
+        if let ast::AssignmentName::ArrayElementName(_, written) = &assignment.name
+            && (written.is_empty() || (idx.is_empty() && !will_be_indexed_array))
+        {
+            return Err(error::ErrorKind::ArrayIndexOutOfRange(written.clone()).into());
+        }
+
         if will_be_indexed_array {
             array_index = Some(
                 arithmetic::expand_and_eval(shell, params, idx.as_str(), false)
