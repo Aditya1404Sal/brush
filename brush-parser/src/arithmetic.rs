@@ -90,13 +90,17 @@ peg::parser! {
             "(" _ expr:expression() _ ")" { expr }
         }
 
+        // The subscript is kept as written: an associative array uses it as its key, and an
+        // indexed array evaluates it, as bash does.
         rule lvalue() -> ast::ArithmeticTarget =
-            name:variable_name() "[" index:expression() "]" {
-                ast::ArithmeticTarget::ArrayElement(name.to_owned(), Box::new(index))
+            name:variable_name() "[" index:$(subscript()) "]" {
+                ast::ArithmeticTarget::ArrayElement(name.to_owned(), index.to_owned())
             } /
             name:variable_name() {
                 ast::ArithmeticTarget::Variable(name.to_owned())
             }
+
+        rule subscript() = ([^ '[' | ']'] / "[" subscript() "]")*
 
         rule variable_name() -> &'input str =
             $(['a'..='z' | 'A'..='Z' | '_'](['a'..='z' | 'A'..='Z' | '_' | '0'..='9']*))
@@ -168,4 +172,38 @@ fn parse_shell_literal_number(s: &str, radix: u64) -> Result<i64, &'static str> 
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn element(input: &str) -> Option<(String, String)> {
+        match parse(input).ok()? {
+            ast::ArithmeticExpr::Reference(ast::ArithmeticTarget::ArrayElement(name, index))
+            | ast::ArithmeticExpr::UnaryAssignment(
+                _,
+                ast::ArithmeticTarget::ArrayElement(name, index),
+            ) => Some((name, index)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn subscripts_are_kept_as_written() {
+        for (input, subscript) in [
+            ("m[k]", "k"),
+            ("m[ k ]", " k "),
+            ("m[foo.txt]++", "foo.txt"),
+            ("m[a-b]", "a-b"),
+            ("a[i+1]", "i+1"),
+            ("a[b[1]]", "b[1]"),
+        ] {
+            assert_eq!(
+                element(input),
+                Some((input[..1].to_owned(), subscript.to_owned())),
+                "{input}"
+            );
+        }
+    }
 }

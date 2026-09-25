@@ -286,8 +286,8 @@ fn deref_lvalue(
 ) -> Result<i64, EvalError> {
     let value_str: Cow<'_, str> = match lvalue {
         ast::ArithmeticTarget::Variable(name) => get_var_value(shell, name.as_str())?,
-        ast::ArithmeticTarget::ArrayElement(name, index_expr) => {
-            let index_str = eval_expr_impl(index_expr, shell, depth)?.to_string();
+        ast::ArithmeticTarget::ArrayElement(name, index) => {
+            let index_str = element_key(shell, name, index, depth)?;
 
             shell
                 .env()
@@ -467,8 +467,8 @@ fn assign(
                 )
                 .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
         }
-        ast::ArithmeticTarget::ArrayElement(name, index_expr) => {
-            let index_str = eval_expr_impl(index_expr, shell, depth)?.to_string();
+        ast::ArithmeticTarget::ArrayElement(name, index) => {
+            let index_str = element_key(shell, name, index, depth)?;
 
             shell
                 .env_mut()
@@ -485,6 +485,29 @@ fn assign(
     }
 
     Ok(value)
+}
+
+/// The key of `name[index]`: an associative array's subscript is its key as written, and an
+/// indexed array's is evaluated arithmetically.
+fn element_key(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    name: &str,
+    index: &str,
+    depth: u32,
+) -> Result<String, EvalError> {
+    let associative = shell.env().get(name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            variables::ShellValue::AssociativeArray(_)
+                | variables::ShellValue::Unset(variables::ShellValueUnsetType::AssociativeArray)
+        )
+    });
+    if associative {
+        return Ok(index.to_owned());
+    }
+    let index_expr = brush_parser::arithmetic::parse(index)
+        .map_err(|_err| EvalError::ParseError(index.to_owned()))?;
+    Ok(eval_expr_impl(&index_expr, shell, depth)?.to_string())
 }
 
 const fn bool_to_i64(value: bool) -> i64 {

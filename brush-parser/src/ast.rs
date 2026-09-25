@@ -2412,8 +2412,8 @@ impl Display for UnaryAssignmentOperator {
 pub enum ArithmeticTarget {
     /// A named variable.
     Variable(String),
-    /// An element in an array.
-    ArrayElement(String, Box<ArithmeticExpr>),
+    /// An element in an array, with its subscript as written.
+    ArrayElement(String, String),
 }
 
 impl Node for ArithmeticTarget {}
