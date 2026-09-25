@@ -191,17 +191,17 @@ mod tests {
 
     #[test]
     fn subscripts_are_kept_as_written() {
-        for (input, subscript) in [
-            ("m[k]", "k"),
-            ("m[ k ]", " k "),
-            ("m[foo.txt]++", "foo.txt"),
-            ("m[a-b]", "a-b"),
-            ("a[i+1]", "i+1"),
-            ("a[b[1]]", "b[1]"),
+        for (input, array, subscript) in [
+            ("m[k]", "m", "k"),
+            ("m[ k ]", "m", " k "),
+            ("m[foo.txt]++", "m", "foo.txt"),
+            ("m[a-b]", "m", "a-b"),
+            ("a[i+1]", "a", "i+1"),
+            ("a[b[1]]", "a", "b[1]"),
         ] {
             assert_eq!(
                 element(input),
-                Some((input[..1].to_owned(), subscript.to_owned())),
+                Some((array.to_owned(), subscript.to_owned())),
                 "{input}"
             );
         }
