@@ -256,7 +256,10 @@ pub fn apply_trap_dispositions(traps: &TrapHandlerConfig) {
 }
 
 /// Records a failed, nonempty write. No handler executes in the I/O callback.
-pub(crate) fn record_broken_pipe() {
+///
+/// An embedder's own stream calls this when it refuses a write as a closed pipe would, so the
+/// writer gets SIGPIPE as with the shell's own pipes.
+pub fn record_broken_pipe() {
     if let Some(state) = current() {
         state.deliver(signals::PIPE);
     }

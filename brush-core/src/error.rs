@@ -287,6 +287,10 @@ pub enum ErrorKind {
     )]
     FunctionNestingTooDeep(String, usize),
 
+    /// A command substitution's output exceeded what the shell holds in memory.
+    #[error("command substitution: output over 16 MiB is unsupported in bash-tool")]
+    SubstitutionTooLarge,
+
     /// Execution would nest deeper than the stack can hold.
     #[error("maximum nesting level exceeded: deeper nesting is unsupported in bash-tool")]
     NestingTooDeep,

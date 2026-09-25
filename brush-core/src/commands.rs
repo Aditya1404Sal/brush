@@ -1019,17 +1019,45 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
         let (mut reader, writer) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
-        let mut output_str = String::new();
+        // At most `MAX_SUBSTITUTION_BYTES` are kept; past that the reader closes, so the
+        // substitution's writers get SIGPIPE, and the substitution fails.
+        let read = async move {
+            use futures::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let count = reader.async_io().read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>((output, false));
+                }
+                if output.len() + count > openfiles::MAX_SUBSTITUTION_BYTES {
+                    drop(reader);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+        };
         let (cmd_result, output_result) = futures::join!(
             crate::execution::process::run_process(
                 subshell.traps().pipe_disposition(),
                 run_substitution_command(subshell, params, s)
             ),
-            futures::io::AsyncReadExt::read_to_string(reader.async_io(), &mut output_str)
+            read
         );
-        output_result?;
-        shell.set_last_exit_status(cmd_result?.exit_code.into());
-        Ok(output_str)
+        let (output, truncated) = output_result?;
+        let status = cmd_result?.exit_code.into();
+        if truncated {
+            shell.set_last_exit_status(1);
+            return Err(error::ErrorKind::SubstitutionTooLarge.into());
+        }
+        shell.set_last_exit_status(status);
+        String::from_utf8(output).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+            .into()
+        })
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -2691,18 +2691,18 @@ async fn setup_process_substitution(
     child_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
     let target_file = match kind {
         ast::ProcessSubstitutionKind::Read => {
-            let (sink, output) = openfiles::memory_sink();
+            let (sink, output) = openfiles::memory_sink(openfiles::MAX_SUBSTITUTION_BYTES);
             child_params.open_files.set_fd(OpenFiles::STDOUT_FD, sink);
             run_substitution_list(shell, &subshell_cmd.list, &child_params).await;
-            let bytes = std::mem::take(
+            let captured = std::mem::take(
                 &mut *output
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            openfiles::from_bytes(bytes)
+            truncated_input(captured)
         }
         ast::ProcessSubstitutionKind::Write => {
-            let (sink, input) = openfiles::memory_sink();
+            let (sink, input) = openfiles::memory_sink(openfiles::MAX_SUBSTITUTION_BYTES);
             params.output_substitutions.push(PendingOutputSubstitution {
                 list: subshell_cmd.list.clone(),
                 params: child_params,
@@ -2720,12 +2720,22 @@ async fn setup_process_substitution(
     Ok((fd, target_file))
 }
 
+/// A process substitution's buffered output as input: when it was cut off at the limit, a read
+/// at the end fails rather than seeing end-of-file.
+#[cfg(target_arch = "wasm32")]
+fn truncated_input(captured: openfiles::Captured) -> OpenFile {
+    let error = captured
+        .truncated
+        .then_some(openfiles::TRUNCATED_SUBSTITUTION);
+    openfiles::from_bytes_then(captured.bytes, error)
+}
+
 /// An output process substitution waiting for the command that writes to it to finish.
 #[cfg(target_arch = "wasm32")]
 pub(crate) struct PendingOutputSubstitution {
     list: ast::CompoundList,
     params: ExecutionParameters,
-    input: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    input: std::sync::Arc<std::sync::Mutex<openfiles::Captured>>,
 }
 
 /// The output substitutions one command has set up, shared by the clones of its parameters.
@@ -2788,7 +2798,7 @@ async fn run_pending_output_substitutions(
         let mut params = substitution.params;
         params
             .open_files
-            .set_fd(OpenFiles::STDIN_FD, openfiles::from_bytes(input));
+            .set_fd(OpenFiles::STDIN_FD, truncated_input(input));
         run_substitution_list(shell, &substitution.list, &params).await;
     }
 }
