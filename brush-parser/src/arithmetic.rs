@@ -75,9 +75,10 @@ peg::parser! {
             "!" _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::LogicalNot, Box::new(x)) }
             "~" _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::BitwiseNot, Box::new(x)) }
             --
-            // NOTE: We add negative lookahead to avoid ambiguity with the pre-increment/pre-decrement operators.
-            "+" !['+'] _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryPlus, Box::new(x)) }
-            "-" !['-'] _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryMinus, Box::new(x)) }
+            // NOTE: We add negative lookahead to avoid ambiguity with the pre-increment/pre-decrement
+            // operators. As in bash, `++` or `--` not followed by a variable is two signs (`++(c)`).
+            "+" !("+" _ lvalue()) _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryPlus, Box::new(x)) }
+            "-" !("-" _ lvalue()) _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryMinus, Box::new(x)) }
             --
             "++" _ x:lvalue() { ast::ArithmeticExpr::UnaryAssignment(ast::UnaryAssignmentOperator::PrefixIncrement, x) }
             "--" _ x:lvalue() { ast::ArithmeticExpr::UnaryAssignment(ast::UnaryAssignmentOperator::PrefixDecrement, x) }
@@ -108,9 +109,13 @@ peg::parser! {
             radix:decimal_literal() "#" s:$(['0'..='9' | 'a'..='z' | 'A'..='Z' | '@' | '_']+) {?
                 parse_shell_literal_number(s, radix.cast_unsigned())
             } /
-            // Hex literal
+            // Hex literal (`0x` alone is 0, as in bash)
             "0" ['x' | 'X'] s:$(['0'..='9' | 'a'..='f' | 'A'..='F']*) {?
-                i64::from_str_radix(s, 16).or(Err("i64"))
+                if s.is_empty() {
+                    Ok(0)
+                } else {
+                    i64::from_str_radix(s, 16).or(Err("i64"))
+                }
             } /
             // Octal literal
             s:$("0" ['0'..='8']*) {?

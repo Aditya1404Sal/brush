@@ -219,6 +219,10 @@ struct CrossTokenParseState {
     queued_tokens: Vec<TokenizeResult>,
     /// Are we in an arithmetic expansion?
     arithmetic_expansion: bool,
+    /// Is the next word in a command's first words, where it can be an assignment?
+    command_position: bool,
+    /// How many nested constructs (`$(...)`, `${...}` and the like) are being tokenized.
+    nested_constructs: u32,
 }
 
 /// Options controlling how the tokenizer operates.
@@ -352,6 +356,13 @@ impl TokenParseState {
 
         // TODO(tokenizer): Make sure the here-tag meets criteria (and isn't a newline).
         let current_here_state = std::mem::take(&mut cross_token_state.here_state);
+        if !matches!(current_here_state, HereState::InHereDocs) {
+            cross_token_state.command_position = starts_command_words(
+                self.current_token(),
+                self.token_is_operator,
+                cross_token_state.command_position,
+            );
+        }
         match current_here_state {
             HereState::NextTokenIsHereTag { remove_tabs } => {
                 // Don't yield the operator as a token yet. We need to make sure we collect
@@ -561,6 +572,8 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 current_here_tags: vec![],
                 queued_tokens: vec![],
                 arithmetic_expansion: false,
+                command_position: true,
+                nested_constructs: 0,
             },
         }
     }
@@ -615,10 +628,12 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     /// The construct's tokens belong to it, not to the tokens queued up after a pending here tag,
     /// and the pending bodies start on the line after the one the construct ends on, as in bash.
     /// A here-document opened inside the construct is tokenized there.
-    fn set_aside_pending_here_docs(&mut self) -> (HereState, Vec<HereTag>) {
+    fn set_aside_pending_here_docs(&mut self) -> (HereState, Vec<HereTag>, bool) {
+        self.cross_state.nested_constructs += 1;
         (
             std::mem::take(&mut self.cross_state.here_state),
             std::mem::take(&mut self.cross_state.current_here_tags),
+            std::mem::replace(&mut self.cross_state.command_position, false),
         )
     }
 
@@ -626,8 +641,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     /// nested construct left pending after them.
     fn restore_pending_here_docs(
         &mut self,
-        (here_state, mut here_tags): (HereState, Vec<HereTag>),
+        (here_state, mut here_tags, command_position): (HereState, Vec<HereTag>, bool),
     ) {
+        self.cross_state.nested_constructs -= 1;
+        self.cross_state.command_position = command_position;
         if here_tags.is_empty() && matches!(here_state, HereState::None) {
             return;
         }
@@ -689,8 +706,18 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             if let Some(cur_token_value) = cur_token.token {
                 state.append_str(cur_token_value.to_str());
 
-                if matches!(cur_token_value, Token::Operator(o, _) if o == nesting_open) {
-                    nesting_count += 1;
+                match &cur_token_value {
+                    Token::Operator(o, _) if o == nesting_open => nesting_count += 1,
+                    // `[` is not an operator, so a subscript's opening bracket is inside a word
+                    // (`$[a[0] < 9]`); each one left open needs its own closing bracket. A word
+                    // can also hold both (`+(a[1])`, read whole as a pattern).
+                    Token::Word(w, _) if nesting_open == "[" => {
+                        let open = w.matches('[').count();
+                        let closed = w.matches(']').count();
+                        nesting_count +=
+                            u32::try_from(open.saturating_sub(closed)).unwrap_or(u32::MAX);
+                    }
+                    _ => (),
                 }
             }
 
@@ -1115,6 +1142,21 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 }
             }
             //
+            // In a command's first words, `NAME[` starts an array element to assign to. As bash
+            // does, read through the matching `]` as part of the word, blanks and operators
+            // included (`b[x > 2]=y`).
+            else if c == '['
+                && self.cross_state.command_position
+                && self.cross_state.nested_constructs == 0
+                && state.unquoted()
+                && !state.in_operator()
+                && is_valid_name(state.current_token())
+            {
+                self.consume_char()?;
+                state.append_char(c);
+                self.consume_array_subscript(&mut state)?;
+            }
+            //
             // [Extension]
             // If extended globbing is enabled, the last consumed character is an
             // unquoted start of an extglob pattern, *and* if the current character
@@ -1205,7 +1247,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             {
                 self.consume_char()?;
                 state.append_char(c);
-            } else if c == '#' {
+            } else if c == '#' && !self.cross_state.arithmetic_expansion {
                 // Consume the '#'.
                 self.consume_char()?;
 
@@ -1237,6 +1279,37 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         let result = result.unwrap();
 
         Ok(result)
+    }
+
+    /// Consumes an array subscript through its matching `]` (the `[` already consumed), quotes
+    /// and nested brackets included, appending it to the token.
+    fn consume_array_subscript(
+        &mut self,
+        state: &mut TokenParseState,
+    ) -> Result<(), TokenizerError> {
+        let mut depth = 1;
+        let mut quote = None;
+        while depth > 0 {
+            let Some(c) = self.next_char()? else {
+                return Err(TokenizerError::UnterminatedExpansion(']'));
+            };
+            state.append_char(c);
+            match (quote, c) {
+                (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+                (Some('\''), _) => (),
+                (_, '\\') => {
+                    if let Some(escaped) = self.next_char()? {
+                        state.append_char(escaped);
+                    }
+                }
+                (Some(_), _) => (),
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '[') => depth += 1,
+                (None, ']') => depth -= 1,
+                _ => (),
+            }
+        }
+        Ok(())
     }
 
     fn remove_here_end_tag(
@@ -1341,6 +1414,57 @@ impl<R: ?Sized + std::io::BufRead> Iterator for Tokenizer<'_, R> {
 
 const fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
+}
+
+/// Whether `s` is a valid variable name.
+fn is_valid_name(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether the word after a token is still among a command's first words, where it can be an
+/// assignment: after a control operator or a reserved word that starts a command, or after an
+/// assignment in that position.
+fn starts_command_words(token: &str, is_operator: bool, command_position: bool) -> bool {
+    if is_operator {
+        return matches!(
+            token,
+            ";" | "&" | "&&" | "||" | "|" | "|&" | "(" | ")" | "\n" | ";;" | ";&" | ";;&"
+        );
+    }
+    if matches!(
+        token,
+        "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "!" | "{" | "time"
+    ) {
+        return true;
+    }
+    command_position && is_assignment_word(token)
+}
+
+/// Whether `token` looks like an assignment: a name, an optional subscript, then `=` or `+=`.
+fn is_assignment_word(token: &str) -> bool {
+    let name_len = token
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(token.len());
+    let (name, mut rest) = token.split_at(name_len);
+    if !is_valid_name(name) {
+        return false;
+    }
+    if rest.starts_with('[') {
+        let mut depth = 0;
+        let Some(end) = rest.find(|c| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => (),
+            }
+            depth == 0
+        }) else {
+            return false;
+        };
+        rest = rest.get(end + 1..).unwrap_or_default();
+    }
+    rest.starts_with('=') || rest.starts_with("+=")
 }
 
 const fn does_char_newly_affect_quoting(state: &TokenParseState, c: char) -> bool {
@@ -1652,6 +1776,46 @@ echo after
         assert_eq!(
             strs("cat <<${x}\nbody\n${x}\n")?,
             ["cat", "<<", "${x}", "body\n", "${x}", "\n"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_array_element_assignments() -> Result<()> {
+        let strs = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect())
+        };
+        // In a command's first words, an element's subscript is part of the word.
+        assert_eq!(strs("b[x>2]=y")?, ["b[x>2]=y"]);
+        assert_eq!(
+            strs("a=1 b[1 + (2)]+=x c[\"]\" d]=z cmd a[1 + 1]=w")?,
+            [
+                "a=1",
+                "b[1 + (2)]+=x",
+                "c[\"]\" d]=z",
+                "cmd",
+                "a[1",
+                "+",
+                "1]=w"
+            ]
+        );
+        assert_eq!(
+            strs("if true; then e[a[1] > 0]=v; fi")?,
+            ["if", "true", ";", "then", "e[a[1] > 0]=v", ";", "fi"]
+        );
+        // Legacy arithmetic ends at the bracket matching its own.
+        assert_eq!(strs("echo $[a[0] < 9]")?, ["echo", "$[a[0] < 9]"]);
+        assert_eq!(
+            strs("echo $[+(a[x-4]) + b[1]]")?,
+            ["echo", "$[+(a[x-4]) + b[1]]"]
+        );
+        // In arithmetic, `#` is an operator (a base), not a comment.
+        assert_eq!(
+            strs("(( 2#1 # 2 ))")?,
+            ["(", "(", "2#1", "#", "2", ")", ")"]
         );
         Ok(())
     }

@@ -618,6 +618,24 @@ pub fn parse_heredoc(
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
 
+/// Parse the text of an arithmetic expression into pieces to expand.
+///
+/// The text is the inside of `$((...))`, `((...))` or `$[...]`. Bash expands it as if it were
+/// inside double quotes, except that a double quote is removed rather than quoting; a single
+/// quote is an ordinary character.
+///
+/// # Arguments
+///
+/// * `word` - The text to parse.
+/// * `options` - The parser options to use.
+pub fn parse_arithmetic_text(
+    word: &str,
+    options: &ParserOptions,
+) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    expansion_parser::unexpanded_arithmetic_text(word, options)
+        .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
+}
+
 /// Parse the given word into a parameter expression.
 ///
 /// # Arguments
@@ -899,22 +917,32 @@ peg::parser! {
             // into us, because if we see an opening parenthesis then we *must* find its closing
             // partner.
             "(" arithmetic_word_plus_right_paren() {} /
+            // Likewise a subscript's brackets, wherever the subscript starts (`++a[0]`, `z>=a[1]`),
+            // so its `]` does not end a `$[...]`.
+            "[" arithmetic_word_plus_right_bracket() {} /
             // This branch handles the case where we have an array element name with square brackets,
             // which may (legitimately) contain the stop condition.
             array_element_name() {} /
             // This branch matches any standard piece of a word, stopping as soon as we reach
-            // either the overall stop condition *OR* an opening parenthesis. We add this latter
-            // condition to ensure that *we* handle matching parentheses.
+            // either the overall stop condition *OR* an opening parenthesis or bracket. We add
+            // the latter conditions to ensure that *we* handle matching them.
             !"(" word_piece(<param_rule_or_open_paren(<stop_condition()>)>, false /*in_command*/) {}
 
-        // This is a helper rule that matches either the provided stop condition or an opening parenthesis.
+        // This is a helper rule that matches either the provided stop condition or an opening
+        // parenthesis or bracket.
         rule param_rule_or_open_paren<T>(stop_condition: rule<T>) -> () =
             stop_condition() {} /
-            "(" {}
+            "(" {} /
+            "[" {}
 
         // This rule matches an arithmetic word followed by a right parenthesis. It must consume the right parenthesis.
         rule arithmetic_word_plus_right_paren() =
             arithmetic_word(<[')']>) ")"
+
+        // This rule matches an arithmetic word followed by a right bracket. It must consume the
+        // right bracket.
+        rule arithmetic_word_plus_right_bracket() =
+            arithmetic_word(<[']']>) "]"
 
         rule word_piece_with_source<T>(stop_condition: rule<T>, in_command: bool) -> WordPieceWithSource =
             start_index:position!() piece:word_piece(<stop_condition()>, in_command) end_index:position!() {
@@ -1051,6 +1079,30 @@ peg::parser! {
 
         rule heredoc_literal_text() -> WordPiece =
             s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() [^'`'])+) {
+                WordPiece::Text(s.to_owned())
+            }
+
+        // An arithmetic expression's text: like double-quoted content, except that a double
+        // quote is removed rather than quoting, and a single quote is an ordinary character.
+        pub(crate) rule unexpanded_arithmetic_text() -> Vec<WordPieceWithSource> =
+            traced(<arithmetic_text_pieces()>)
+
+        rule arithmetic_text_pieces() -> Vec<WordPieceWithSource> =
+            pieces:arithmetic_text_piece_with_source()* { pieces.into_iter().flatten().collect() }
+
+        rule arithmetic_text_piece_with_source() -> Option<WordPieceWithSource> =
+            "\"" { None } /
+            start_index:position!() piece:arithmetic_text_piece() end_index:position!() {
+                Some(WordPieceWithSource { piece, start_index, end_index })
+            }
+
+        rule arithmetic_text_piece() -> WordPiece =
+            arithmetic_expansion() /
+            legacy_arithmetic_expansion() /
+            command_substitution() /
+            parameter_expansion() /
+            double_quoted_escape_sequence() /
+            s:$((!double_quoted_escape_sequence() !dollar_sign_word_piece() [^'\"' | '`'])+) {
                 WordPiece::Text(s.to_owned())
             }
 

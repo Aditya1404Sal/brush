@@ -560,6 +560,28 @@ pub(crate) async fn basic_expand_heredoc_word(
     expander.basic_expand_to_str(word_str.as_ref()).await
 }
 
+/// Expands the text of an arithmetic expression (the inside of `$((...))`, `((...))` or
+/// `$[...]`) as bash does: as if it were inside double quotes, with double quotes removed. A
+/// single quote, or a backslash before a character it does not escape in double quotes, stays in
+/// the text for the arithmetic parser to reject.
+///
+/// # Arguments
+///
+/// * `shell` - The shell in which to perform expansion.
+/// * `params` - The execution parameters to use during expansion.
+/// * `text` - The expression's text.
+pub(crate) async fn basic_expand_arithmetic_text(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    text: &str,
+) -> Result<String, error::Error> {
+    let mut expander = WordExpander::new(shell, params);
+    expander.arithmetic_mode = true;
+    expander.disable_brace_expansion = true;
+    expander.assignment_word_tilde = false;
+    expander.basic_expand_to_str(text).await
+}
+
 /// Applies all basic expansion to the given word (represented as a string),
 /// with custom expander options.
 ///
@@ -713,6 +735,8 @@ struct WordExpander<'a, SE: extensions::ShellExtensions> {
     in_double_quotes: bool,
     /// Whether to use heredoc expansion semantics (literal quotes, no brace expansion).
     heredoc_mode: bool,
+    /// Whether the word is an arithmetic expression's text (see `basic_expand_arithmetic_text`).
+    arithmetic_mode: bool,
     /// Whether the next word expanded is a command-line word that, if it looks like an
     /// assignment, gets tilde expansion after its `=` and colons (see
     /// [`ExpanderOptions::assignment_word_tilde`]). Cleared once that word is taken, so words
@@ -734,6 +758,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             unquoted_backslash_handling: UnquotedBackslashHandling::Strip,
             in_double_quotes: false,
             heredoc_mode: false,
+            arithmetic_mode: false,
         }
     }
 
@@ -762,6 +787,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             unquoted_backslash_handling: options.unquoted_backslash_handling,
             in_double_quotes: false,
             heredoc_mode: false,
+            arithmetic_mode: false,
         }
     }
 
@@ -875,6 +901,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         let expansion_chars: &[char] = if self.heredoc_mode {
             // Heredoc bodies treat quotes as literal; only $, `, and \ trigger expansion.
             &['$', '`', '\\']
+        } else if self.arithmetic_mode {
+            // Arithmetic text treats single quotes as literal and removes double quotes.
+            &['$', '`', '\\', '"']
         } else {
             &['$', '`', '\\', '\'', '\"', '~', '{']
         };
@@ -928,6 +957,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         let pieces = if self.heredoc_mode {
             self.heredoc_mode = false;
             brush_parser::word::parse_heredoc(word, &self.parser_options)?
+        } else if self.arithmetic_mode {
+            self.arithmetic_mode = false;
+            brush_parser::word::parse_arithmetic_text(word, &self.parser_options)?
         } else if assignment_word {
             let options = brush_parser::ParserOptions {
                 tilde_expansion_after_colon: true,
