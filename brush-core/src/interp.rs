@@ -2483,6 +2483,13 @@ async fn setup_command_redirects(
                 return Err(error);
             }
             let _ = shell.display_error(&mut params.stderr(shell), &error);
+            // A special builtin's failed redirection ends a non-interactive POSIX-mode shell.
+            if shell.options().posix_mode
+                && !shell.options().interactive
+                && runs_special_builtin(shell, args)
+            {
+                return Err(error.into_reported().into_fatal());
+            }
             return Ok(false);
         }
     }
@@ -2587,6 +2594,21 @@ fn single_quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+/// Whether the command `args` names is a special builtin (not a function of that name).
+fn runs_special_builtin(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    args: &[CommandArg],
+) -> bool {
+    let Some(CommandArg::String(name)) = args.first() else {
+        return false;
+    };
+    shell.funcs().get(name).is_none()
+        && shell
+            .builtins()
+            .get(name)
+            .is_some_and(|builtin| !builtin.disabled && builtin.special_builtin)
+}
+
 /// Whether bash would run the command `args` names as a program in a child process: not a
 /// function, and not a builtin other than a utility that stands for a program.
 fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[CommandArg]) -> bool {
@@ -2636,10 +2658,20 @@ async fn execute_command<T: Into<String>>(
         )
         .await
         {
-            // A readonly variable keeps its value: bash reports it and still runs the command.
+            // A readonly variable keeps its value: bash reports it and still runs the command,
+            // unless it is a special builtin in a non-interactive POSIX-mode shell, which ends.
             Err(error)
                 if error.abandons_command()
-                    && matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) => {}
+                    && matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) =>
+            {
+                let shell = guard.shell();
+                if shell.options().posix_mode
+                    && !shell.options().interactive
+                    && runs_special_builtin(shell, args)
+                {
+                    return Err(error.into_fatal());
+                }
+            }
             result => result?,
         }
     }

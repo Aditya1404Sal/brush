@@ -790,6 +790,8 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
 ) -> Result<ExecutionResult, error::Error> {
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
+    let interactive = context.shell.options().interactive;
+    let command_name = context.command_name.clone();
     #[cfg(target_arch = "wasm32")]
     let services = context.shell.execution_services();
 
@@ -801,7 +803,12 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     (services.yield_now)().await;
 
     match result {
-        Ok(result) => Ok(result),
+        Ok(mut result) => {
+            if mark_errors_fatal && !interactive && special_builtin_failed(&command_name, &result) {
+                result.next_control_flow = crate::results::ExecutionControlFlow::ExitShell;
+            }
+            Ok(result)
+        }
         Err(e) => {
             // Broken pipe errors should silently return the appropriate exit code
             if let Some(io_err) = e.as_io_error() {
@@ -929,6 +936,13 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
             return Ok(outcome);
         }
     }
+    if mark_errors_fatal
+        && !shell.options().interactive
+        && let Ok(result) = &mut result
+        && special_builtin_failed(&command_name, result)
+    {
+        result.next_control_flow = crate::results::ExecutionControlFlow::ExitShell;
+    }
     result.map_err(|error| {
         if mark_errors_fatal {
             error.into_fatal()
@@ -936,6 +950,27 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
             error
         }
     })
+}
+
+/// Whether a special builtin failed in a way that ends a non-interactive POSIX-mode shell, as in
+/// bash: a usage error, an invalid name or a readonly variable, but not an operational failure
+/// (`shift` past the end, `trap` of an unknown signal).
+fn special_builtin_failed(name: &str, result: &ExecutionResult) -> bool {
+    let status = u8::from(result.exit_code);
+    if status == 0
+        || !matches!(
+            result.next_control_flow,
+            crate::results::ExecutionControlFlow::Normal
+        )
+    {
+        return false;
+    }
+    match name {
+        "set" | "unset" | "export" | "readonly" | "times" => true,
+        // `return` outside a function, and `exit` with a status that is not a number.
+        "shift" | "trap" | "return" | "exit" => status == 2,
+        _ => false,
+    }
 }
 
 /// Runs handlers for caught signals that arrived while the current command ran. Returns the
