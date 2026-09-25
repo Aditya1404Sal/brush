@@ -219,6 +219,8 @@ fn signal_target<SE: brush_core::ShellExtensions>(
     };
     let delivered = if probe_only {
         process::process_exists(&table, pid)
+    } else if pid == table.shell_pid() && group {
+        process::signal_every_process(&table, number)
     } else if group {
         process::signal_process_group(&table, pid, number)
     } else {

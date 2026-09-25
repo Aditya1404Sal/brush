@@ -132,9 +132,17 @@ impl builtins::Command for BindCommand {
             tracing::debug!(target: trace_categories::INPUT,
                  "bind: key bindings not supported in this config");
 
-            // Silently succeed when key bindings are unavailable (e.g., in
-            // non-interactive mode or with an input backend that doesn't
-            // yet support them).
+            // Without an input backend there is nothing to modify, but bash itself still
+            // accepts a *binding* form (it would act on readline's own tables): it warns once
+            // and otherwise succeeds. A *query* form (list/find/print against those tables) has
+            // no real tables to answer from here, so it is the caller's job to refuse those
+            // before ever reaching this builtin (see bash-tool's own `stateless.rs`); reaching
+            // this point at all means the invocation is a binding form.
+            writeln!(
+                context.stderr(),
+                "{}bind: warning: line editing not enabled",
+                context.shell.diagnostic_prefix()
+            )?;
             Ok(ExecutionExitCode::Success.into())
         }
     }
