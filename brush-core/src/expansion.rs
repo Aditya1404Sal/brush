@@ -2209,6 +2209,34 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 ))
                 .into())
             }
+            // A here-document body's command substitution that is left open or does not parse,
+            // reported as bash's parser reports it, from the line after the command's.
+            brush_parser::word::ParameterExpr::BadSubstitution { text, .. }
+                if text.starts_with("$(") && !text.starts_with("$((") =>
+            {
+                let line = self
+                    .shell
+                    .call_stack()
+                    .current_frame()
+                    .and_then(|frame| frame.current_line())
+                    .unwrap_or(1);
+                let lines = brush_parser::command_substitution_diagnostic(
+                    text.get(2..).unwrap_or_default(),
+                    line + 1,
+                    &self.parser_options,
+                );
+                if lines.is_empty() {
+                    return Err(error::ErrorKind::BadSubstitution(format!(
+                        "{text}: bad substitution"
+                    ))
+                    .into());
+                }
+                Err(error::ErrorKind::SyntaxError {
+                    origin: "command substitution".to_owned(),
+                    lines,
+                }
+                .into())
+            }
             brush_parser::word::ParameterExpr::BadSubstitution { text, transform } => {
                 // As in bash, this ends a non-interactive shell; a transformation that does not
                 // exist ends `bash -c` with 127, as an unset variable does. The diagnostic
@@ -2228,6 +2256,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 };
                 let kind = if transform {
                     error::ErrorKind::CheckedExpansionError(format!("{context}: bad substitution"))
+                } else if text.starts_with("$[") {
+                    // A `$[` left open in a here-document; bash quotes the body.
+                    error::ErrorKind::BadSubstitution(format!(
+                        "bad substitution: no closing `]' in {}",
+                        self.outer_word.as_deref().unwrap_or(&text)
+                    ))
                 } else if text.starts_with("$((") {
                     // A comment hid the closing `))` (`$((1 # c))`); bash quotes the word.
                     error::ErrorKind::BadSubstitution(format!(

@@ -671,6 +671,77 @@ fn open_function_parenthesis(tokens: &[crate::Token]) -> Option<usize> {
     None
 }
 
+/// Bash's diagnostic for a here-document body's command substitution that does not parse.
+///
+/// `text` is the body after the substitution's `$(`, and its first line is line `first_line`.
+/// Bash reads it as it reads any `$( )`: to a `)` that closes it, or to the end.
+pub fn command_substitution_diagnostic(
+    text: &str,
+    first_line: usize,
+    options: &crate::ParserOptions,
+) -> Vec<String> {
+    let lines = match tokenizer::command_substitution_len(text, &options.tokenizer_options()) {
+        Err(inner) => bash_diagnostic(
+            &ParseError::Tokenizing {
+                inner,
+                position: None,
+            },
+            text,
+            options,
+        ),
+        Ok(len) => {
+            let parse = |command: &str| {
+                let mut reader = std::io::BufReader::new(command.as_bytes());
+                crate::Parser::new(&mut reader, options).parse_program()
+            };
+            // A command that does not parse is diagnosed with its `)`, which bash reads as a
+            // token: `$(if)` fails at it.
+            let command = text.get(..len).unwrap_or(text);
+            let without_close = command
+                .get(..command.len().saturating_sub(1))
+                .unwrap_or(command);
+            let error = match parse(without_close) {
+                Ok(_) => None,
+                Err(_) => parse(command).err(),
+            };
+            match error {
+                None => vec![],
+                Some(error) => {
+                    let mut lines = bash_diagnostic(&error, text, options);
+                    // Bash names what it was looking for when the token is not the `)`.
+                    if let Some(first) = lines.first_mut() {
+                        if first.contains("syntax error near unexpected token `")
+                            && !first.ends_with("`)'")
+                        {
+                            first.push_str(" while looking for matching `)'");
+                        }
+                    }
+                    lines
+                }
+            }
+        }
+    };
+    // The lines are numbered from the substitution's first line.
+    lines
+        .into_iter()
+        .map(|line| {
+            let Some(rest) = line.strip_prefix("line ") else {
+                return line;
+            };
+            let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            let number = rest
+                .strip_suffix(after)
+                .and_then(|n| n.parse::<usize>().ok());
+            match number {
+                Some(number) => {
+                    std::format!("line {}{after}", first_line + number.saturating_sub(1))
+                }
+                None => line,
+            }
+        })
+        .collect()
+}
+
 /// A reserved word that ends the input where a command was expected (`if then`): bash names it
 /// rather than the end of the input.
 fn misplaced_last(tokens: &[crate::Token]) -> Option<(&str, usize)> {
@@ -703,7 +774,7 @@ fn unexpected_token(
         return (word.to_owned(), position.line);
     };
     if index > 0
-        && matches!(tokens[index].to_str(), ";" | "\n" | "&")
+        && matches!(tokens[index].to_str(), ";" | "\n" | "&" | ")")
         && RESERVED.contains(&tokens[index - 1].to_str())
     {
         index -= 1;
@@ -929,6 +1000,40 @@ mod tests {
                 "line 2: syntax error: unexpected end of file from `[[' command on line 1",
             ]
         );
+    }
+
+    #[test]
+    fn words_command_substitution_errors_from_their_first_line() {
+        let diagnose = |text: &str| {
+            super::command_substitution_diagnostic(text, 2, &crate::ParserOptions::default())
+        };
+        assert_eq!(
+            diagnose("echo hi\n"),
+            ["line 3: unexpected EOF while looking for matching `)'"]
+        );
+        assert_eq!(
+            diagnose("if) more\n"),
+            [
+                "line 2: syntax error near unexpected token `)'",
+                "line 2: `if) more'"
+            ]
+        );
+        assert_eq!(
+            diagnose("echo a; fi) x\n"),
+            [
+                "line 2: syntax error near unexpected token `fi' while looking for matching `)'",
+                "line 2: `echo a; fi) x'"
+            ]
+        );
+        assert_eq!(
+            diagnose("echo 'a\n"),
+            ["line 2: unexpected EOF while looking for matching `''"]
+        );
+        assert_eq!(
+            diagnose("case x in x) echo y\nz\n"),
+            ["line 4: unexpected EOF while looking for matching `)'"]
+        );
+        assert!(diagnose("echo fine) rest").is_empty());
     }
 
     #[test]

@@ -674,6 +674,19 @@ fn comment_hides_close(expr: &str) -> bool {
     in_comment
 }
 
+/// The command of the command substitution at the start of `text` (just after its `$(`) and how
+/// many bytes of `text` it takes through its `)`, when it is closed and its command parses.
+fn heredoc_command<'a>(text: &'a str, options: &ParserOptions) -> Option<(&'a str, usize)> {
+    let len =
+        crate::tokenizer::command_substitution_len(text, &options.tokenizer_options()).ok()?;
+    let command = text.get(..len.checked_sub(1)?)?;
+    let mut reader = std::io::BufReader::new(command.as_bytes());
+    crate::Parser::new(&mut reader, options)
+        .parse_program()
+        .ok()
+        .map(|_| (command, len))
+}
+
 /// The length of the text starting with a here-document operator (`<<TAG`, `<<-TAG`) in a
 /// command's text, through the rest of its line and the body of every here-document on that line,
 /// each up to its delimiter line. `None` when the text does not start with one, or when the
@@ -1240,23 +1253,46 @@ peg::parser! {
         rule heredoc_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
-            command_substitution() /
-            parameter_expansion() /
+            heredoc_command_substitution() /
+            &("$((" / "`") c:command_substitution() { c } /
+            &"${" p:parameter_expansion() {?
+                // Not the lone `$` a `${` left open would otherwise be taken as.
+                if matches!(&p, WordPiece::Text(text) if text == "$") { Err("${") } else { Ok(p) }
+            } /
+            !("$" ['(' | '{' | '[']) p:parameter_expansion() { p } /
             heredoc_escape_sequence() /
             heredoc_literal_text() /
-            // A backquote left open is an error when the body is expanded, as in bash.
-            "`" rest:$([_]*) {
+            // An expansion left open, or a command substitution that does not parse, is an error
+            // when the body is expanded, as in bash: the text from it to the end of the body.
+            text:$(("$((" / "$[" / "${" / "$(" / "`") [_]*) {
                 WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution {
-                    text: std::format!("`{rest}"),
+                    text: text.to_owned(),
                     transform: false,
                 })
             }
+
+        // A command substitution in a here-document body, which bash reads only when it expands
+        // the body: it ends where the tokenizer finds its `)`, and it must parse.
+        rule heredoc_command_substitution() -> WordPiece = #{|input, pos| {
+            match input.get(pos..).and_then(|text| text.strip_prefix("$(")) {
+                Some(rest) if !rest.starts_with('(') => {
+                    match heredoc_command(rest, parser_options) {
+                        Some((command, len)) => peg::RuleResult::Matched(
+                            pos + 2 + len,
+                            WordPiece::CommandSubstitution(command.to_owned()),
+                        ),
+                        None => peg::RuleResult::Failed,
+                    }
+                }
+                _ => peg::RuleResult::Failed,
+            }
+        }}
 
         rule heredoc_escape_sequence() -> WordPiece =
             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }
 
         rule heredoc_literal_text() -> WordPiece =
-            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() [^'`'])+) {
+            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() !("$" ['(' | '{' | '[']) [^'`'])+) {
                 WordPiece::Text(s.to_owned())
             }
 
@@ -1777,6 +1813,49 @@ mod tests {
                 transform: true,
                 ..
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_here_document_bodies_with_expansions_left_open() -> Result<()> {
+        let pieces = |body: &str| -> Result<Vec<WordPiece>> {
+            Ok(super::parse_heredoc(body, &ParserOptions::default())?
+                .into_iter()
+                .map(|p| p.piece)
+                .collect())
+        };
+        let bad = |text: &str| {
+            WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution {
+                text: text.to_owned(),
+                transform: false,
+            })
+        };
+        // What is left open, or a command substitution that does not parse, runs to the end.
+        assert_eq!(pieces("$(echo hi\n")?, [bad("$(echo hi\n")]);
+        assert_eq!(pieces("$(if) more\n")?, [bad("$(if) more\n")]);
+        assert_eq!(
+            pieces("a ${x\nb\n")?,
+            [WordPiece::Text("a ".into()), bad("${x\nb\n")]
+        );
+        assert_eq!(pieces("$((1+2\n")?, [bad("$((1+2\n")]);
+        assert_eq!(pieces("$[1\n")?, [bad("$[1\n")]);
+        // What is closed and parses expands, and a lone `$` is text.
+        assert_eq!(
+            pieces("$((echo a) ) $(echo \")\") ${x} $ z")?,
+            [
+                WordPiece::CommandSubstitution("(echo a) ".into()),
+                WordPiece::Text(" ".into()),
+                WordPiece::CommandSubstitution("echo \")\"".into()),
+                WordPiece::Text(" ".into()),
+                WordPiece::ParameterExpansion(ParameterExpr::Parameter {
+                    parameter: Parameter::Named("x".into()),
+                    indirect: false
+                }),
+                WordPiece::Text(" ".into()),
+                WordPiece::Text("$".into()),
+                WordPiece::Text(" z".into()),
+            ]
         );
         Ok(())
     }

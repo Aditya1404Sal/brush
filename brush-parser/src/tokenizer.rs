@@ -563,6 +563,26 @@ fn uncached_tokenize_string(
     uncached_tokenize_str(input, options)
 }
 
+/// How many bytes of `text` a command substitution takes whose `$(` came just before it, through
+/// its closing `)`, as the tokenizer reads one: bash parses a here-document body's command
+/// substitutions only when it expands the body, but finds where each ends the same way.
+pub(crate) fn command_substitution_len(
+    text: &str,
+    options: &TokenizerOptions,
+) -> Result<usize, TokenizerError> {
+    let mut reader = std::io::BufReader::new(text.as_bytes());
+    let mut tokenizer = Tokenizer::new(&mut reader, options);
+    let mut state = TokenParseState::new(&tokenizer.cross_state.cursor);
+    let pending = tokenizer.set_aside_pending_here_docs();
+    tokenizer.consume_nested_construct(&mut state, ')', "(", 1)?;
+    tokenizer.restore_pending_here_docs(pending);
+    let chars = tokenizer.cross_state.cursor.index;
+    Ok(text
+        .char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index))
+}
+
 /// Break the given input shell script string into tokens, returning the tokens.
 /// No caching is performed.
 ///
