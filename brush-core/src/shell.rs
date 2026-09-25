@@ -938,6 +938,19 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
         self.history.as_mut()
     }
 
+    /// Returns a mutable reference to the shell's history, creating an empty one first if none
+    /// exists yet. The `history` *builtin* works on the list regardless of the `history` -o
+    /// option's state in real bash -- the option only gates automatic recording (each executed
+    /// command becoming an entry, which happens entirely in the interactive layer and is
+    /// unaffected by this): `history -s foo; history` prints the entry it just added under
+    /// `bash -c` even though `set -o history` there reports off. This is what gives the builtin
+    /// that same always-available list without flipping the option (and so without the
+    /// `SHELLOPTS`/`set -o`/`$-` divergence flipping it would cause).
+    pub fn history_or_init_mut(&mut self) -> &mut crate::history::History {
+        self.history
+            .get_or_insert_with(crate::history::History::default)
+    }
+
     /// Returns the shell's official version string (if available).
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
