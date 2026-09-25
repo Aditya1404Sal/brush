@@ -264,8 +264,28 @@ impl ShellEnvironment {
     ///
     /// * `name` - The name of the variable to retrieve.
     pub fn get<S: AsRef<str>>(&self, name: S) -> Option<(EnvironmentScope, &ShellVariable)> {
+        if let Some(global) = self.circular_global(name.as_ref()) {
+            return self
+                .get_using_policy_raw(&global, EnvironmentLookup::OnlyInGlobal)
+                .map(|var| (EnvironmentScope::Global, var));
+        }
         let name = self.resolve_nameref(name.as_ref());
         self.get_raw(name.as_ref())
+    }
+
+    /// The global variable bash reads and assigns in place of `name` when `name` is a function's
+    /// local nameref that comes back to itself (see [`Self::circular_nameref`]).
+    fn circular_global(&self, name: &str) -> Option<String> {
+        if !self
+            .get_raw(name)
+            .is_some_and(|(_, var)| var.is_treated_as_nameref())
+        {
+            return None;
+        }
+        match self.circular_nameref(name) {
+            Some((closing, true)) => Some(closing),
+            _ => None,
+        }
     }
 
     /// Like [`Self::get`], but a nameref is returned itself rather than the variable it names.
@@ -313,6 +333,43 @@ impl ShellEnvironment {
             resolved = Cow::Owned(next);
         }
         resolved
+    }
+
+    /// A nameref that comes back to itself or to the nameref it just followed (`local -n v=v`,
+    /// `declare -n a=b b=a`), as bash's `find_variable_nameref` detects a circular name
+    /// reference: the name of the variable that closes it, and whether bash then reads and
+    /// assigns the global variable of that name, without namerefs, in its place (the closing
+    /// variable is a function's local and a function is running). `None` for anything else.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to resolve.
+    pub fn circular_nameref(&self, name: &str) -> Option<(String, bool)> {
+        const MAX_NAMEREF_HOPS: usize = 8;
+        let mut current = name.to_owned();
+        for _ in 0..MAX_NAMEREF_HOPS {
+            let (_, var) = self.get_raw(&current)?;
+            if !var.is_treated_as_nameref() {
+                return None;
+            }
+            let ShellValue::String(target) = var.value() else {
+                return None;
+            };
+            if target.is_empty() {
+                return None;
+            }
+            if target == name || *target == current {
+                let (scope, _) = self.get_raw(target)?;
+                let in_function = self
+                    .scopes
+                    .iter()
+                    .any(|(scope, _)| matches!(scope, EnvironmentScope::Local));
+                let global = in_function && !matches!(scope, EnvironmentScope::Global);
+                return Some((target.clone(), global));
+            }
+            current = target.clone();
+        }
+        None
     }
 
     /// Whether following the nameref `name` comes back to a nameref already followed
@@ -365,6 +422,11 @@ impl ShellEnvironment {
         &mut self,
         name: S,
     ) -> Option<(EnvironmentScope, &mut ShellVariable)> {
+        if let Some(global) = self.circular_global(name.as_ref()) {
+            return self
+                .get_mut_using_policy_raw(global, EnvironmentLookup::OnlyInGlobal)
+                .map(|var| (EnvironmentScope::Global, var));
+        }
         let name = self.resolve_nameref(name.as_ref()).into_owned();
         // Look through scopes, from the top of the stack on down.
         for (scope_type, map) in self.scopes.iter_mut().rev() {
@@ -632,8 +694,13 @@ impl ShellEnvironment {
         lookup_policy: EnvironmentLookup,
         scope_if_creating: EnvironmentScope,
     ) -> Result<(), error::Error> {
+        let name = name.into();
+        // A function's local nameref that comes back to itself assigns the global variable.
+        if let Some(global) = self.circular_global(&name) {
+            return self.update_or_add_global(global, value, updater);
+        }
         // Assigning through a nameref assigns to (and if need be creates) the variable it names.
-        let name = self.resolve_nameref(&name.into()).into_owned();
+        let name = self.resolve_nameref(&name).into_owned();
 
         // An array element, named directly (`read 'arr[1]'`) or through a nameref, is assigned as
         // `arr[1]=value` is: bash has no variable whose name holds a subscript.
@@ -690,7 +757,20 @@ impl ShellEnvironment {
         lookup_policy: EnvironmentLookup,
         scope_if_creating: EnvironmentScope,
     ) -> Result<(), error::Error> {
-        let name = self.resolve_nameref(&name.into()).into_owned();
+        let name = name.into();
+        // A function's local nameref that comes back to itself assigns the global array.
+        let (name, lookup_policy, scope_if_creating) = match self.circular_global(&name) {
+            Some(global) => (
+                global,
+                EnvironmentLookup::OnlyInGlobal,
+                EnvironmentScope::Global,
+            ),
+            None => (
+                self.resolve_nameref(&name).into_owned(),
+                lookup_policy,
+                scope_if_creating,
+            ),
+        };
 
         if let Some(var) = self.get_mut_using_policy(&name, lookup_policy) {
             var.assign_at_index(index, value, false)
@@ -708,6 +788,33 @@ impl ShellEnvironment {
             updater(&mut var)?;
 
             self.add(name, var, scope_if_creating)
+        }
+    }
+
+    /// Assigns `value` to the global variable `name`, without following namerefs, creating it if
+    /// need be.
+    fn update_or_add_global(
+        &mut self,
+        name: String,
+        value: variables::ShellValueLiteral,
+        updater: impl Fn(&mut ShellVariable) -> Result<(), error::Error>,
+    ) -> Result<(), error::Error> {
+        let auto_export = self.export_variables_on_modification;
+        if let Some(var) = self.get_mut_using_policy_raw(&name, EnvironmentLookup::OnlyInGlobal) {
+            var.assign(value, false)
+                .map_err(|error| name_readonly_error(error, &name))?;
+            if auto_export {
+                var.export();
+            }
+            updater(var)
+        } else {
+            let mut var = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
+            var.assign(value, false)?;
+            if auto_export {
+                var.export();
+            }
+            updater(&mut var)?;
+            self.add(name, var, EnvironmentScope::Global)
         }
     }
 

@@ -3227,8 +3227,34 @@ async fn apply_assignment_unchecked(
             name
         }
     };
-    // Assigning through a circular nameref fails, as a readonly variable does in bash.
-    if shell.env().is_circular_nameref(variable_name) {
+    // Assigning through a nameref that comes back to itself from a function's local
+    // (`local -n v=v`) assigns the global variable it closes on, as bash does after following
+    // the reference as far as it goes.
+    let circular = shell.env().circular_nameref(variable_name);
+    let global_only = if let Some((closing, true)) = &circular {
+        // Bash's lookups on the way say so as they go: once for a list, twice for an element.
+        let prefix = shell.diagnostic_prefix();
+        let warning = match (&array_index, &assignment.value) {
+            (Some(_), _) => format!(
+                "{prefix}warning: {variable_name}: circular name reference\n\
+                 {prefix}warning: {variable_name}: circular name reference"
+            ),
+            (None, ast::AssignmentValue::Array(_)) => {
+                format!("{prefix}warning: {variable_name}: circular name reference")
+            }
+            (None, ast::AssignmentValue::Scalar(_)) => {
+                format!("{prefix}warning: {variable_name}: maximum nameref depth (8) exceeded")
+            }
+        };
+        writeln!(params.stderr(shell), "{warning}")?;
+        Some(closing.clone())
+    } else {
+        None
+    };
+    // Assigning through any other circular nameref fails, as a readonly variable does in bash.
+    if global_only.is_none()
+        && (circular.is_some() || shell.env().is_circular_nameref(variable_name))
+    {
         writeln!(
             params.stderr(shell),
             "{}warning: {variable_name}: circular name reference",
@@ -3242,11 +3268,15 @@ async fn apply_assignment_unchecked(
 
     // Assigning through a nameref assigns to the variable it names, and a nameref to an array
     // element (`declare -n ref='arr[1]'`) to that element, just as `arr[1]=value` would.
-    let mut resolved_name = shell
-        .env()
-        .resolve_nameref(variable_name.as_str())
-        .into_owned();
+    let mut resolved_name = match &global_only {
+        Some(closing) => closing.clone(),
+        None => shell
+            .env()
+            .resolve_nameref(variable_name.as_str())
+            .into_owned(),
+    };
     if array_index.is_none()
+        && global_only.is_none()
         && let Some((array, index)) = shell.env().resolve_nameref_element(variable_name.as_str())
     {
         resolved_name = array;
@@ -3404,10 +3434,17 @@ async fn apply_assignment_unchecked(
     // Read option before taking mutable borrow on env.
     let export_variables_on_modification = shell.options().export_variables_on_modification;
 
-    // See if we can find an existing value associated with the variable.
-    if let Some((existing_value_scope, existing_value)) =
+    // See if we can find an existing value associated with the variable: the global one, for a
+    // circular reference.
+    let existing = if global_only.is_some() {
+        shell
+            .env_mut()
+            .get_mut_using_policy_raw(variable_name.as_str(), EnvironmentLookup::OnlyInGlobal)
+            .map(|var| (EnvironmentScope::Global, var))
+    } else {
         shell.env_mut().get_mut(variable_name.as_str())
-    {
+    };
+    if let Some((existing_value_scope, existing_value)) = existing {
         if required_scope.is_none() || Some(existing_value_scope) == required_scope {
             if let Some(array_index) = array_index {
                 match new_value {
@@ -3469,6 +3506,11 @@ async fn apply_assignment_unchecked(
         new_var.export();
     }
 
+    let creation_scope = if global_only.is_some() {
+        EnvironmentScope::Global
+    } else {
+        creation_scope
+    };
     shell
         .env_mut()
         .add(variable_name, new_var, creation_scope)?;

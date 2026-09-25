@@ -2462,6 +2462,29 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         error::ErrorKind::BadSubstitution(format!("${{{n}}}: bad substitution"))
                             .into(),
                     )
+                } else if let Some((closing, global)) = self.shell.env().circular_nameref(n) {
+                    // Bash warns, and expands the global variable the reference closes on when a
+                    // function's local closes it (`local -n v=v` reads the global `v`), else
+                    // nothing.
+                    let _ = writeln!(
+                        self.params.stderr(self.shell),
+                        "{}warning: {n}: circular name reference",
+                        self.shell.diagnostic_prefix()
+                    );
+                    let value = if global {
+                        self.shell
+                            .env()
+                            .get_using_policy_raw(&closing, env::EnvironmentLookup::OnlyInGlobal)
+                            .filter(|var| !matches!(var.value(), ShellValue::Unset(_)))
+                            .and_then(|var| var.value().try_get_cow_str(self.shell))
+                            .map(|value| value.to_string())
+                    } else {
+                        None
+                    };
+                    match value {
+                        Some(value) => Ok(Expansion::from(value)),
+                        None => self.undefined_expansion(parameter, allow_unset_vars),
+                    }
                 } else if self.shell.env().is_circular_nameref(n) {
                     // Bash warns and expands nothing.
                     let _ = writeln!(
@@ -2486,6 +2509,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
             brush_parser::word::Parameter::NamedWithIndex { name, index } => {
+                self.warn_circular_element(name);
                 // First check to see if it's an associative array.
                 let is_set_assoc_array = if let Some((_, var)) = self.shell.env().get(name) {
                     matches!(
@@ -2524,6 +2548,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
             brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate } => {
+                self.warn_circular_element(name);
                 if let Some((_, var)) = self.shell.env().get(name) {
                     // Resolve a dynamic value once, so the kind and the element values
                     // can't disagree: a getter like RANDOM's changes on every read.
@@ -2566,6 +2591,20 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     })
                 }
             }
+        }
+    }
+
+    /// Warns twice of an element of a circular name reference (`local -n v=v; ${v[0]}`), as
+    /// bash's two lookups of it do; the element is the global array's (see
+    /// [`env::ShellEnvironment::circular_nameref`]).
+    fn warn_circular_element(&self, name: &str) {
+        if self.shell.env().circular_nameref(name).is_some() {
+            let prefix = self.shell.diagnostic_prefix();
+            let _ = write!(
+                self.params.stderr(self.shell),
+                "{prefix}warning: {name}: circular name reference\n\
+                 {prefix}warning: {name}: circular name reference\n"
+            );
         }
     }
 
