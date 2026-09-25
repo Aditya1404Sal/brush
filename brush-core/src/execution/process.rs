@@ -20,78 +20,89 @@ use crate::{
     traps::{PipeDisposition, TrapHandlerConfig},
 };
 
-/// Numbers of the synthetic signal set.
+/// Numbers of signals the engine itself raises or treats specially.
 pub mod signals {
     /// Hangup.
     pub const HUP: u8 = 1;
     /// Interrupt.
     pub const INT: u8 = 2;
+    /// Quit.
+    pub const QUIT: u8 = 3;
     /// Uncatchable kill.
     pub const KILL: u8 = 9;
     /// Write to a pipe without readers.
     pub const PIPE: u8 = 13;
     /// Termination request.
     pub const TERM: u8 = 15;
+    /// Continue a stopped process.
+    pub const CONT: u8 = 18;
+    /// Uncatchable stop.
+    pub const STOP: u8 = 19;
+    /// The highest signal number.
+    pub const MAX: u8 = 64;
 }
 
-/// Per-signal delivery policy of one logical process.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Dispositions {
-    /// HUP disposition.
-    pub hup: PipeDisposition,
-    /// INT disposition.
-    pub int: PipeDisposition,
-    /// PIPE disposition.
-    pub pipe: PipeDisposition,
-    /// TERM disposition.
-    pub term: PipeDisposition,
+/// What a signal does to a process that neither catches nor ignores it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DefaultAction {
+    Terminate,
+    Ignore,
+    Continue,
+    Stop,
+}
+
+/// Linux's default action for `signal`. The C library's reserved 32 to 34 do nothing.
+const fn default_action(signal: u8) -> DefaultAction {
+    match signal {
+        17 | 23 | 28 | 32..=34 => DefaultAction::Ignore,
+        signals::CONT => DefaultAction::Continue,
+        signals::STOP | 20..=22 => DefaultAction::Stop,
+        _ => DefaultAction::Terminate,
+    }
+}
+
+/// Per-signal delivery policy of one logical process, indexed by signal number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Dispositions([PipeDisposition; signals::MAX as usize + 1]);
+
+impl Default for Dispositions {
+    fn default() -> Self {
+        Self([PipeDisposition::Default; signals::MAX as usize + 1])
+    }
 }
 
 impl Dispositions {
     /// Reads every disposition from a shell's trap configuration.
     pub fn from_traps(traps: &TrapHandlerConfig) -> Self {
-        let get = |name: &str| {
-            name.parse().map_or(PipeDisposition::Default, |signal| {
-                traps.signal_disposition(signal)
-            })
-        };
-        Self {
-            hup: get("HUP"),
-            int: get("INT"),
-            pipe: get("PIPE"),
-            term: get("TERM"),
+        let mut dispositions = Self::default();
+        for (signal, disposition) in traps.signal_dispositions() {
+            dispositions.set(signal, disposition);
         }
+        dispositions
     }
 
     /// Caught handlers reset across a command boundary; ignored signals stay ignored.
     #[must_use]
-    pub const fn for_exec(self) -> Self {
-        Self {
-            hup: self.hup.for_exec(),
-            int: self.int.for_exec(),
-            pipe: self.pipe.for_exec(),
-            term: self.term.for_exec(),
+    pub fn for_exec(mut self) -> Self {
+        for disposition in &mut self.0 {
+            *disposition = disposition.for_exec();
         }
+        self
     }
 
-    /// Disposition of one signal number. KILL and unknown numbers are always default.
+    /// Disposition of one signal number. KILL, STOP and unknown numbers are always default.
     pub const fn get(self, signal: u8) -> PipeDisposition {
         match signal {
-            signals::HUP => self.hup,
-            signals::INT => self.int,
-            signals::PIPE => self.pipe,
-            signals::TERM => self.term,
+            signals::KILL | signals::STOP => PipeDisposition::Default,
+            1..=signals::MAX => self.0[signal as usize],
             _ => PipeDisposition::Default,
         }
     }
 
-    const fn set(&mut self, signal: u8, disposition: PipeDisposition) {
-        match signal {
-            signals::HUP => self.hup = disposition,
-            signals::INT => self.int = disposition,
-            signals::PIPE => self.pipe = disposition,
-            signals::TERM => self.term = disposition,
-            _ => {}
+    /// Sets one signal's disposition; unknown numbers are ignored.
+    pub const fn set(&mut self, signal: u8, disposition: PipeDisposition) {
+        if signal >= 1 && signal <= signals::MAX {
+            self.0[signal as usize] = disposition;
         }
     }
 }
@@ -167,6 +178,12 @@ pub fn spawn_job<T: 'static>(
 pub(super) struct ProcessState {
     dispositions: Cell<Dispositions>,
     terminated: Cell<Option<u8>>,
+    /// Stopped by STOP, TSTP, TTIN or TTOU until CONT: not polled, and signals other than KILL
+    /// wait for it to continue.
+    stopped: Cell<bool>,
+    /// A background job's process, which starts ignoring INT and QUIT once it runs.
+    background: Cell<bool>,
+    started: Cell<bool>,
     pending: RefCell<Vec<u8>>,
     handling: Cell<bool>,
     waker: RefCell<Option<Waker>>,
@@ -182,6 +199,9 @@ impl ProcessState {
         let state = Rc::new(Self {
             dispositions: Cell::new(dispositions),
             terminated: Cell::new(None),
+            stopped: Cell::new(false),
+            background: Cell::new(false),
+            started: Cell::new(false),
             pending: RefCell::new(Vec::new()),
             handling: Cell::new(false),
             waker: RefCell::new(None),
@@ -198,14 +218,24 @@ impl ProcessState {
     fn deliver(&self, signal: u8) {
         if signal == signals::KILL {
             self.terminated.set(Some(signals::KILL));
+        } else if signal == signals::STOP {
+            self.stopped.set(true);
         } else {
+            // CONT continues a stopped process whatever its disposition.
+            if signal == signals::CONT {
+                self.stopped.set(false);
+            }
             match self.dispositions.get().get(signal) {
-                PipeDisposition::Default => {
-                    if self.terminated.get().is_none() {
-                        self.terminated.set(Some(signal));
+                PipeDisposition::Default => match default_action(signal) {
+                    DefaultAction::Terminate => {
+                        if self.terminated.get().is_none() {
+                            self.terminated.set(Some(signal));
+                        }
                     }
-                }
-                PipeDisposition::Ignored => return,
+                    DefaultAction::Stop => self.stopped.set(true),
+                    DefaultAction::Ignore | DefaultAction::Continue => {}
+                },
+                PipeDisposition::Ignored => {}
                 PipeDisposition::Caught => {
                     // A PIPE raised while its own handler runs is dropped, as before.
                     if signal == signals::PIPE && self.handling.get() {
@@ -257,7 +287,7 @@ pub(super) fn install(process: Option<Rc<ProcessState>>) -> RestoreProcess {
 /// The executor installs this context only while polling its future.
 pub fn pipe_disposition() -> PipeDisposition {
     current().map_or(PipeDisposition::Default, |state| {
-        state.dispositions.get().pipe
+        state.dispositions.get().get(signals::PIPE)
     })
 }
 
@@ -283,7 +313,7 @@ pub fn current_dispositions() -> Dispositions {
 /// Dispositions a child command inherits: the running process's, reset for exec, with `pipe`.
 pub fn inherited_dispositions(pipe: PipeDisposition) -> Dispositions {
     let mut dispositions = current_dispositions().for_exec();
-    dispositions.pipe = pipe;
+    dispositions.set(signals::PIPE, pipe);
     dispositions
 }
 
@@ -298,22 +328,15 @@ pub fn apply_trap_dispositions(traps: &TrapHandlerConfig) {
         return;
     };
     let mut dispositions = state.dispositions.get();
-    for (name, number) in [
-        ("HUP", signals::HUP),
-        ("INT", signals::INT),
-        ("PIPE", signals::PIPE),
-        ("TERM", signals::TERM),
-    ] {
-        let Ok(signal) = name.parse() else {
-            continue;
-        };
-        if traps.get_effective_handler(signal).is_some()
-            || number == signals::PIPE
-            || dispositions.get(number) == PipeDisposition::Caught
-        {
-            dispositions.set(number, traps.signal_disposition(signal));
+    for signal in 1..=signals::MAX {
+        if dispositions.get(signal) == PipeDisposition::Caught {
+            dispositions.set(signal, PipeDisposition::Default);
         }
     }
+    for (signal, disposition) in traps.signal_dispositions() {
+        dispositions.set(signal, disposition);
+    }
+    dispositions.set(signals::PIPE, traps.pipe_disposition());
     state.dispositions.set(dispositions);
 }
 
@@ -372,8 +395,25 @@ impl<F: Future<Output = Result<ExecutionResult, Error>>> Future for ProcessFutur
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         *self.state.waker.borrow_mut() = Some(cx.waker().clone());
-        if let Some(signal) = self.state.terminated.get() {
+        let terminated = self.state.terminated.get();
+        if terminated == Some(signals::KILL) {
+            return Poll::Ready(Ok(ExecutionResult::terminated_by_signal(signals::KILL)));
+        }
+        // A stopped process waits for CONT; only KILL ends it meanwhile.
+        if self.state.stopped.get() {
+            return Poll::Pending;
+        }
+        if let Some(signal) = terminated {
             return Poll::Ready(Ok(ExecutionResult::terminated_by_signal(signal)));
+        }
+        // Without job control, a background job ignores INT and QUIT once it runs; one sent
+        // before its first turn still ends it, as in bash.
+        if !self.state.started.replace(true) && self.state.background.get() {
+            let mut dispositions = self.state.dispositions.get();
+            for signal in [signals::INT, signals::QUIT] {
+                dispositions.set(signal, PipeDisposition::Ignored);
+            }
+            self.state.dispositions.set(dispositions);
         }
         let _process = install(Some(self.state.clone()));
         let _tasks = super::RestoreScope(super::CURRENT_SCOPE.replace(Some(self.tasks.clone())));
@@ -467,6 +507,13 @@ impl NumberedProcess {
             _registration: Registration(Some(key)),
             finished: false,
         }
+    }
+
+    /// Marks this as a process of a background job: once it runs, it ignores INT and QUIT.
+    #[must_use]
+    pub fn in_background(self) -> Self {
+        self.state.background.set(true);
+        self
     }
 
     /// This process's number.
@@ -779,14 +826,19 @@ mod tests {
     use crate::process_table::{ProcessStatus, ProcessTable};
     use crate::traps::TrapHandlerConfig;
 
+    fn with(settings: &[(u8, PipeDisposition)]) -> Dispositions {
+        let mut dispositions = Dispositions::default();
+        for (signal, disposition) in settings {
+            dispositions.set(*signal, *disposition);
+        }
+        dispositions
+    }
+
     fn caught(term: bool) -> Dispositions {
-        Dispositions {
-            term: if term {
-                PipeDisposition::Caught
-            } else {
-                PipeDisposition::Default
-            },
-            ..Dispositions::default()
+        if term {
+            with(&[(signals::TERM, PipeDisposition::Caught)])
+        } else {
+            Dispositions::default()
         }
     }
 
@@ -822,10 +874,7 @@ mod tests {
             let table = ProcessTable::new(10, 11);
             let ignored = table.allocate(10, "ignored".into());
             let caught_pid = table.allocate(10, "caught".into());
-            let ignore = Dispositions {
-                term: PipeDisposition::Ignored,
-                ..Dispositions::default()
-            };
+            let ignore = with(&[(signals::TERM, PipeDisposition::Ignored)]);
             let (ignored_result, caught_result, ()) = futures::join!(
                 run_numbered_process(&table, ignored, ignore, async {
                     for _ in 0..4 {
@@ -879,16 +928,91 @@ mod tests {
     }
 
     #[test]
+    fn stop_holds_a_process_until_cont_and_kill_still_ends_it() {
+        run(async {
+            let table = ProcessTable::new(10, 11);
+            let (stopped, killed) = (
+                table.allocate(10, "stopped".into()),
+                table.allocate(10, "killed".into()),
+            );
+            let progress = Rc::new(Cell::new(0));
+            let counted = progress.clone();
+            let (resumed, dead, ()) = futures::join!(
+                run_numbered_process(&table, stopped, Dispositions::default(), async move {
+                    for _ in 0..8 {
+                        counted.set(counted.get() + 1);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(ExecutionResult::new(5))
+                }),
+                run_numbered_process(&table, killed, Dispositions::default(), async {
+                    futures::future::pending::<()>().await;
+                    Ok(ExecutionResult::success())
+                }),
+                async {
+                    tokio::task::yield_now().await;
+                    for pid in [stopped, killed] {
+                        assert!(signal_process(&table, pid, signals::STOP));
+                    }
+                    // TERM waits for CONT; KILL does not.
+                    signal_process(&table, stopped, signals::TERM);
+                    signal_process(&table, killed, signals::KILL);
+                    let seen = progress.get();
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(progress.get(), seen);
+                    signal_process(&table, stopped, signals::CONT);
+                }
+            );
+            assert_eq!(u8::from(resumed.unwrap().exit_code), 143);
+            assert_eq!(u8::from(dead.unwrap().exit_code), 137);
+        });
+    }
+
+    #[test]
+    fn default_actions_ignore_some_signals_and_background_jobs_ignore_interrupts_once_started() {
+        run(async {
+            let table = ProcessTable::new(10, 11);
+            let job = table.allocate(10, "job".into());
+            let early = table.allocate(10, "early".into());
+            let early_process =
+                NumberedProcess::register(&table, early, Dispositions::default()).in_background();
+            // INT before the job's first turn ends it.
+            assert!(signal_process(&table, early, signals::INT));
+            let (result, early_result, ()) = futures::join!(
+                NumberedProcess::register(&table, job, Dispositions::default())
+                    .in_background()
+                    .run(async {
+                        for _ in 0..4 {
+                            tokio::task::yield_now().await;
+                        }
+                        Ok(ExecutionResult::new(3))
+                    }),
+                early_process.run(async { Ok(ExecutionResult::success()) }),
+                async {
+                    tokio::task::yield_now().await;
+                    // CHLD, WINCH and URG are ignored by default; INT and QUIT once it runs.
+                    for signal in [17, 28, 23, signals::INT, signals::QUIT] {
+                        assert!(signal_process(&table, job, signal));
+                    }
+                }
+            );
+            assert_eq!(u8::from(result.unwrap().exit_code), 3);
+            assert_eq!(u8::from(early_result.unwrap().exit_code), 130);
+        });
+    }
+
+    #[test]
     fn kill_ignores_dispositions() {
         run(async {
             let table = ProcessTable::new(10, 11);
             let pid = table.allocate(10, "stubborn".into());
-            let all_ignored = Dispositions {
-                hup: PipeDisposition::Ignored,
-                int: PipeDisposition::Ignored,
-                pipe: PipeDisposition::Ignored,
-                term: PipeDisposition::Ignored,
-            };
+            let all_ignored = with(
+                &(1..=signals::MAX)
+                    .map(|signal| (signal, PipeDisposition::Ignored))
+                    .collect::<Vec<_>>(),
+            );
             let (result, ()) = futures::join!(
                 run_numbered_process(&table, pid, all_ignored, async {
                     futures::future::pending::<()>().await;
@@ -909,16 +1033,15 @@ mod tests {
             let table = ProcessTable::new(10, 11);
             let pid = table.allocate(10, "job".into());
             // The leader catches TERM (children reset it to default) and ignores HUP (inherited).
-            let leader = Dispositions {
-                term: PipeDisposition::Caught,
-                hup: PipeDisposition::Ignored,
-                ..Dispositions::default()
-            };
+            let leader = with(&[
+                (signals::TERM, PipeDisposition::Caught),
+                (signals::HUP, PipeDisposition::Ignored),
+            ]);
             let (result, ()) = futures::join!(
                 run_numbered_process(&table, pid, leader, async {
                     let inherited = inherited_dispositions(PipeDisposition::Default);
-                    assert_eq!(inherited.term, PipeDisposition::Default);
-                    assert_eq!(inherited.hup, PipeDisposition::Ignored);
+                    assert_eq!(inherited.get(signals::TERM), PipeDisposition::Default);
+                    assert_eq!(inherited.get(signals::HUP), PipeDisposition::Ignored);
                     let child = run_process(PipeDisposition::Default, async {
                         futures::future::pending::<()>().await;
                         Ok(ExecutionResult::success())
@@ -943,10 +1066,7 @@ mod tests {
         run(async {
             let table = ProcessTable::new(10, 11);
             let pid = table.allocate(10, "job".into());
-            let inherited = Dispositions {
-                int: PipeDisposition::Ignored,
-                ..Dispositions::default()
-            };
+            let inherited = with(&[(signals::INT, PipeDisposition::Ignored)]);
             run_numbered_process(&table, pid, inherited, async {
                 assert!(process_exists(&table, pid));
                 let mut traps = TrapHandlerConfig::default();
@@ -956,11 +1076,20 @@ mod tests {
                     crate::SourceInfo::from("test"),
                 );
                 apply_trap_dispositions(&traps);
-                assert_eq!(current_dispositions().term, PipeDisposition::Caught);
-                assert_eq!(current_dispositions().int, PipeDisposition::Ignored);
+                assert_eq!(
+                    current_dispositions().get(signals::TERM),
+                    PipeDisposition::Caught
+                );
+                assert_eq!(
+                    current_dispositions().get(signals::INT),
+                    PipeDisposition::Ignored
+                );
                 traps.remove_handlers("TERM".parse()?);
                 apply_trap_dispositions(&traps);
-                assert_eq!(current_dispositions().term, PipeDisposition::Default);
+                assert_eq!(
+                    current_dispositions().get(signals::TERM),
+                    PipeDisposition::Default
+                );
                 Ok(ExecutionResult::success())
             })
             .await

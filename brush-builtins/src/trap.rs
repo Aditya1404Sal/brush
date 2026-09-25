@@ -52,37 +52,54 @@ impl TrapCommand {
                 .map(|()| ExecutionResult::success())
         } else if self.print_trap_commands || self.args.is_empty() {
             if !self.args.is_empty() {
-                for signal_type in &self.args {
-                    Self::display_handlers_for(&context, signal_type.parse()?, stdout)?;
+                let (signals, result) = Self::parse_signals(&context, &self.args)?;
+                for signal in signals {
+                    Self::display_handlers_for(&context, signal, stdout)?;
                 }
+                Ok(result)
             } else {
                 Self::display_all_handlers(&context, stdout)?;
+                Ok(ExecutionResult::success())
             }
-            Ok(ExecutionResult::success())
-        } else if self.args.len() == 1 {
-            // When only a single argument is given, it is assumed to be a signal name
-            // and an indication to remove the handlers for that signal.
-            let signal = self.args[0].as_str();
-            Self::remove_all_handlers(&mut context, signal.parse()?);
-            Ok(ExecutionResult::success())
-        } else if self.args[0] == "-" {
-            // "-" as the first argument indicates that the remaining
-            // arguments are signal names and we need to remove the handlers for them.
-            for signal in &self.args[1..] {
-                Self::remove_all_handlers(&mut context, signal.parse()?);
+        } else if self.args.len() == 1 || self.args[0] == "-" {
+            // A single argument is a signal whose handlers to remove; after "-", every argument
+            // is.
+            let names = if self.args.len() == 1 {
+                &self.args[..]
+            } else {
+                &self.args[1..]
+            };
+            let (signals, result) = Self::parse_signals(&context, names)?;
+            for signal in signals {
+                Self::remove_all_handlers(&mut context, signal);
             }
-            Ok(ExecutionResult::success())
+            Ok(result)
         } else {
             let handler = &self.args[0];
-
-            let mut signal_types = Vec::with_capacity(self.args.len() - 1);
-            for signal in &self.args[1..] {
-                signal_types.push(signal.parse()?);
-            }
-
-            Self::register_handler(&mut context, signal_types, handler.as_str());
-            Ok(ExecutionResult::success())
+            let (signals, result) = Self::parse_signals(&context, &self.args[1..])?;
+            Self::register_handler(&mut context, signals, handler.as_str());
+            Ok(result)
         }
+    }
+
+    /// Parses signal names and numbers. As bash does, an invalid one is reported and fails the
+    /// command, and the valid ones still take effect.
+    fn parse_signals(
+        context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+        names: &[String],
+    ) -> Result<(Vec<TrapSignal>, ExecutionResult), brush_core::Error> {
+        let mut signals = Vec::with_capacity(names.len());
+        let mut result = ExecutionResult::success();
+        for name in names {
+            match name.parse() {
+                Ok(signal) => signals.push(signal),
+                Err(_) => {
+                    context.report(format_args!("{name}: invalid signal specification"))?;
+                    result = ExecutionResult::general_error();
+                }
+            }
+        }
+        Ok((signals, result))
     }
 
     fn display_all_handlers(

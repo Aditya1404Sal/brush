@@ -318,11 +318,11 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
     }
 
-    let mut dispositions = process::Dispositions::from_traps(cloned_shell.traps());
-    // Without job control, asynchronous commands ignore SIGINT.
-    dispositions.int = crate::traps::PipeDisposition::Ignored;
-    // Register now, so `kill $!` and `kill %1` reach the job before its task first runs.
-    let leader_process = process::NumberedProcess::register(&table, leader, dispositions);
+    let dispositions = process::Dispositions::from_traps(cloned_shell.traps());
+    // Register now, so `kill $!` and `kill %1` reach the job before its task first runs. Without
+    // job control, it ignores INT and QUIT once it runs.
+    let leader_process =
+        process::NumberedProcess::register(&table, leader, dispositions).in_background();
 
     // A single background pipeline reports one number per stage; `$!` is the last stage.
     let stage_processes: VecDeque<_> = if ao_list.additional.is_empty()
@@ -337,7 +337,9 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
             .iter()
             .map(|command| {
                 let pid = table.allocate(leader, command.to_string());
-                leader_process.register_child(pid, dispositions.for_exec())
+                leader_process
+                    .register_child(pid, dispositions.for_exec())
+                    .in_background()
             })
             .collect()
     } else {

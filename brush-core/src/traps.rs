@@ -97,7 +97,8 @@ impl TrapSignal {
     }
 }
 
-/// Formats [`Iterator<Item = TrapSignal>`](TrapSignal)  to the provided writer.
+/// Lists the numbered signals among `it` as bash's `kill -l` and `trap -l` do: ` 1) SIGHUP`,
+/// five to a line, separated by tabs.
 ///
 /// # Arguments
 ///
@@ -107,11 +108,17 @@ pub fn format_signals(
     mut f: impl std::io::Write,
     it: impl Iterator<Item = TrapSignal>,
 ) -> Result<(), error::Error> {
-    let it = it
-        .filter_map(|s| i32::try_from(s).ok().map(|n| (s, n)))
-        .sorted_by(|a, b| Ord::cmp(&a.1, &b.1))
-        .format_with("\n", |s, f| f(&format_args!("{}) {}", s.1, s.0)));
-    write!(f, "{it}")?;
+    let signals: Vec<(i32, TrapSignal)> = it
+        .filter_map(|s| i32::try_from(s).ok().filter(|n| *n > 0).map(|n| (n, s)))
+        .sorted_by_key(|(n, _)| *n)
+        .collect();
+    for (index, (number, signal)) in signals.iter().enumerate() {
+        let separator = if (index + 1) % 5 == 0 { '\n' } else { '\t' };
+        write!(f, "{number:2}) {signal}{separator}")?;
+    }
+    if signals.len() % 5 != 0 {
+        writeln!(f)?;
+    }
     Ok(())
 }
 
@@ -222,6 +229,24 @@ impl TrapHandlerConfig {
             Some(handler) if handler.command.is_empty() => PipeDisposition::Ignored,
             Some(_) => PipeDisposition::Caught,
         }
+    }
+
+    /// The effective disposition of every signal that has a handler, by signal number.
+    pub fn signal_dispositions(&self) -> impl Iterator<Item = (u8, PipeDisposition)> + '_ {
+        self.handlers
+            .iter()
+            .filter(|(signal, _)| {
+                matches!(signal, TrapSignal::Signal(_)) && !self.inherited_handlers.contains(signal)
+            })
+            .filter_map(|(signal, handler)| {
+                let number = u8::try_from(i32::try_from(*signal).ok()?).ok()?;
+                let disposition = if handler.command.is_empty() {
+                    PipeDisposition::Ignored
+                } else {
+                    PipeDisposition::Caught
+                };
+                Some((number, disposition))
+            })
     }
 
     /// Effective PIPE disposition, independently of the handler shown by `trap -p`.
