@@ -22,7 +22,7 @@ fn cacheable_parse(input: &str) -> Result<ast::ArithmeticExpr, error::WordParseE
 peg::parser! {
     grammar arithmetic() for str {
         pub(crate) rule full_expression() -> ast::ArithmeticExpr =
-            ![_] { ast::ArithmeticExpr::Literal(0) } /
+            _ ![_] { ast::ArithmeticExpr::Literal(0) } /
             _ e:expression() _ { e }
 
         pub(crate) rule expression() -> ast::ArithmeticExpr = precedence!{
@@ -75,9 +75,10 @@ peg::parser! {
             "!" _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::LogicalNot, Box::new(x)) }
             "~" _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::BitwiseNot, Box::new(x)) }
             --
-            // NOTE: We add negative lookahead to avoid ambiguity with the pre-increment/pre-decrement operators.
-            "+" !['+'] _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryPlus, Box::new(x)) }
-            "-" !['-'] _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryMinus, Box::new(x)) }
+            // NOTE: `++` and `--` step a variable that follows them; before anything else they are
+            // two signs, as in bash.
+            "+" !("+" _ ['a'..='z' | 'A'..='Z' | '_']) _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryPlus, Box::new(x)) }
+            "-" !("-" _ ['a'..='z' | 'A'..='Z' | '_']) _ x:(@) { ast::ArithmeticExpr::UnaryOp(ast::UnaryOperator::UnaryMinus, Box::new(x)) }
             --
             "++" _ x:lvalue() { ast::ArithmeticExpr::UnaryAssignment(ast::UnaryAssignmentOperator::PrefixIncrement, x) }
             "--" _ x:lvalue() { ast::ArithmeticExpr::UnaryAssignment(ast::UnaryAssignmentOperator::PrefixDecrement, x) }
@@ -90,13 +91,17 @@ peg::parser! {
             "(" _ expr:expression() _ ")" { expr }
         }
 
+        // The subscript is kept as written: an associative array uses it as its key, and an
+        // indexed array evaluates it, as bash does.
         rule lvalue() -> ast::ArithmeticTarget =
-            name:variable_name() "[" index:expression() "]" {
-                ast::ArithmeticTarget::ArrayElement(name.to_owned(), Box::new(index))
+            name:variable_name() "[" index:$(subscript()) "]" {
+                ast::ArithmeticTarget::ArrayElement(name.to_owned(), index.to_owned())
             } /
             name:variable_name() {
                 ast::ArithmeticTarget::Variable(name.to_owned())
             }
+
+        rule subscript() = ([^ '[' | ']'] / "[" subscript() "]")*
 
         rule variable_name() -> &'input str =
             $(['a'..='z' | 'A'..='Z' | '_'](['a'..='z' | 'A'..='Z' | '_' | '0'..='9']*))
@@ -108,25 +113,31 @@ peg::parser! {
             radix:decimal_literal() "#" s:$(['0'..='9' | 'a'..='z' | 'A'..='Z' | '@' | '_']+) {?
                 parse_shell_literal_number(s, radix.cast_unsigned())
             } /
-            // Hex literal
-            "0" ['x' | 'X'] s:$(['0'..='9' | 'a'..='f' | 'A'..='F']*) {?
-                i64::from_str_radix(s, 16).or(Err("i64"))
-            } /
+            // Hex literal (a bare `0x` is 0, as in bash)
+            "0" ['x' | 'X'] s:$(['0'..='9' | 'a'..='f' | 'A'..='F']*) { wrapping_literal(s, 16) } /
             // Octal literal
-            s:$("0" ['0'..='8']*) {?
-                i64::from_str_radix(s, 8).or(Err("i64"))
-            } /
+            s:$("0" ['0'..='7']*) { wrapping_literal(s, 8) } /
             // Decimal literal
             decimal_literal()
 
+        // A literal too large for 64 bits wraps, as in bash. This also gives INT64_MIN for
+        // -9223372036854775808.
         rule decimal_literal() -> i64 =
-            s:$(['1'..='9'] ['0'..='9']*) {?
-                // Parse as u64 first, then cast to i64. This handles values like
-                // 9223372036854775808 (i64::MAX + 1) which is needed for INT64_MIN
-                // when preceded by unary minus: -(9223372036854775808) wraps to i64::MIN.
-                s.parse::<u64>().map(|v| v.cast_signed()).or(Err("i64"))
-            }
+            s:$(['1'..='9'] ['0'..='9']*) { wrapping_literal(s, 10) }
     }
+}
+
+/// The value of a literal's digits (all valid in the radix), wrapped to 64 bits.
+fn wrapping_literal(digits: &str, radix: u32) -> i64 {
+    digits
+        .chars()
+        .filter_map(|c| c.to_digit(radix))
+        .fold(0_u64, |value, digit| {
+            value
+                .wrapping_mul(u64::from(radix))
+                .wrapping_add(u64::from(digit))
+        })
+        .cast_signed()
 }
 
 fn parse_shell_literal_number(s: &str, radix: u64) -> Result<i64, &'static str> {
@@ -168,4 +179,85 @@ fn parse_shell_literal_number(s: &str, radix: u64) -> Result<i64, &'static str> 
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn element(input: &str) -> Option<(String, String)> {
+        match parse(input).ok()? {
+            ast::ArithmeticExpr::Reference(ast::ArithmeticTarget::ArrayElement(name, index))
+            | ast::ArithmeticExpr::UnaryAssignment(
+                _,
+                ast::ArithmeticTarget::ArrayElement(name, index),
+            ) => Some((name, index)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn subscripts_are_kept_as_written() {
+        for (input, array, subscript) in [
+            ("m[k]", "m", "k"),
+            ("m[ k ]", "m", " k "),
+            ("m[foo.txt]++", "m", "foo.txt"),
+            ("m[a-b]", "m", "a-b"),
+            ("a[i+1]", "a", "i+1"),
+            ("a[b[1]]", "a", "b[1]"),
+        ] {
+            assert_eq!(
+                element(input),
+                Some((array.to_owned(), subscript.to_owned())),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn literals_wrap_to_64_bits() {
+        for (input, value) in [
+            ("99999999999999999999", 7_766_279_631_452_241_919),
+            ("18446744073709551616", 0),
+            ("0777777777777777777777777", -1),
+            ("0xffffffffffffffffff", -1),
+            ("0x", 0),
+        ] {
+            assert!(
+                matches!(parse(input), Ok(ast::ArithmeticExpr::Literal(v)) if v == value),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn steps_before_a_number_are_signs() {
+        for input in ["++1", "-- 1"] {
+            assert!(
+                matches!(
+                    parse(input),
+                    Ok(ast::ArithmeticExpr::UnaryOp(_, ref operand))
+                        if matches!(**operand, ast::ArithmeticExpr::UnaryOp(_, _))
+                ),
+                "{input}"
+            );
+        }
+        assert!(matches!(
+            parse("++ a"),
+            Ok(ast::ArithmeticExpr::UnaryAssignment(
+                ast::UnaryAssignmentOperator::PrefixIncrement,
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn blank_expressions_are_zero() {
+        for input in ["", " ", "  \t "] {
+            assert!(
+                matches!(parse(input), Ok(ast::ArithmeticExpr::Literal(0))),
+                "{input:?}"
+            );
+        }
+    }
 }

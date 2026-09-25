@@ -27,7 +27,11 @@ pub(crate) struct CdCommand {
 
     /// By default it is the value of the HOME shell variable. If `TARGET_DIR` is "-", it is
     /// converted to $OLDPWD.
-    target_dir: Option<PathBuf>,
+    target_dir: Option<String>,
+
+    /// Operands after the first, which bash refuses.
+    #[arg(hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for CdCommand {
@@ -42,20 +46,43 @@ impl builtins::Command for CdCommand {
             return error::unimp("cd -@");
         }
 
+        if !self.extra.is_empty() {
+            context.report("too many arguments")?;
+            return Ok(ExecutionResult::new(2));
+        }
+
         let mut should_print = false;
         let mut target_dir = if let Some(target_dir) = &self.target_dir {
             // `cd -', equivalent to `cd $OLDPWD'
-            if target_dir.as_os_str() == "-" {
+            if target_dir == "-" {
                 should_print = true;
-                if let Some(oldpwd) = context.shell.env_str("OLDPWD") {
-                    PathBuf::from(oldpwd.to_string())
-                } else {
-                    context.report("OLDPWD not set")?;
-                    return Ok(ExecutionResult::general_error());
+                let oldpwd = context
+                    .shell
+                    .env()
+                    .get("OLDPWD")
+                    .filter(|(_, var)| var.value().is_set())
+                    .map(|(_, var)| var.value().to_cow_str(context.shell).to_string());
+                match oldpwd {
+                    // An empty OLDPWD names the current directory.
+                    Some(oldpwd) if oldpwd.is_empty() => {
+                        writeln!(context.stdout())?;
+                        return Ok(ExecutionResult::success());
+                    }
+                    Some(oldpwd) => PathBuf::from(oldpwd),
+                    None => {
+                        context.report("OLDPWD not set")?;
+                        return Ok(ExecutionResult::general_error());
+                    }
                 }
+            } else if target_dir.is_empty() {
+                context.report("null directory")?;
+                return Ok(ExecutionResult::general_error());
+            } else if let Some(found) = cdpath_directory(&context, target_dir) {
+                // A directory found through a non-empty CDPATH entry is printed, as in bash.
+                should_print = found.1;
+                found.0
             } else {
-                // TODO(cd): remove clone, and use temporary lifetime extension after rust 1.75
-                target_dir.clone()
+                PathBuf::from(target_dir)
             }
         // `cd' without arguments is equivalent to `cd $HOME'
         } else {
@@ -83,8 +110,11 @@ impl builtins::Command for CdCommand {
 
         if let Err(error) = context.shell.set_working_dir(&target_dir) {
             // As bash words it: the operand as given, then the reason.
-            let shown = self.target_dir.as_ref().unwrap_or(&target_dir);
-            context.report(format_args!("{}: {}", shown.display(), error.path_reason()))?;
+            let shown = self
+                .target_dir
+                .clone()
+                .unwrap_or_else(|| target_dir.to_string_lossy().to_string());
+            context.report(format_args!("{shown}: {}", error.path_reason()))?;
             return Ok(ExecutionResult::general_error());
         }
 
@@ -94,9 +124,39 @@ impl builtins::Command for CdCommand {
         // the directory change is successful, the absolute pathname of the new working
         // directory is written to the standard output.
         if should_print {
-            writeln!(context.stdout(), "{}", target_dir.display())?;
+            writeln!(
+                context.stdout(),
+                "{}",
+                context.shell.working_dir().display()
+            )?;
         }
 
         Ok(ExecutionResult::success())
     }
+}
+
+/// The directory `target` names through CDPATH, as bash searches it: only for a relative name
+/// that does not start with `.` or `..`, each entry in turn (an empty one is the current
+/// directory). Returns it, and whether a non-empty entry found it.
+fn cdpath_directory(
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    target: &str,
+) -> Option<(PathBuf, bool)> {
+    let first = target.split('/').next().unwrap_or_default();
+    if target.starts_with('/') || first == "." || first == ".." {
+        return None;
+    }
+    let cdpath = context.shell.env_str("CDPATH")?;
+    cdpath.split(':').find_map(|entry| {
+        let candidate = if entry.is_empty() {
+            PathBuf::from(target)
+        } else {
+            PathBuf::from(entry).join(target)
+        };
+        context
+            .shell
+            .absolute_path(&candidate)
+            .is_dir()
+            .then_some((candidate, !entry.is_empty()))
+    })
 }

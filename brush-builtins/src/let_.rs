@@ -1,6 +1,12 @@
 use clap::Parser;
 
-use brush_core::{ExecutionExitCode, ExecutionResult, arithmetic::Evaluatable, builtins};
+use std::io::Write as _;
+
+use brush_core::{
+    ExecutionExitCode, ExecutionResult,
+    arithmetic::{EvalError, Evaluatable},
+    builtins,
+};
 
 /// Evaluate arithmetic expressions.
 #[derive(Parser)]
@@ -21,12 +27,16 @@ impl builtins::Command for LetCommand {
 
         if self.exprs.is_empty() {
             context.report("expression expected")?;
-            return Ok(result);
+            return Ok(ExecutionResult::general_error());
         }
 
         for expr in &self.exprs {
-            let parsed = brush_parser::arithmetic::parse(expr.as_str())?;
-            let evaluated = parsed.eval(context.shell)?;
+            let evaluated = match brush_core::arithmetic::parse(expr.as_str())
+                .and_then(|parsed| parsed.eval(context.shell))
+            {
+                Ok(evaluated) => evaluated,
+                Err(error) => return report(&context, expr, error),
+            };
 
             if evaluated == 0 {
                 result = ExecutionResult::general_error();
@@ -37,4 +47,32 @@ impl builtins::Command for LetCommand {
 
         Ok(result)
     }
+}
+
+/// Fails `let` on an expression it could not evaluate, reported as bash words it
+/// (`let: EXPR: message`, or `NAME: readonly variable`). An unset variable under `set -u` ends
+/// the shell.
+fn report(
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    expr: &str,
+    error: EvalError,
+) -> Result<ExecutionResult, brush_core::Error> {
+    if let Some(name) = error.unset_variable() {
+        return Err(
+            brush_core::Error::from(brush_core::ErrorKind::ExpandingUnsetVariable(
+                name.to_owned(),
+            ))
+            .into_fatal(),
+        );
+    }
+    if error.is_readonly_variable() {
+        writeln!(
+            context.stderr(),
+            "{}{error}",
+            context.shell.diagnostic_prefix()
+        )?;
+    } else {
+        context.report(EvalError::in_expression(expr, error))?;
+    }
+    Ok(ExecutionResult::general_error())
 }

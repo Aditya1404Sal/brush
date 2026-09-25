@@ -247,9 +247,27 @@ async fn execute_program(
     {
         let mut result = ExecutionResult::success();
         let (program, interrupted) = shell.begin_program();
+        let input = shell.pending_input.take();
+        let mut next_input_line = 1;
 
         for (index, command) in program_ast.complete_commands.iter().enumerate() {
             shell.begin_command_unit(program, index);
+            // `set -v` echoes the input lines of each command as bash reads them, before it runs.
+            if let Some(input) = &input {
+                let end = ast::SourceLocation::location(command)
+                    .map_or(next_input_line, |span| span.end.line);
+                if shell.options().print_shell_input_lines && end >= next_input_line {
+                    let mut stderr = params.stderr(shell);
+                    for line in input
+                        .lines()
+                        .skip(next_input_line - 1)
+                        .take(end + 1 - next_input_line)
+                    {
+                        let _ = writeln!(stderr, "{line}");
+                    }
+                }
+                next_input_line = next_input_line.max(end + 1);
+            }
             // Execute the command and handle any errors without immediately propagating them.
             // This allows interactive shells to continue executing subsequent commands even after
             // errors.
@@ -352,7 +370,16 @@ async fn execute_list(
 
                 result = ExecutionResult::success();
             } else {
-                result = ao_list.execute(shell, params).await?;
+                result = match ao_list.execute(shell, params).await {
+                    Ok(result) => result,
+                    // An error that ends the shell is reported where it happened, while LINENO
+                    // still names that line (in a function body, not the call).
+                    Err(error) if error.is_fatal() && !error.is_reported() => {
+                        let _ = shell.display_error(&mut params.stderr(shell), &error);
+                        return Err(error.into_reported());
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 // Update status
                 shell.set_last_exit_status(result.exit_code.into());
@@ -512,6 +539,15 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         pids,
         stages,
     ))
+}
+
+/// Whether a pipeline stage adds no subshell level (`BASH_SUBSHELL`) of its own, as in bash: a
+/// simple command runs in the stage's process as it is, and a `( list )` is the stage's subshell.
+const fn stage_adds_no_subshell(command: &ast::Command) -> bool {
+    matches!(
+        command,
+        ast::Command::Simple(_) | ast::Command::Compound(ast::CompoundCommand::Subshell(_), _)
+    )
 }
 
 /// Turns the jobs already started get to finish before the job cap refuses another one.
@@ -717,7 +753,11 @@ impl Execute for ast::Pipeline {
         // We reuse `suppress_errexit` here because bash suppresses the ERR trap in
         // exactly the same contexts it suppresses errexit (conditionals, `!`-prefixed
         // pipelines, etc.).
-        if !result.is_success() && !params.suppress_errexit && !self.bang {
+        if !result.is_success()
+            && !params.suppress_errexit
+            && !self.bang
+            && !runs_its_own_commands(self)
+        {
             if shell.traps().handles(crate::traps::TrapSignal::Err) {
                 shell
                     .invoke_trap_handler(crate::traps::TrapSignal::Err, &params)
@@ -730,32 +770,57 @@ impl Execute for ast::Pipeline {
             shell.apply_errexit_if_enabled(&mut result);
         }
 
-        // If requested, report timing.
+        // If requested, report timing, in TIMEFORMAT (bash's default when it is unset; nothing
+        // when it is empty) or, for `time -p`, the POSIX format.
         if let (Some(timed), Some(stopwatch)) = (&self.timed, &stopwatch)
             && let Some(mut stderr) = params.try_fd(shell, openfiles::OpenFiles::STDERR_FD)
         {
             let timing = stopwatch.stop()?;
-            if timed.is_posix_output() {
-                std::write!(
-                    stderr,
-                    "real {}\nuser {}\nsys {}\n",
-                    timing::format_duration_posixly(&timing.wall),
-                    timing::format_duration_posixly(&timing.user),
-                    timing::format_duration_posixly(&timing.system),
-                )?;
+            let format = if timed.is_posix_output() {
+                timing::POSIX_TIMEFORMAT.to_owned()
             } else {
-                std::write!(
-                    stderr,
-                    "\nreal\t{}\nuser\t{}\nsys\t{}\n",
-                    timing::format_duration_non_posixly(&timing.wall),
-                    timing::format_duration_non_posixly(&timing.user),
-                    timing::format_duration_non_posixly(&timing.system),
-                )?;
+                shell
+                    .env()
+                    .get("TIMEFORMAT")
+                    .filter(|(_, var)| var.value().is_set())
+                    .map_or_else(
+                        || timing::BASH_TIMEFORMAT.to_owned(),
+                        |(_, var)| var.value().to_cow_str(shell).into_owned(),
+                    )
+            };
+            if !format.is_empty() {
+                match timing::format_timing(&format, &timing) {
+                    Ok(text) => std::writeln!(stderr, "{text}")?,
+                    Err(message) => {
+                        std::writeln!(stderr, "{}{message}", shell.diagnostic_prefix())?;
+                    }
+                }
             }
         }
 
         Ok(result)
     }
+}
+
+/// Whether the pipeline is one compound command that runs its commands in this shell (a group,
+/// a loop, `if` or `case`), or a function definition. The commands inside set PIPESTATUS and run
+/// the ERR trap themselves, as in bash; `(( ))`, `[[ ]]` and `( )` do both as commands.
+const fn runs_its_own_commands(pipeline: &ast::Pipeline) -> bool {
+    matches!(
+        pipeline.seq.as_slice(),
+        [ast::Command::Function(_)
+            | ast::Command::Compound(
+                ast::CompoundCommand::BraceGroup(_)
+                    | ast::CompoundCommand::ForClause(_)
+                    | ast::CompoundCommand::ArithmeticForClause(_)
+                    | ast::CompoundCommand::SelectClause(_)
+                    | ast::CompoundCommand::CaseClause(_)
+                    | ast::CompoundCommand::IfClause(_)
+                    | ast::CompoundCommand::WhileClause(_)
+                    | ast::CompoundCommand::UntilClause(_),
+                _,
+            )]
+    )
 }
 
 async fn spawn_pipeline_processes(
@@ -835,8 +900,12 @@ async fn spawn_pipeline_processes(
         {
             if !run_in_current_shell {
                 let stage_process = shell.take_stage_process();
+                let mut stage_shell = shell.clone();
+                if stage_adds_no_subshell(command) {
+                    stage_shell.subshell_level = shell.subshell_level;
+                }
                 let join_handle =
-                    spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params, stage_process);
+                    spawn_pipeline_stage(stage_shell, command.clone(), cmd_params, stage_process);
                 stage_tasks.0.push(join_handle.abort_handle());
                 spawn_results.push_back(ExecutionSpawnResult::StartedTask(join_handle));
                 continue;
@@ -849,9 +918,13 @@ async fn spawn_pipeline_processes(
                 cmd_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
             }
 
+            let mut stage_shell = shell.clone();
+            if stage_adds_no_subshell(command) {
+                stage_shell.subshell_level = shell.subshell_level;
+            }
             PipelineExecutionContext {
                 shell: commands::ShellForCommand::OwnedShell {
-                    target: Box::new(shell.clone()),
+                    target: Box::new(stage_shell),
                     parent: shell,
                 },
                 process_group_id,
@@ -984,6 +1057,12 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
                 },
                 Err(error) => Err(error),
             };
+            // An error that ends the stage (`${x:?}`) ends only the stage, which exits with the
+            // error's status, as a bash subshell does.
+            let result = result.or_else(|error: error::Error| {
+                let _ = shell.display_error(&mut params.stderr(&shell), &error);
+                Ok(ExecutionResult::from(error.into_result(&shell).exit_code))
+            });
             let result = shell.exit_with_trap_in(result, &params).await;
             completed.set(true);
             // A stage is a subshell: its `exit`, `break` or `return` ends only the stage.
@@ -1046,8 +1125,14 @@ async fn wait_for_pipeline_processes_and_update_status(
     let mut stopped_children = vec![];
     let mut last_failure_exit_code: Option<(ExecutionExitCode, Option<u8>)> = None;
 
+    // A compound command or function definition run on its own in this shell leaves PIPESTATUS
+    // as the last pipeline it ran set it, as in bash; `(( ))`, `[[ ]]` and `( )` set it.
+    let keeps_statuses = runs_its_own_commands(pipeline);
+
     // Clear our the pipeline status so we can start filling it out.
-    shell.last_pipeline_statuses_mut().clear();
+    if !keeps_statuses {
+        shell.last_pipeline_statuses_mut().clear();
+    }
 
     while let Some(child) = process_spawn_results.pop_front() {
         let wait_result = if !stopped_children.is_empty() {
@@ -1060,9 +1145,11 @@ async fn wait_for_pipeline_processes_and_update_status(
             ExecutionWaitResult::Completed(current_result) => {
                 result = current_result;
                 shell.set_last_exit_status(result.exit_code.into());
-                shell
-                    .last_pipeline_statuses_mut()
-                    .push(result.exit_code.into());
+                if !keeps_statuses {
+                    shell
+                        .last_pipeline_statuses_mut()
+                        .push(result.exit_code.into());
+                }
 
                 // Track the last failure for pipefail option
                 if !result.is_success() {
@@ -1135,10 +1222,47 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                 #[cfg(target_arch = "wasm32")]
                 let pending = params.own_output_substitutions();
 
-                // Set up any additional redirects.
+                // `(( ))`, `[[ ]]` and `( )` are commands in their own right: they become
+                // BASH_COMMAND, and the DEBUG trap runs before `(( ))` and `[[ ]]`, as in bash.
+                let text = match compound {
+                    ast::CompoundCommand::Arithmetic(arithmetic) => {
+                        Some((format!("(( {} ))", arithmetic.expr.value), true))
+                    }
+                    ast::CompoundCommand::ExtendedTest(test) => {
+                        Some((format!("[[ {test} ]]"), true))
+                    }
+                    ast::CompoundCommand::Subshell(subshell) => Some((subshell.to_string(), false)),
+                    _ => None,
+                };
+                if let Some((text, debug)) = text {
+                    let shell = &mut pipeline_context.shell;
+                    if !shell.running_trap_handler() {
+                        shell.env_mut().update_or_add(
+                            "BASH_COMMAND",
+                            ShellValueLiteral::Scalar(text),
+                            |_| Ok(()),
+                            EnvironmentLookup::Anywhere,
+                            EnvironmentScope::Global,
+                        )?;
+                    }
+                    if debug && shell.traps().handles(traps::TrapSignal::Debug) {
+                        shell
+                            .invoke_trap_handler(traps::TrapSignal::Debug, &params)
+                            .await?;
+                    }
+                }
+
+                // Set up any additional redirects. One that fails fails the command, and the
+                // list goes on.
                 if let Some(redirects) = redirects {
                     for redirect in &redirects.0 {
-                        setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await?;
+                        if let Err(error) =
+                            setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await
+                        {
+                            let shell = &mut pipeline_context.shell;
+                            let _ = shell.display_error(&mut params.stderr(shell), &error);
+                            return Ok(ExecutionResult::general_error().into());
+                        }
                     }
                     if redirects.0.iter().any(redirects_stdin) {
                         params.stdin_redirected = true;
@@ -1271,12 +1395,27 @@ impl Execute for ast::CompoundCommand {
             Self::ArithmeticForClause(a) => a.execute(shell, params).await,
             Self::Coprocess(c) => c.execute(shell, params).await,
             Self::ExtendedTest(e) => {
-                let result =
-                    if extendedtests::eval_extended_test_expr(&e.expr, shell, params).await? {
-                        0
-                    } else {
-                        1
-                    };
+                let result = match extendedtests::eval_extended_test_expr(&e.expr, shell, params)
+                    .await
+                {
+                    Ok(true) => 0,
+                    Ok(false) => 1,
+                    // A regular expression that does not compile fails the test with status 2.
+                    Err(error) if matches!(error.kind(), error::ErrorKind::InvalidRegex(..)) => {
+                        writeln!(
+                            params.stderr(shell),
+                            "{}[[: {error}",
+                            shell.diagnostic_prefix()
+                        )?;
+                        return Ok(ExecutionResult::new(2));
+                    }
+                    Err(error) => {
+                        return match error.into_eval_error() {
+                            Ok(error) => arithmetic_command_error(shell, params, "[[", &error),
+                            Err(error) => Err(error),
+                        };
+                    }
+                };
                 Ok(ExecutionResult::new(result))
             }
         }
@@ -1388,24 +1527,35 @@ impl Execute for ast::ForClauseCommand {
             shell.current_shell_args().to_vec()
         };
 
+        let header = if let Some(unexpanded_values) = &self.values {
+            std::format!(
+                "for {} in {}",
+                self.variable_name,
+                unexpanded_values.iter().join(" ")
+            )
+        } else {
+            std::format!("for {}", self.variable_name)
+        };
+
         for value in expanded_values {
+            // Each iteration runs the DEBUG trap with the header as BASH_COMMAND, as in bash.
+            if !shell.running_trap_handler() {
+                shell.env_mut().update_or_add(
+                    "BASH_COMMAND",
+                    ShellValueLiteral::Scalar(header.clone()),
+                    |_| Ok(()),
+                    EnvironmentLookup::Anywhere,
+                    EnvironmentScope::Global,
+                )?;
+            }
+            if shell.traps().handles(traps::TrapSignal::Debug) {
+                shell
+                    .invoke_trap_handler(traps::TrapSignal::Debug, params)
+                    .await?;
+            }
+
             if shell.options().print_commands_and_arguments {
-                if let Some(unexpanded_values) = &self.values {
-                    shell
-                        .trace_command(
-                            params,
-                            std::format!(
-                                "for {} in {}",
-                                self.variable_name,
-                                unexpanded_values.iter().join(" ")
-                            ),
-                        )
-                        .await;
-                } else {
-                    shell
-                        .trace_command(params, std::format!("for {}", self.variable_name))
-                        .await;
-                }
+                shell.trace_command(params, header.as_str()).await;
             }
 
             // Update the variable. A nameref control variable is pointed at each word in turn
@@ -1421,14 +1571,20 @@ impl Execute for ast::ForClauseCommand {
                 {
                     var.assign(ShellValueLiteral::Scalar(value), false)?;
                 }
-            } else {
-                shell.env_mut().update_or_add(
-                    &self.variable_name,
-                    ShellValueLiteral::Scalar(value),
-                    |_| Ok(()),
-                    EnvironmentLookup::Anywhere,
-                    EnvironmentScope::Global,
-                )?;
+            } else if let Err(error) = shell.env_mut().update_or_add(
+                &self.variable_name,
+                ShellValueLiteral::Scalar(value),
+                |_| Ok(()),
+                EnvironmentLookup::Anywhere,
+                EnvironmentScope::Global,
+            ) {
+                // A readonly control variable fails the loop, and the list goes on.
+                if !matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) {
+                    return Err(error);
+                }
+                let _ = shell.display_error(&mut params.stderr(shell), &error);
+                result = ExecutionResult::general_error();
+                break;
             }
 
             shell.loop_depth += 1;
@@ -1803,7 +1959,10 @@ impl Execute for ast::ArithmeticCommand {
         shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
-        let value = self.expr.eval(shell, params, true).await?;
+        let value = match self.expr.eval(shell, params, true).await {
+            Ok(value) => value,
+            Err(error) => return arithmetic_command_error(shell, params, "((", &error),
+        };
         let result = if value != 0 {
             ExecutionResult::success()
         } else {
@@ -1825,15 +1984,21 @@ impl Execute for ast::ArithmeticForClauseCommand {
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let mut result = ExecutionResult::success();
-        if let Some(initializer) = &self.initializer {
-            initializer.eval(shell, params, true).await?;
+        if let Some(initializer) = &self.initializer
+            && let Err(error) = initializer.eval(shell, params, true).await
+        {
+            return arithmetic_command_error(shell, params, "((", &error);
         }
 
         loop {
             if let Some(condition) = &self.condition {
                 // An empty condition (e.g., `for (( ; ; ))`) means "always true".
-                if !condition.value.is_empty() && condition.eval(shell, params, true).await? == 0 {
-                    break;
+                if !condition.value.is_empty() {
+                    match condition.eval(shell, params, true).await {
+                        Ok(0) => break,
+                        Ok(_) => (),
+                        Err(error) => return arithmetic_command_error(shell, params, "((", &error),
+                    }
                 }
             }
 
@@ -1853,8 +2018,10 @@ impl Execute for ast::ArithmeticForClauseCommand {
                 break;
             }
 
-            if let Some(updater) = &self.updater {
-                updater.eval(shell, params, true).await?;
+            if let Some(updater) = &self.updater
+                && let Err(error) = updater.eval(shell, params, true).await
+            {
+                return arithmetic_command_error(shell, params, "((", &error);
             }
         }
 
@@ -1863,15 +2030,62 @@ impl Execute for ast::ArithmeticForClauseCommand {
     }
 }
 
+/// An arithmetic error in `(( ))`, `for (( ))` or `[[ ]]` fails that command with status 1,
+/// reported as bash words it (`((: EXPR: message`), and the list goes on. An unset variable under
+/// `set -u` ends the shell instead, as it does anywhere else.
+fn arithmetic_command_error(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: &str,
+    error: &arithmetic::EvalError,
+) -> Result<ExecutionResult, error::Error> {
+    if let Some(name) = error.unset_variable() {
+        return Err(
+            error::Error::from(error::ErrorKind::ExpandingUnsetVariable(name.to_owned()))
+                .into_fatal(),
+        );
+    }
+    // A readonly variable is named on its own, without the command.
+    let message = if error.is_readonly_variable() {
+        error.to_string()
+    } else {
+        format!("{command}: {error}")
+    };
+    writeln!(
+        params.stderr(shell),
+        "{}{message}",
+        shell.diagnostic_prefix()
+    )?;
+    let result = ExecutionResult::general_error();
+    shell.set_last_exit_status(result.exit_code.into());
+    Ok(result)
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Execute for ast::FunctionDefinition {
     async fn execute(
         &self,
         shell: &mut Shell<impl extensions::ShellExtensions>,
-        _params: &ExecutionParameters,
+        params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         let func_name = self.fname.value.clone();
+
+        // A readonly function (`readonly -f`) keeps its definition.
+        if shell
+            .funcs()
+            .get(&func_name)
+            .is_some_and(|f| f.is_readonly())
+        {
+            writeln!(
+                params.stderr(shell),
+                "{}{func_name}: readonly function",
+                shell.diagnostic_prefix()
+            )?;
+            let result = ExecutionResult::general_error();
+            shell.set_last_exit_status(result.exit_code.into());
+            return Ok(result);
+        }
 
         // In POSIX mode, function names can't shadow special builtins.
         if shell.options().posix_mode
@@ -1896,7 +2110,11 @@ impl Execute for ast::FunctionDefinition {
             .map_or_else(crate::SourceInfo::default, |frame| {
                 frame.adjusted_source_info()
             });
-        shell.define_func(func_name, self.clone(), &source_info);
+        let aliases = shell.aliases_for_definition();
+        shell.define_func(func_name.clone(), self.clone(), &source_info);
+        if let Some(registration) = shell.func_mut(&func_name) {
+            registration.set_aliases(aliases);
+        }
 
         let result = ExecutionResult::success();
         shell.set_last_exit_status(result.exit_code.into());
@@ -1947,6 +2165,16 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         let mut assignments = vec![];
         let mut args: Vec<CommandArg> = vec![];
         let mut command_takes_assignments = false;
+        let mut redirect_failed = false;
+        let mut alias_follows = false;
+
+        // `set -x` traces a simple command to the standard error it had before its own
+        // redirections, as bash does.
+        let trace_params = context
+            .shell
+            .options()
+            .print_commands_and_arguments
+            .then(|| params.clone());
 
         // Capture the status change count before expansion, so we can detect
         // if expansion (e.g., command substitution) set an exit status.
@@ -1955,11 +2183,27 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
         for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
             match item {
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
-                    if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
+                    // Bash expands a here-document or here-string given to a program it runs in
+                    // a child process there, so the expansion's side effects are lost.
+                    let result = if matches!(
+                        redirect,
+                        ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)
+                    ) && runs_as_process(&context.shell, &args)
                     {
+                        let mut child = Shell::clone(&context.shell);
+                        setup_redirect(&mut child, &mut params, redirect).await
+                    } else {
+                        setup_redirect(&mut context.shell, &mut params, redirect).await
+                    };
+                    if let Err(e) = result {
                         let _ = context
                             .shell
                             .display_error(&mut params.stderr(&context.shell), &e);
+                        // Without a command, the assignments still take effect, as in bash.
+                        if self.word_or_name.is_none() {
+                            redirect_failed = true;
+                            continue;
+                        }
                         return Ok(ExecutionResult::general_error().into());
                     }
                 }
@@ -1977,7 +2221,15 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     )));
                 }
                 CommandPrefixOrSuffixItem::AssignmentWord(assignment, word) => {
-                    if args.is_empty() {
+                    // With `set -k`, an assignment anywhere among the words is one for the
+                    // command's environment, as in bash.
+                    if args.is_empty()
+                        || (!command_takes_assignments
+                            && context
+                                .shell
+                                .options()
+                                .place_all_assignment_args_in_command_env)
+                    {
                         // If we haven't yet seen any arguments, then this must be a proper
                         // scoped assignment. Add it to the list we're accumulating.
                         assignments.push(assignment);
@@ -2007,47 +2259,36 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     }
                 }
                 CommandPrefixOrSuffixItem::Word(arg) => {
-                    let mut next_args =
+                    // The command word, and a word after an alias ending in a blank, may be
+                    // aliases (when `expand_aliases` is on, as it is in interactive shells).
+                    //
+                    // TODO(#57): aliases are supposed to be expanded as the command is read, not
+                    // as it runs; this handles bodies that amount to a sequence of words.
+                    let alias_position = args.is_empty() || alias_follows;
+                    alias_follows = false;
+                    let next_args = if alias_position
+                        && let Some((fields, trailing_blank)) =
+                            expand_alias(&mut context.shell, &params, &arg.value).await?
+                    {
+                        alias_follows = trailing_blank;
+                        fields
+                    } else {
                         expansion::full_expand_and_split_word(&mut context.shell, &params, arg)
-                            .await?;
+                            .await?
+                    };
 
                     if args.is_empty() {
-                        if let Some(cmd_name) = next_args.first() {
-                            // Aliases are only expanded when `expand_aliases` is enabled; it's
-                            // enabled by default for interactive shells.
-                            if context.shell.options().expand_aliases
-                                && context.shell.alias_in_effect(cmd_name)
-                                && let Some(alias_value) =
-                                    context.shell.aliases().get(cmd_name.as_str())
-                            {
-                                //
-                                // TODO(#57): This is a total hack; aliases are supposed to be
-                                // handled much earlier in the process.
-                                //
-                                // N.B. Tokenizing first releases our borrow of the shell's aliases,
-                                // so we can take a mutable borrow of the shell to expand the words.
-                                let alias_words = tokenize_alias_body(&context.shell, alias_value);
-                                let mut alias_pieces =
-                                    expand_words(&mut context.shell, &params, alias_words).await?;
-
-                                next_args.remove(0);
-                                alias_pieces.append(&mut next_args);
-
-                                next_args = alias_pieces;
-                            }
-
-                            // Check if we're going to be invoking a special declaration builtin.
-                            // That will change how we parse and process args. (An alias with an
-                            // empty body leaves us with no words at all.)
-                            if let Some(first_arg) = next_args.first()
-                                && context
-                                    .shell
-                                    .builtins()
-                                    .get(first_arg.as_str())
-                                    .is_some_and(|r| !r.disabled && r.declaration_builtin)
-                            {
-                                command_takes_assignments = true;
-                            }
+                        // Check if we're going to be invoking a special declaration builtin.
+                        // That will change how we parse and process args. (An alias with an
+                        // empty body leaves us with no words at all.)
+                        if let Some(first_arg) = next_args.first()
+                            && context
+                                .shell
+                                .builtins()
+                                .get(first_arg.as_str())
+                                .is_some_and(|r| !r.disabled && r.declaration_builtin)
+                        {
+                            command_takes_assignments = true;
                         }
                     }
 
@@ -2080,7 +2321,15 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 process_group_id: context.process_group_id,
             };
 
-            let result = execute_command(context, params, cmd_name, &assignments, &args).await;
+            let result = execute_command(
+                context,
+                params,
+                trace_params.as_ref(),
+                cmd_name,
+                &assignments,
+                &args,
+            )
+            .await;
             #[cfg(target_arch = "wasm32")]
             let result = match result {
                 Ok(spawned) if !pending.is_empty() => {
@@ -2111,6 +2360,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     assignment,
                     &mut context.shell,
                     &params,
+                    trace_params.as_ref().unwrap_or(&params),
                     false,
                     None,
                     EnvironmentScope::Global,
@@ -2122,6 +2372,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             // This matches bash behavior where assignments don't have a "last
             // argument".
             context.shell.update_last_arg_variable(None);
+
+            if redirect_failed {
+                context.shell.set_last_exit_status(1);
+                return Ok(ExecutionResult::general_error().into());
+            }
 
             // We need to set the last exit status to indicate assignment success,
             // but only if there was no status set during expansion. We use the
@@ -2139,9 +2394,27 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
     }
 }
 
+/// Whether bash would run the command `args` names as a program in a child process: not a
+/// function, and not a builtin other than a utility that stands for a program.
+fn runs_as_process(shell: &Shell<impl extensions::ShellExtensions>, args: &[CommandArg]) -> bool {
+    let Some(CommandArg::String(name)) = args.first() else {
+        return false;
+    };
+    if shell.funcs().get(name).is_some() {
+        return false;
+    }
+    match shell.builtins().get(name) {
+        Some(registration) if !registration.disabled => {
+            registration.execution_boundary == crate::builtins::ExecutionBoundary::Command
+        }
+        _ => true,
+    }
+}
+
 async fn execute_command<T: Into<String>>(
     mut context: PipelineExecutionContext<'_, impl extensions::ShellExtensions>,
     params: ExecutionParameters,
+    trace_params: Option<&ExecutionParameters>,
     cmd_name: T,
     assignments: &[&ast::Assignment],
     args: &[CommandArg],
@@ -2153,22 +2426,28 @@ async fn execute_command<T: Into<String>>(
 
     for assignment in assignments {
         // Ensure it's tagged as exported and created in the command scope.
-        apply_assignment(
+        match apply_assignment(
             assignment,
             guard.shell(),
             &params,
+            trace_params.unwrap_or(&params),
             true,
             Some(EnvironmentScope::Command),
             EnvironmentScope::Command,
         )
-        .await?;
+        .await
+        {
+            // A readonly variable keeps its value: bash reports it and still runs the command.
+            Err(error) if error.abandons_command() => (),
+            result => result?,
+        }
     }
 
     if guard.shell().options().print_commands_and_arguments {
         guard
             .shell()
             .trace_command(
-                &params,
+                trace_params.unwrap_or(&params),
                 args.iter().map(|arg| arg.quote_for_tracing()).join(" "),
             )
             .await;
@@ -2213,6 +2492,38 @@ fn tokenize_alias_body(
         },
         |tokens| tokens.iter().map(|t| t.to_str().to_owned()).collect(),
     )
+}
+
+/// Expands `word` as the alias it names, as bash does: an alias whose body starts with another
+/// alias expands that one too, though never one already expanded here. Returns the fields and
+/// whether the last alias's body ends in a blank (so the next word may be an alias too), or `None`
+/// when `word` names no alias in effect.
+async fn expand_alias(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    word: &str,
+) -> Result<Option<(Vec<String>, bool)>, error::Error> {
+    let mut words: VecDeque<String> = VecDeque::from([word.to_owned()]);
+    let mut expanded: Vec<String> = vec![];
+    let mut trailing_blank = false;
+    while let Some(first) = words.front()
+        && !expanded.contains(first)
+        && let Some(value) = shell.alias_for_expansion(first)
+    {
+        trailing_blank = value.ends_with([' ', '\t']);
+        let body = tokenize_alias_body(shell, value);
+        expanded.push(words.pop_front().unwrap_or_default());
+        for body_word in body.into_iter().rev() {
+            words.push_front(body_word);
+        }
+    }
+    if expanded.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((
+        expand_words(shell, params, words).await?,
+        trailing_blank,
+    )))
 }
 
 /// Expands the given words, with splitting enabled, yielding the fields they expand to.
@@ -2308,6 +2619,7 @@ async fn apply_assignment(
     assignment: &ast::Assignment,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
+    trace_params: &ExecutionParameters,
     export: bool,
     required_scope: Option<EnvironmentScope>,
     creation_scope: EnvironmentScope,
@@ -2318,6 +2630,7 @@ async fn apply_assignment(
         assignment,
         shell,
         params,
+        trace_params,
         export,
         required_scope,
         creation_scope,
@@ -2346,6 +2659,7 @@ async fn apply_assignment_unchecked(
     assignment: &ast::Assignment,
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
+    trace_params: &ExecutionParameters,
     mut export: bool,
     required_scope: Option<EnvironmentScope>,
     creation_scope: EnvironmentScope,
@@ -2364,6 +2678,19 @@ async fn apply_assignment_unchecked(
             name
         }
     };
+    // Assigning through a circular nameref fails, as a readonly variable does in bash.
+    if shell.env().is_circular_nameref(variable_name) {
+        writeln!(
+            params.stderr(shell),
+            "{}warning: {variable_name}: circular name reference",
+            shell.diagnostic_prefix()
+        )?;
+        return Err(error::Error::from(error::ErrorKind::ReadonlyVariableNamed(
+            variable_name.clone(),
+        ))
+        .into_reported());
+    }
+
     // Assigning through a nameref assigns to the variable it names, and a nameref to an array
     // element (`declare -n ref='arr[1]'`) to that element, just as `arr[1]=value` would.
     let mut resolved_name = shell
@@ -2418,21 +2745,33 @@ async fn apply_assignment_unchecked(
         }
     };
 
-    // Assigning to an integer variable evaluates the value arithmetically.
-    let new_value = if shell
-        .env()
-        .get(variable_name)
-        .is_some_and(|(_, existing)| existing.is_treated_as_integer())
+    // Assigning to an integer variable evaluates the value arithmetically, and a value that does
+    // not evaluate ends the shell, as in bash. A prefix assignment (`n=1+2 cmd`) makes a new
+    // variable for the command, without the attribute, so it keeps its text.
+    let new_value = if creation_scope != EnvironmentScope::Command
+        && shell
+            .env()
+            .get(variable_name)
+            .is_some_and(|(_, existing)| existing.is_treated_as_integer())
     {
-        arithmetic::eval_integer_literal(shell, new_value)?
+        arithmetic::eval_integer_literal(shell, new_value)
+            .map_err(|error| error::Error::from(error).into_fatal())?
     } else {
         new_value
     };
 
     if shell.options().print_commands_and_arguments {
         let op = if assignment.append { "+=" } else { "=" };
+        // Bash prints an empty value as nothing: `a=`.
+        let traced = match &new_value {
+            ShellValueLiteral::Scalar(value) if value.is_empty() => String::new(),
+            value => value.to_string(),
+        };
         shell
-            .trace_command(params, std::format!("{}{op}{new_value}", assignment.name))
+            .trace_command(
+                trace_params,
+                std::format!("{}{op}{traced}", assignment.name),
+            )
             .await;
     }
 
@@ -2452,6 +2791,13 @@ async fn apply_assignment_unchecked(
             } else {
                 true
             };
+
+        // An empty subscript names no element (`a[]=v`, or `m[""]=v` in an associative array).
+        if let ast::AssignmentName::ArrayElementName(_, written) = &assignment.name
+            && (written.is_empty() || (idx.is_empty() && !will_be_indexed_array))
+        {
+            return Err(error::ErrorKind::ArrayIndexOutOfRange(written.clone()).into());
+        }
 
         if will_be_indexed_array {
             array_index = Some(
@@ -2496,6 +2842,11 @@ async fn apply_assignment_unchecked(
 
             // That's it!
             return Ok(());
+        }
+
+        // A command's own assignment cannot shadow a readonly variable either.
+        if existing_value.is_readonly() {
+            return Err(error::ErrorKind::ReadonlyVariable.into());
         }
     }
 
@@ -2547,14 +2898,13 @@ pub(crate) async fn setup_redirect(
         }
 
         ast::IoRedirect::NamedFd(variable, kind, target) => {
-            // `{fd}>&-` closes the descriptor the variable holds.
+            // `{fd}>&-` closes the descriptor the variable holds; bash names the variable when it
+            // holds none.
             if matches!(target, ast::IoFileRedirectTarget::Duplicate(word) if word.value == "-") {
                 let fd = shell
                     .env_str(variable)
                     .and_then(|value| value.parse::<ShellFd>().ok())
-                    .ok_or_else(|| {
-                        error::ErrorKind::AmbiguousRedirect(format!("{{{variable}}}"))
-                    })?;
+                    .ok_or_else(|| error::ErrorKind::AmbiguousRedirect(variable.clone()))?;
                 params.open_files.remove_fd(fd);
                 return Ok(());
             }
@@ -2587,6 +2937,14 @@ pub(crate) async fn setup_redirect(
 
                     // Diagnostics name the file as the script did, not its absolute path.
                     let written_path = expanded_fields.remove(0);
+                    // An empty name names no file (not the working directory).
+                    if written_path.is_empty() {
+                        return Err(error::ErrorKind::RedirectionFailure(
+                            written_path,
+                            "No such file or directory".to_owned(),
+                        )
+                        .into());
+                    }
                     let expanded_file_path: PathBuf =
                         shell.absolute_path(Path::new(written_path.as_str()));
 
@@ -2712,8 +3070,13 @@ pub(crate) async fn setup_redirect(
                             .map_err(|_| error::ErrorKind::InvalidRedirection)?;
 
                         // Reference the same open file as the source fd (shared handle; no OS-level duplication).
+                        // Bash names a descriptor that is not open as the script wrote it (`$fd`).
                         let Some(target_file) = params.try_fd(shell, source_fd_num) else {
-                            return Err(error::ErrorKind::BadFileDescriptor(source_fd_num).into());
+                            return Err(error::ErrorKind::RedirectionFailure(
+                                word.value.trim_end_matches('-').to_owned(),
+                                "Bad file descriptor".to_owned(),
+                            )
+                            .into());
                         };
 
                         params.open_files.set_fd(fd_num, target_file);
@@ -2728,8 +3091,9 @@ pub(crate) async fn setup_redirect(
                         return Err(error::ErrorKind::InvalidRedirection.into());
                     }
 
-                    if dash {
-                        // Ignore a descriptor that is not open.
+                    // Ignore a descriptor that is not open; moving one onto itself (`>&1-`) keeps it.
+                    let moved_onto_itself = closed_fd == fd_num && !expanded.is_empty();
+                    if dash && !moved_onto_itself {
                         params.open_files.remove_fd(closed_fd);
                     }
                 }
@@ -2810,22 +3174,43 @@ fn setup_redirect_output_and_error_to(
     file_path: &str,
     append: bool,
 ) -> Result<(), error::Error> {
+    // An empty name names no file (not the working directory).
+    if file_path.is_empty() {
+        return Err(error::ErrorKind::RedirectionFailure(
+            String::new(),
+            "No such file or directory".to_owned(),
+        )
+        .into());
+    }
     let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
 
-    let mut file_options = std::fs::File::options();
-    file_options
-        .create(true)
-        .write(true)
-        .truncate(!append)
-        .append(append);
+    // `set -C` guards `&>` and `>&word` as it guards `>`: an existing regular file is refused.
+    let noclobber = !append
+        && shell
+            .options()
+            .disallow_overwriting_regular_files_via_output_redirection;
 
+    let mut file_options = std::fs::File::options();
+    file_options.write(true);
+    if noclobber && abs_file_path.is_file() {
+        file_options.create_new(true);
+    } else {
+        file_options
+            .create(true)
+            .truncate(!append && !noclobber)
+            .append(append);
+    }
+
+    // Diagnostics name the file as the script did, not its absolute path.
     let stdout_file = shell
         .open_file(&file_options, &abs_file_path, params)
         .map_err(|err| {
-            error::ErrorKind::RedirectionFailure(
-                abs_file_path.to_string_lossy().to_string(),
-                error::io_message(&err),
-            )
+            let message = if noclobber && err.kind() == std::io::ErrorKind::AlreadyExists {
+                "cannot overwrite existing file".to_owned()
+            } else {
+                error::io_message(&err)
+            };
+            error::ErrorKind::RedirectionFailure(file_path.to_owned(), message)
         })?;
 
     let stderr_file = stdout_file.clone();
@@ -2873,8 +3258,9 @@ async fn setup_process_substitution(
     subshell_cmd: &ast::SubshellCommand,
 ) -> Result<(ShellFd, OpenFile), error::Error> {
     // TODO(execute): Don't execute synchronously!
-    // Execute in a subshell.
+    // Execute in a subshell, read one xtrace level deeper, as bash does.
     let mut subshell = shell.clone();
+    subshell.trace_level += 1;
 
     // Set up execution parameters for the child execution.
     let mut child_params = params.clone();
@@ -3155,6 +3541,8 @@ async fn run_substitution_list(
     subshell.traps_mut().reset_pipe_for_subshell();
     subshell.traps_mut().reset_exit_for_subshell();
     subshell.loop_depth = 0;
+    // Bash reads the list one xtrace level deeper.
+    subshell.trace_level += 1;
     let disposition = subshell.traps().pipe_disposition();
     let body = async {
         let result = list.execute(&mut subshell, params).await;

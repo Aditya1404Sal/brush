@@ -1188,7 +1188,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 if cmd_output.contains('\0') {
                     writeln!(
                         self.params.stderr(self.shell),
-                        "warning: command substitution: ignored null byte in input",
+                        "{}warning: command substitution: ignored null byte in input",
+                        self.shell.diagnostic_prefix()
                     )?;
                     cmd_output.retain(|c| c != '\0');
                 }
@@ -1451,11 +1452,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         } else {
                             "parameter not set".to_owned()
                         };
-                        let err: error::Error = error::ErrorKind::CheckedExpansionError(format!(
-                            "{}: {message}",
-                            diagnostic_name(&parameter)
-                        ))
-                        .into();
+                        // Bash names a positional parameter here by its number alone.
+                        let name = match &parameter {
+                            brush_parser::word::Parameter::Positional(n) => n.to_string(),
+                            parameter => diagnostic_name(parameter),
+                        };
+                        let err: error::Error =
+                            error::ErrorKind::CheckedExpansionError(format!("{name}: {message}"))
+                                .into();
 
                         // Expansion errors are fatal per POSIX spec
                         Err(err.into_fatal())
@@ -1907,7 +1911,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 concatenate: _,
             }
             | brush_parser::word::Parameter::Special(_) => {
-                return Err(error::ErrorKind::CannotAssignToSpecialParameter.into());
+                return Err(
+                    error::ErrorKind::CannotAssignToSpecialParameter(diagnostic_name(parameter))
+                        .into(),
+                );
             }
         };
 
@@ -1943,8 +1950,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         } else {
             let expansion = self.expand_parameter(parameter, false).await?;
             let parameter_str: String = self.fields_to_string(expansion);
+            // Bash names a value that is no parameter as an invalid variable name.
             let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)
+                    .map_err(|_error| {
+                    error::ErrorKind::CheckedExpansionError(format!(
+                        "{parameter_str}: invalid variable name"
+                    ))
+                })?;
             Ok(self.try_resolve_parameter_to_variable_without_indirect(&inner_parameter))
         }
     }
@@ -2018,8 +2031,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             Ok(expansion)
         } else {
             let parameter_str: String = self.fields_to_string(expansion);
+            // Bash names a value that is no parameter as an invalid variable name.
             let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)
+                    .map_err(|_error| {
+                    error::ErrorKind::CheckedExpansionError(format!(
+                        "{parameter_str}: invalid variable name"
+                    ))
+                })?;
 
             self.expand_parameter_without_indirect(&inner_parameter, allow_unset_vars)
                 .await
@@ -2058,10 +2077,24 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     self.undefined_expansion(parameter, allow_unset_vars)
                 }
             }
+            // `$!` is unset until a job has been started in the background.
+            brush_parser::word::Parameter::Special(
+                brush_parser::word::SpecialParameter::LastBackgroundProcessId,
+            ) if self.last_background_pid().is_none() => {
+                self.undefined_expansion(parameter, allow_unset_vars)
+            }
             brush_parser::word::Parameter::Special(s) => Ok(self.expand_special_parameter(s)),
             brush_parser::word::Parameter::Named(n) => {
                 if !env::valid_variable_name(n.as_str()) {
                     Err(error::ErrorKind::BadSubstitution(n.clone()).into())
+                } else if self.shell.env().is_circular_nameref(n) {
+                    // Bash warns and expands nothing.
+                    let _ = writeln!(
+                        self.params.stderr(self.shell),
+                        "{}warning: {n}: circular name reference",
+                        self.shell.diagnostic_prefix()
+                    );
+                    self.undefined_expansion(parameter, allow_unset_vars)
                 } else if let Some((_, var)) = self.shell.env().get(n) {
                     if matches!(var.value(), ShellValue::Unset(_)) {
                         self.undefined_expansion(parameter, allow_unset_vars)
@@ -2177,6 +2210,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Ok(index_to_use)
     }
 
+    /// The process number `$!` names: the last job started in the background, if any.
+    const fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.shell.last_background_pid()
+    }
+
     fn expand_special_parameter(
         &self,
         parameter: &brush_parser::word::SpecialParameter,
@@ -2223,7 +2261,17 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         &mut self,
         expr: brush_parser::ast::UnexpandedArithmeticExpr,
     ) -> Result<String, error::Error> {
-        let value = expr.eval(self.shell, self.params, false).await?;
+        // An unset variable under `set -u` ends the shell here as it does anywhere else.
+        let value = expr
+            .eval(self.shell, self.params, false)
+            .await
+            .map_err(|error| match error.unset_variable() {
+                Some(name) => {
+                    error::Error::from(error::ErrorKind::ExpandingUnsetVariable(name.to_owned()))
+                        .into_fatal()
+                }
+                None => error.into(),
+            })?;
         Ok(value.to_string())
     }
 
@@ -2305,8 +2353,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         came_from_undefined: bool,
     ) -> Result<String, error::Error> {
         match op {
+            // The prompt's command substitutions leave `$?` alone, as in bash.
             brush_parser::word::ParameterTransformOp::PromptExpand => {
-                prompt::expand_prompt(self.shell, self.params, s).await
+                let saved_status = self.shell.save_command_status();
+                let result = prompt::expand_prompt(self.shell, self.params, s).await;
+                self.shell.restore_command_status(saved_status);
+                result
             }
             brush_parser::word::ParameterTransformOp::CapitalizeInitial => Ok(capitalize_first(s)),
             brush_parser::word::ParameterTransformOp::ExpandEscapeSequences => {

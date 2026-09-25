@@ -215,7 +215,9 @@ pub fn default_builtins<SE: brush_core::ShellExtensions>(
         #[cfg(feature = "builtin.jobs")]
         m.insert("disown".into(), builtin::<disown::DisownCommand, SE>());
 
-        // TODO(logout): implement logout builtin
+        #[cfg(feature = "builtin.exit")]
+        m.insert("logout".into(), builtin::<exit::LogoutCommand, SE>());
+        #[cfg(not(feature = "builtin.exit"))]
         m.insert(
             "logout".into(),
             builtin::<unimp::UnimplementedCommand, SE>(),

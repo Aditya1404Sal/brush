@@ -69,6 +69,11 @@ pub struct Registration {
     source_info: crate::SourceInfo,
     /// Whether or not this function definition should be exported to children.
     exported: bool,
+    /// Whether the function is readonly (`readonly -f`): it cannot be redefined or unset.
+    readonly: bool,
+    /// The aliases its body expands: those in effect where it was defined.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    aliases: std::sync::Arc<std::collections::HashMap<String, String>>,
 }
 
 impl From<brush_parser::ast::FunctionDefinition> for Registration {
@@ -77,6 +82,8 @@ impl From<brush_parser::ast::FunctionDefinition> for Registration {
             definition: Arc::new(definition),
             source_info: crate::SourceInfo::default(),
             exported: false,
+            readonly: false,
+            aliases: std::sync::Arc::default(),
         }
     }
 }
@@ -96,6 +103,8 @@ impl Registration {
             definition: Arc::new(definition),
             source_info: source_info.clone(),
             exported: false,
+            readonly: false,
+            aliases: std::sync::Arc::default(),
         }
     }
 
@@ -122,5 +131,40 @@ impl Registration {
     /// Returns whether this function is exported.
     pub const fn is_exported(&self) -> bool {
         self.exported
+    }
+
+    /// Marks the function readonly.
+    pub const fn set_readonly(&mut self) {
+        self.readonly = true;
+    }
+
+    /// Returns whether this function is readonly.
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// The aliases the function's body expands: those in effect where it was defined.
+    pub(crate) fn aliases(&self) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+        self.aliases.clone()
+    }
+
+    /// Records the aliases the function's body expands.
+    pub(crate) fn set_aliases(
+        &mut self,
+        aliases: std::sync::Arc<std::collections::HashMap<String, String>>,
+    ) {
+        self.aliases = aliases;
+    }
+
+    /// The attribute letters `declare -F -p` shows for the function (`declare -f{flags} name`).
+    pub fn attribute_flags(&self) -> String {
+        let mut flags = String::new();
+        if self.readonly {
+            flags.push('r');
+        }
+        if self.exported {
+            flags.push('x');
+        }
+        flags
     }
 }

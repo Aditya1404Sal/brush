@@ -21,7 +21,18 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     pub fn set_working_dir(&mut self, target_dir: impl AsRef<Path>) -> Result<(), error::Error> {
         let abs_path = self.absolute_path(target_dir.as_ref());
 
-        match std::fs::metadata(&abs_path) {
+        // Normalize the path (but don't canonicalize it).
+        let cleaned_path = abs_path.normalize();
+
+        // A sandbox may refuse the path as written (`/..` leaves the root it grants), so the
+        // normalized path, which bash's logical `cd` goes to, is checked when it does.
+        let metadata = match std::fs::metadata(&abs_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::fs::metadata(&cleaned_path)
+            }
+            result => result,
+        };
+        match metadata {
             Ok(m) => {
                 if !m.is_dir() {
                     return Err(error::ErrorKind::NotADirectory(abs_path).into());
@@ -32,8 +43,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             }
         }
 
-        // Normalize the path (but don't canonicalize it).
-        let cleaned_path = abs_path.normalize();
+        // Exactly two leading slashes are kept, as POSIX lets them mean something else.
+        let abs_str = abs_path.to_string_lossy();
+        let cleaned_path = if abs_str.starts_with("//") && !abs_str.starts_with("///") {
+            PathBuf::from(format!("/{}", cleaned_path.to_string_lossy()))
+        } else {
+            cleaned_path
+        };
 
         let pwd = cleaned_path.to_string_lossy().to_string();
 

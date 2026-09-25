@@ -29,6 +29,11 @@ pub enum ErrorKind {
     #[error("cannot assign list to array member")]
     AssigningListToArrayMember,
 
+    /// A regular expression (`[[ =~ ]]`) that does not compile, with the reason as bash's
+    /// regex library words it.
+    #[error("invalid regular expression `{0}': {1}")]
+    InvalidRegex(String, &'static str),
+
     /// An attempt was made to convert an associative array to an indexed array.
     #[error("cannot convert associative array to indexed array")]
     ConvertingAssociativeArrayToIndexedArray,
@@ -54,8 +59,8 @@ pub enum ErrorKind {
     FailedToSendSignal,
 
     /// An attempt was made to assign a value to a special parameter.
-    #[error("cannot assign in this way")]
-    CannotAssignToSpecialParameter,
+    #[error("{0}: cannot assign in this way")]
+    CannotAssignToSpecialParameter(String),
 
     /// Checked expansion error.
     #[error("{0}")]
@@ -324,6 +329,11 @@ pub enum ErrorKind {
     #[error("{1}: {0}")]
     BuiltinError(Box<dyn BuiltinError>, String),
 
+    /// The embedder refused to run a prompt string's expansions (see
+    /// [`crate::Shell::set_prompt_guard`]); the diagnostic is its own.
+    #[error("{0}")]
+    PromptRefused(String),
+
     /// Operation not supported on this platform.
     #[error("operation not supported on this platform: {0}")]
     NotSupportedOnThisPlatform(&'static str),
@@ -422,6 +432,7 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
+            ErrorKind::PromptRefused(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
             ErrorKind::CannotExecutePath(_, reason) if *reason == NO_SUCH_FILE => Self::NotFound,
             ErrorKind::CannotExecutePath(..) => Self::CannotExecute,
@@ -486,9 +497,10 @@ impl Error {
 
     /// Whether the error abandons the rest of the top-level command, as assigning to a
     /// readonly variable does in bash: it passes through function calls rather than becoming
-    /// the call's status.
+    /// the call's status. Only an assignment statement does this, and it reports the error
+    /// where it happens; a builtin or a loop that cannot assign the variable just fails.
     pub const fn abandons_command(&self) -> bool {
-        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_))
+        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported
     }
 
     /// The reason a path could not be used, as the system words it ("No such file or
@@ -499,6 +511,18 @@ impl Error {
             ErrorKind::NotADirectory(_) => "Not a directory".to_owned(),
             ErrorKind::WorkingDirMissing(_) => "No such file or directory".to_owned(),
             kind => kind.to_string(),
+        }
+    }
+
+    /// The arithmetic error this error carries, or the error itself when it is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error itself when it is not an arithmetic error.
+    pub fn into_eval_error(self) -> Result<crate::arithmetic::EvalError, Self> {
+        match self.kind {
+            ErrorKind::EvalError(error) => Ok(error),
+            _ => Err(self),
         }
     }
 
@@ -551,7 +575,7 @@ impl Error {
         // An unset variable (`set -u`, `${x?}`) ends `bash -c` with 127, as in bash; a script
         // read from a file or standard input, `set -e`, or a subshell ended by it gives 1.
         let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
-            && shell.depth() == 0
+            && shell.depth() == shell.process_depth
             && shell.options().command_string_mode
             && !shell.options().exit_on_nonzero_command_exit
             && matches!(

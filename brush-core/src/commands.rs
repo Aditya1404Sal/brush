@@ -119,15 +119,16 @@ impl CommandArg {
     pub(crate) fn quote_for_tracing(&self) -> Cow<'_, str> {
         match self {
             Self::String(s) => escape::quote_if_needed(s, escape::QuoteMode::SingleQuote),
+            // Bash prints the word `name=value` as it prints any word, quoted whole when it
+            // needs to be: `e=`, `'a=x y'`.
             Self::Assignment(a) => {
-                let mut s = a.name.to_string();
                 let op = if a.append { "+=" } else { "=" };
-                s.push_str(op);
-                s.push_str(&escape::quote_if_needed(
-                    a.value.to_string().as_str(),
+                escape::quote_if_needed(
+                    format!("{}{op}{}", a.name, a.value).as_str(),
                     escape::QuoteMode::SingleQuote,
-                ));
-                s.into()
+                )
+                .into_owned()
+                .into()
             }
         }
     }
@@ -395,6 +396,35 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 
                 if let Some(post_execute) = self.post_execute {
                     let _ = post_execute(&mut self.shell);
+                }
+
+                // Bash hands a command it cannot find to `command_not_found_handle`, when one is
+                // defined, run in a subshell with the command and its arguments; its status is
+                // the command's.
+                if let Some(handler) = self.shell.funcs().get(NOT_FOUND_HANDLER).cloned() {
+                    let mut subshell = self.shell.clone();
+                    // The handler does not handle the commands it cannot find itself.
+                    subshell.undefine_func(NOT_FOUND_HANDLER);
+                    let context = ExecutionContext {
+                        shell: &mut subshell,
+                        command_name: NOT_FOUND_HANDLER.to_owned(),
+                        params: self.params,
+                    };
+                    let status = match invoke_shell_function(handler, context, &self.args).await {
+                        Ok(spawned) => match spawned.wait().await? {
+                            crate::results::ExecutionWaitResult::Completed(result) => {
+                                result.exit_code
+                            }
+                            crate::results::ExecutionWaitResult::Stopped(..) => {
+                                ExecutionResult::stopped().exit_code
+                            }
+                        },
+                        Err(error) => {
+                            let _ = subshell.display_error(&mut subshell.stderr(), &error);
+                            error.into_result(&subshell).exit_code
+                        }
+                    };
+                    return Ok(ExecutionResult::from(status).into());
                 }
 
                 Err(ErrorKind::CommandNotFound(self.command_name).into())
@@ -854,9 +884,12 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
         {
             if process::pipe_disposition() != PipeDisposition::Default {
                 let mut stderr = params.stderr(shell);
+                let prefix = shell.diagnostic_prefix();
                 let diagnostic = stderr
                     .async_io()
-                    .write_all(format!("{command_name}: write error: Broken pipe\n").as_bytes())
+                    .write_all(
+                        format!("{prefix}{command_name}: write error: Broken pipe\n").as_bytes(),
+                    )
                     .await;
                 if let Err(error) = diagnostic {
                     if error.kind() != std::io::ErrorKind::BrokenPipe {
@@ -921,6 +954,9 @@ async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
     Ok(None)
 }
 
+/// The function bash runs for a command it cannot find.
+const NOT_FOUND_HANDLER: &str = "command_not_found_handle";
+
 pub(crate) async fn invoke_shell_function(
     function: functions::Registration,
     mut context: ExecutionContext<'_, impl extensions::ShellExtensions>,
@@ -962,6 +998,8 @@ pub(crate) async fn invoke_shell_function(
         .map(|handler| handler.command.clone());
     // `local -` in the body saves the options, which come back when it returns.
     let option_saves = context.shell.local_option_saves.len();
+    // The body expands the aliases in effect where the function was defined.
+    let caller_aliases = context.shell.alias_scope.replace(function.aliases());
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
@@ -975,6 +1013,7 @@ pub(crate) async fn invoke_shell_function(
         context.shell.leave_function()?;
         result
     };
+    context.shell.alias_scope = caller_aliases;
     context.shell.loop_depth = caller_loop_depth;
     context.shell.restore_local_options(option_saves);
 
@@ -992,11 +1031,9 @@ pub(crate) async fn invoke_shell_function(
                 .options()
                 .shell_functions_inherit_debug_and_return_traps)
     {
-        let _ = context
-            .shell
-            .invoke_trap_handler(traps::TrapSignal::Return, &context.params)
-            .await;
+        let _ = context.shell.run_return_trap(&context.params).await;
     }
+    context.shell.status_before_return = None;
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;
@@ -1175,6 +1212,9 @@ async fn run_substitution_command_in(
 
     // TODO(source-info): review this
     let source_info = crate::SourceInfo::from("main");
+
+    // The substitution's lines are numbered on from the command it is part of.
+    shell.begin_nested_code();
 
     // Handle the parse result using default shell behavior.
     shell

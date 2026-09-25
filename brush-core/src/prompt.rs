@@ -3,6 +3,7 @@ use crate::{
     shell::Shell,
     sys::{self, users},
 };
+use std::io::Write as _;
 use std::path::Path;
 
 const VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
@@ -41,6 +42,17 @@ pub(crate) async fn expand_prompt(
     }
 
     if shell.options().expand_prompt_strings {
+        // An embedder that checks code before the shell runs it sees the text first: a refused
+        // prompt runs none of its expansions.
+        if let Some(guard) = shell.prompt_guard()
+            && let Err(diagnostic) = guard(&formatted_prompt)
+        {
+            write!(params.stderr(shell), "{diagnostic}")?;
+            return Err(
+                error::Error::from(error::ErrorKind::PromptRefused(diagnostic)).into_reported(),
+            );
+        }
+
         // Now expand any remaining escape sequences, but without tilde-expansion.
         // Use double-quote escape rules so that backslashes emitted in the
         // previous step survive intact unless they precede a character that
