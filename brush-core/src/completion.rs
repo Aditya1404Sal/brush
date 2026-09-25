@@ -541,8 +541,10 @@ impl Spec {
                     }
                 }
                 CompleteAction::Builtin => {
-                    for name in shell.builtins().keys() {
-                        if name.starts_with(token) {
+                    // Bash lists its builtins in name order; one that stands for a program bash
+                    // has no builtin for (`cat`) is a command (`-c`), not a builtin.
+                    for name in shell.builtins().keys().sorted() {
+                        if name.starts_with(token) && !shell.is_file_program(name) {
                             candidates.push(name.to_owned());
                         }
                     }
@@ -574,15 +576,21 @@ impl Spec {
                     candidates.append(&mut file_completions);
                 }
                 CompleteAction::Disabled => {
-                    for (name, registration) in shell.builtins() {
-                        if registration.disabled && name.starts_with(token) {
+                    for (name, registration) in shell.builtins().iter().sorted_by_key(|v| v.0) {
+                        if registration.disabled
+                            && name.starts_with(token)
+                            && !shell.is_file_program(name)
+                        {
                             candidates.push(name.to_owned());
                         }
                     }
                 }
                 CompleteAction::Enabled => {
-                    for (name, registration) in shell.builtins() {
-                        if !registration.disabled && name.starts_with(token) {
+                    for (name, registration) in shell.builtins().iter().sorted_by_key(|v| v.0) {
+                        if !registration.disabled
+                            && name.starts_with(token)
+                            && !shell.is_file_program(name)
+                        {
                             candidates.push(name.to_owned());
                         }
                     }
@@ -616,8 +624,8 @@ impl Spec {
                 }
                 CompleteAction::HelpTopic => {
                     // For now, we only have help topics for built-in commands.
-                    for name in shell.builtins().keys() {
-                        if name.starts_with(token) {
+                    for name in shell.builtins().keys().sorted() {
+                        if name.starts_with(token) && !shell.is_file_program(name) {
                             candidates.push(name.to_owned());
                         }
                     }
