@@ -999,6 +999,9 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     let mut subshell = shell.clone();
     #[cfg(target_arch = "wasm32")]
     subshell.traps_mut().reset_pipe_for_subshell();
+    // It runs only an EXIT trap it sets itself, when it ends.
+    #[cfg(target_arch = "wasm32")]
+    subshell.traps_mut().reset_exit_for_subshell();
 
     // Command substitutions don't inherit errexit by default. Only inherit it when
     // command_subst_inherits_errexit is enabled, otherwise disable errexit in the subshell.
@@ -1020,11 +1023,25 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
         let mut output_str = String::new();
+        let disposition = subshell.traps().pipe_disposition();
+        // The substitution's output ends when the subshell, its EXIT trap and every job still
+        // holding its output are done.
+        let command = async move {
+            let completed = std::cell::Cell::new(false);
+            let result = crate::execution::process::run_process(disposition, async {
+                let result = run_wasm_substitution_command(&mut subshell, &mut params, s).await;
+                let result = subshell.exit_with_trap_in(result, &params).await;
+                completed.set(true);
+                result
+            })
+            .await;
+            if !completed.get() {
+                subshell.exit_trap_after_signal(&result, &params).await;
+            }
+            result
+        };
         let (cmd_result, output_result) = futures::join!(
-            crate::execution::process::run_process(
-                subshell.traps().pipe_disposition(),
-                run_substitution_command(subshell, params, s)
-            ),
+            command,
             futures::io::AsyncReadExt::read_to_string(reader.async_io(), &mut output_str)
         );
         output_result?;
@@ -1058,9 +1075,27 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn run_wasm_substitution_command(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
+    command: String,
+) -> Result<ExecutionResult, error::Error> {
+    run_substitution_command_in(shell, params, command).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn run_substitution_command(
     mut shell: Shell<impl extensions::ShellExtensions>,
     mut params: ExecutionParameters,
+    command: String,
+) -> Result<ExecutionResult, error::Error> {
+    run_substitution_command_in(&mut shell, &mut params, command).await
+}
+
+async fn run_substitution_command_in(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
     command: String,
 ) -> Result<ExecutionResult, error::Error> {
     // Parse the string into a whole shell program.
@@ -1073,14 +1108,14 @@ async fn run_substitution_command(
         if let Some(redir) = try_unwrap_bare_input_redir_program(program) {
             // A file that cannot be read is reported and fails the substitution (status 1), as
             // in bash; it does not end the command using the substitution.
-            if let Err(error) = interp::setup_redirect(&mut shell, &mut params, redir).await {
-                let _ = shell.display_error(&mut params.stderr(&shell), &error);
+            if let Err(error) = interp::setup_redirect(shell, params, redir).await {
+                let _ = shell.display_error(&mut params.stderr(shell), &error);
                 return Ok(ExecutionResult::general_error());
             }
             #[cfg(target_arch = "wasm32")]
-            futures::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell)).await?;
+            futures::io::copy(&mut params.stdin(shell), &mut params.stdout(shell)).await?;
             #[cfg(not(target_arch = "wasm32"))]
-            std::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell))?;
+            std::io::copy(&mut params.stdin(shell), &mut params.stdout(shell))?;
             return Ok(ExecutionResult::new(0));
         }
     }
@@ -1090,7 +1125,7 @@ async fn run_substitution_command(
 
     // Handle the parse result using default shell behavior.
     shell
-        .run_parsed_result(parse_result, Some(&command), &source_info, &params)
+        .run_parsed_result(parse_result, Some(&command), &source_info, params)
         .await
 }
 

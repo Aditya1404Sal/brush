@@ -352,29 +352,42 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     // Bash forks once for `( list ) &`: the subshell is the job itself, so its traps are the job's.
     let subshell_body = sole_subshell_body(ao_list).cloned();
     // The job outlives the subshell, stage or child shell that starts it, as an orphan does.
+    // The job is a subshell: it runs only an EXIT trap it sets itself, when it ends.
+    cloned_shell.traps_mut().reset_exit_for_subshell();
     let join_handle = process::spawn_job(&shell.execution_services(), &table, async move {
-        leader_process
-            .run(async move {
+        let completed = std::cell::Cell::new(false);
+        let result = leader_process
+            .run(async {
                 let result = match subshell_body {
                     Some(list) => match list.execute(&mut cloned_shell, &cloned_params).await {
-                        Ok(result) => result,
+                        Ok(result) => Ok(result),
                         Err(error) => {
                             let mut stderr = cloned_params.stderr(&cloned_shell);
                             let _ = cloned_shell.display_error(&mut stderr, &error);
-                            error.into_result(&cloned_shell)
+                            Ok(error.into_result(&cloned_shell))
                         }
                     },
                     None => {
                         cloned_ao_list
                             .execute(&mut cloned_shell, &cloned_params)
-                            .await?
+                            .await
                     }
                 };
+                let result = cloned_shell
+                    .exit_with_trap_in(result, &cloned_params)
+                    .await?;
+                completed.set(true);
                 // A job reports only its status: its `exit`, `break` or `return` must never
                 // act on the shell that later waits for it.
                 Ok(ExecutionResult::from(result.exit_code))
             })
-            .await
+            .await;
+        if !completed.get() {
+            cloned_shell
+                .exit_trap_after_signal(&result, &cloned_params)
+                .await;
+        }
+        result
     });
 
     let pids = if stage_pids.is_empty() {
@@ -797,27 +810,36 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     use crate::execution::process;
     let services = shell.execution_services();
     shell.traps_mut().reset_pipe_for_subshell();
+    // A stage is a subshell: it runs only an EXIT trap it sets itself, when it ends.
+    shell.traps_mut().reset_exit_for_subshell();
     let disposition = shell.traps().pipe_disposition();
     services.spawn(async move {
-        let body = async move {
+        let completed = std::cell::Cell::new(false);
+        let body = async {
             let context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut shell),
                 process_group_id: None,
             };
-            match command
-                .execute_in_pipeline(context, params)
-                .await?
-                .wait()
-                .await?
-            {
-                ExecutionWaitResult::Completed(result) => Ok(result),
-                ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
-            }
+            let result = match command.execute_in_pipeline(context, params.clone()).await {
+                Ok(spawned) => match spawned.wait().await {
+                    Ok(ExecutionWaitResult::Completed(result)) => Ok(result),
+                    Ok(ExecutionWaitResult::Stopped(_)) => Ok(ExecutionResult::stopped()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let result = shell.exit_with_trap_in(result, &params).await;
+            completed.set(true);
+            result
         };
-        match numbered {
+        let result = match numbered {
             Some(numbered) => numbered.run(body).await,
             None => process::run_process(disposition, body).await,
+        };
+        if !completed.get() {
+            shell.exit_trap_after_signal(&result, &params).await;
         }
+        result
     })
 }
 
@@ -969,9 +991,14 @@ impl Execute for ast::CompoundCommand {
                 subshell.jobs_mut().jobs.clear();
                 #[cfg(target_arch = "wasm32")]
                 let disposition = subshell.traps().pipe_disposition();
+                #[cfg(target_arch = "wasm32")]
+                let completed = std::cell::Cell::new(false);
                 let body = async {
                     let result = list.execute(&mut subshell, params).await;
-                    subshell.exit_with_trap(result).await
+                    let result = subshell.exit_with_trap_in(result, params).await;
+                    #[cfg(target_arch = "wasm32")]
+                    completed.set(true);
+                    result
                 };
 
                 // Handle errors within the subshell context to prevent fatal errors
@@ -980,6 +1007,11 @@ impl Execute for ast::CompoundCommand {
                 let execution = crate::execution::process::run_process(disposition, body).await;
                 #[cfg(not(target_arch = "wasm32"))]
                 let execution = body.await;
+                // A signal ended the subshell before its commands finished.
+                #[cfg(target_arch = "wasm32")]
+                if !completed.get() {
+                    subshell.exit_trap_after_signal(&execution, params).await;
+                }
                 let subshell_result = match execution {
                     Ok(result) => result,
                     Err(error) => {
