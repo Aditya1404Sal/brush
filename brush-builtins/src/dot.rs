@@ -43,10 +43,15 @@ impl builtins::Command for DotCommand {
             )
             .await;
         match result {
-            // Bash reports a script it cannot read without naming `source`, and carries on.
+            // Bash reports a script it cannot read without naming `source`, and carries on
+            // (a POSIX-mode shell exits, as a failing special builtin ends it).
             Err(error) if matches!(error.kind(), brush_core::ErrorKind::FailedSourcingFile(..)) => {
                 context.shell.display_error(&mut context.stderr(), &error)?;
-                Ok(brush_core::ExecutionResult::general_error())
+                let mut result = brush_core::ExecutionResult::general_error();
+                if context.shell.options().posix_mode {
+                    result.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
+                }
+                Ok(result)
             }
             result => result,
         }
