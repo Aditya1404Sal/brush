@@ -134,6 +134,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) debug_trap_ran: bool,
 
+    /// Whether this shell is a pipeline stage whose command is a simple command it has yet to
+    /// run. Bash runs that command in the stage's process and exits without recording its last
+    /// argument in `$_`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) stage_command: bool,
+
     /// Checks the text a prompt string (`PS4`, `${x@P}`) expands before any of its expansions
     /// run (see [`Self::set_prompt_guard`]).
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -340,6 +346,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             exit_trace_level: self.trace_level + 1,
             pending_input: None,
             debug_trap_ran: false,
+            stage_command: false,
             prompt_guard: self.prompt_guard,
             paren_subshell: self.paren_subshell,
             stage_subshell: self.stage_subshell,
