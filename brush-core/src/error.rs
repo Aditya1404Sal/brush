@@ -29,6 +29,11 @@ pub enum ErrorKind {
     #[error("cannot assign list to array member")]
     AssigningListToArrayMember,
 
+    /// A regular expression (`[[ =~ ]]`) that does not compile, with the reason as bash's
+    /// regex library words it.
+    #[error("invalid regular expression `{0}': {1}")]
+    InvalidRegex(String, &'static str),
+
     /// An attempt was made to convert an associative array to an indexed array.
     #[error("cannot convert associative array to indexed array")]
     ConvertingAssociativeArrayToIndexedArray,

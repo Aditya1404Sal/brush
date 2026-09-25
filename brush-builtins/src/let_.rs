@@ -27,7 +27,7 @@ impl builtins::Command for LetCommand {
 
         if self.exprs.is_empty() {
             context.report("expression expected")?;
-            return Ok(result);
+            return Ok(ExecutionResult::general_error());
         }
 
         for expr in &self.exprs {

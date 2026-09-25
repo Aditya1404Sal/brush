@@ -327,7 +327,8 @@ impl ShellVariable {
     pub fn convert_to_indexed_array(&mut self) -> Result<(), error::Error> {
         match self.value() {
             ShellValue::IndexedArray(_) => Ok(()),
-            ShellValue::AssociativeArray(_) => {
+            ShellValue::AssociativeArray(_)
+            | ShellValue::Unset(ShellValueUnsetType::AssociativeArray) => {
                 Err(error::ErrorKind::ConvertingAssociativeArrayToIndexedArray.into())
             }
             _ => {
@@ -346,7 +347,7 @@ impl ShellVariable {
     pub fn convert_to_associative_array(&mut self) -> Result<(), error::Error> {
         match self.value() {
             ShellValue::AssociativeArray(_) => Ok(()),
-            ShellValue::IndexedArray(_) => {
+            ShellValue::IndexedArray(_) | ShellValue::Unset(ShellValueUnsetType::IndexedArray) => {
                 Err(error::ErrorKind::ConvertingIndexedArrayToAssociativeArray.into())
             }
             _ => {

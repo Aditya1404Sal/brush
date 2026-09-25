@@ -273,6 +273,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             programs_started: 0,
             alias_scope: None,
             status_before_return: None,
+            last_background_pid: None,
             local_option_saves: Vec::new(),
             parser_impl: crate::parser::ParserImpl::default(),
             key_bindings: None,

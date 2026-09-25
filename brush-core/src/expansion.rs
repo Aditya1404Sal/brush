@@ -2077,6 +2077,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     self.undefined_expansion(parameter, allow_unset_vars)
                 }
             }
+            // `$!` is unset until a job has been started in the background.
+            brush_parser::word::Parameter::Special(
+                brush_parser::word::SpecialParameter::LastBackgroundProcessId,
+            ) if self.last_background_pid().is_none() => {
+                self.undefined_expansion(parameter, allow_unset_vars)
+            }
             brush_parser::word::Parameter::Special(s) => Ok(self.expand_special_parameter(s)),
             brush_parser::word::Parameter::Named(n) => {
                 if !env::valid_variable_name(n.as_str()) {
@@ -2204,6 +2210,16 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Ok(index_to_use)
     }
 
+    /// The process number `$!` names: the last job started in the background, if any.
+    fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.shell.last_background_pid.or_else(|| {
+            self.shell
+                .jobs()
+                .current_job()
+                .and_then(crate::jobs::Job::representative_pid)
+        })
+    }
+
     fn expand_special_parameter(
         &self,
         parameter: &brush_parser::word::SpecialParameter,
@@ -2234,9 +2250,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 Expansion::from(std::process::id().to_string())
             }
             brush_parser::word::SpecialParameter::LastBackgroundProcessId => {
-                if let Some(job) = self.shell.jobs().current_job()
-                    && let Some(pid) = job.representative_pid()
-                {
+                if let Some(pid) = self.last_background_pid() {
                     return Expansion::from(pid.to_string());
                 }
                 Expansion::from(String::new())
@@ -2253,7 +2267,17 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         &mut self,
         expr: brush_parser::ast::UnexpandedArithmeticExpr,
     ) -> Result<String, error::Error> {
-        let value = expr.eval(self.shell, self.params, false).await?;
+        // An unset variable under `set -u` ends the shell here as it does anywhere else.
+        let value = expr
+            .eval(self.shell, self.params, false)
+            .await
+            .map_err(|error| match error.unset_variable() {
+                Some(name) => {
+                    error::Error::from(error::ErrorKind::ExpandingUnsetVariable(name.to_owned()))
+                        .into_fatal()
+                }
+                None => error.into(),
+            })?;
         Ok(value.to_string())
     }
 

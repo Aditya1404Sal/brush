@@ -293,9 +293,9 @@ async fn apply_binary_predicate(
             let (matches, captures) = match regex.matches(s.as_str()) {
                 Ok(Some(captures)) => (true, captures),
                 Ok(None) => (false, vec![]),
-                // If we can't compile the regex, don't abort the whole operation but make sure to
-                // report it.
-                // TODO(test): Docs indicate we should yield 2 on an invalid regex (not 1).
+                // A regular expression that does not compile fails the whole test (status 2).
+                Err(e) if matches!(e.kind(), error::ErrorKind::InvalidRegex(..)) => return Err(e),
+                // Otherwise don't abort the whole operation, but make sure to report it.
                 Err(e) => {
                     tracing::warn!("error using regex: {}", e);
                     (false, vec![])

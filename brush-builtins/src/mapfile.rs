@@ -56,6 +56,14 @@ impl builtins::Command for MapFileCommand {
             return error::unimp("mapfile -C/-c is not yet implemented");
         }
 
+        if !brush_core::env::valid_variable_name(&self.array_var_name) {
+            context.report(format_args!(
+                "`{}': not a valid identifier",
+                self.array_var_name
+            ))?;
+            return Ok(ExecutionExitCode::GeneralError.into());
+        }
+
         if let Some(origin) = self.origin {
             if origin < 0 {
                 context.report(format_args!("{origin}: invalid array origin"))?;

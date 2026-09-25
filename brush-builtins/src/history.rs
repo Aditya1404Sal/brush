@@ -72,7 +72,8 @@ impl builtins::Command for HistoryCommand {
         if let Some(history) = context.shell.history_mut() {
             self.execute_with_history(history, &config, stdout, stderr)
         } else {
-            Err(brush_core::ErrorKind::HistoryNotEnabled.into())
+            // A shell that keeps no history has an empty one, as a non-interactive bash does.
+            Ok(ExecutionResult::success())
         }
     }
 }

@@ -274,6 +274,8 @@ impl Execute for ast::CompoundList {
                 }
                 let job = spawn_async_ao_list_in_task(ao_list, shell, params);
                 let job_formatted = job.to_pid_style_string();
+                let pid = job.representative_pid();
+                shell.last_background_pid = pid.or(shell.last_background_pid);
 
                 if shell.options().interactive && !shell.is_subshell() {
                     writeln!(params.stderr(shell), "{job_formatted}")?;
@@ -1066,17 +1068,27 @@ impl Execute for ast::CompoundCommand {
             Self::ArithmeticForClause(a) => a.execute(shell, params).await,
             Self::Coprocess(c) => c.execute(shell, params).await,
             Self::ExtendedTest(e) => {
-                let result =
-                    match extendedtests::eval_extended_test_expr(&e.expr, shell, params).await {
-                        Ok(true) => 0,
-                        Ok(false) => 1,
-                        Err(error) => {
-                            return match error.into_eval_error() {
-                                Ok(error) => arithmetic_command_error(shell, params, "[[", &error),
-                                Err(error) => Err(error),
-                            };
-                        }
-                    };
+                let result = match extendedtests::eval_extended_test_expr(&e.expr, shell, params)
+                    .await
+                {
+                    Ok(true) => 0,
+                    Ok(false) => 1,
+                    // A regular expression that does not compile fails the test with status 2.
+                    Err(error) if matches!(error.kind(), error::ErrorKind::InvalidRegex(..)) => {
+                        writeln!(
+                            params.stderr(shell),
+                            "{}[[: {error}",
+                            shell.diagnostic_prefix()
+                        )?;
+                        return Ok(ExecutionResult::new(2));
+                    }
+                    Err(error) => {
+                        return match error.into_eval_error() {
+                            Ok(error) => arithmetic_command_error(shell, params, "[[", &error),
+                            Err(error) => Err(error),
+                        };
+                    }
+                };
                 Ok(ExecutionResult::new(result))
             }
         }

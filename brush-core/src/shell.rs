@@ -167,6 +167,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) status_before_return: Option<u8>,
 
+    /// The process number of the last job started in the background (`$!`), kept after the job
+    /// is waited for, as in bash.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) last_background_pid: Option<crate::sys::process::ProcessId>,
+
     /// `set -o` options saved by `local -`, restored when the saving function returns.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) local_option_saves: Vec<Vec<(&'static str, bool)>>,
@@ -236,6 +241,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             programs_started: self.programs_started,
             alias_scope: self.alias_scope.clone(),
             status_before_return: None,
+            last_background_pid: self.last_background_pid,
             local_option_saves: self.local_option_saves.clone(),
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),

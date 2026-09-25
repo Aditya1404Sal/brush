@@ -129,6 +129,7 @@ mod builder;
 mod factory;
 #[cfg(any(feature = "builtin.command", feature = "builtin.type"))]
 mod lookup;
+#[cfg(not(feature = "builtin.exit"))]
 mod unimp;
 
 pub use builder::ShellBuilderExt;

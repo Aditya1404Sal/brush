@@ -173,15 +173,19 @@ impl builtins::Command for ReadCommand {
             ReadResult::InputReady => (None, brush_core::ExecutionResult::success()),
         };
 
-        // Assign input to variables based on options.
-        assign_input_to_variables(
+        // Assign input to variables based on options. A name that is not a variable is reported
+        // where bash reaches it, after the names before it are assigned.
+        if let Some(invalid) = assign_input_to_variables(
             context.shell,
             input_line.as_deref(),
             &ifs,
             skip_ifs_splitting,
             self.array_variable.as_deref(),
             &self.variable_names,
-        )?;
+        )? {
+            context.report(format_args!("`{invalid}': not a valid identifier"))?;
+            return Ok(brush_core::ExecutionResult::general_error());
+        }
 
         Ok(result)
     }
@@ -227,8 +231,11 @@ fn assign_input_to_variables(
     skip_ifs_splitting: bool,
     array_variable: Option<&str>,
     variable_names: &[String],
-) -> Result<(), brush_core::Error> {
+) -> Result<Option<String>, brush_core::Error> {
     if let Some(array_variable) = array_variable {
+        if !is_variable_or_element(array_variable) {
+            return Ok(Some(array_variable.to_owned()));
+        }
         let literal_fields = build_array_fields(input_line, ifs, skip_ifs_splitting);
         shell.env_mut().update_or_add(
             array_variable,
@@ -238,7 +245,13 @@ fn assign_input_to_variables(
             env::EnvironmentScope::Global,
         )?;
     } else if !variable_names.is_empty() {
-        assign_to_named_variables(shell, input_line, ifs, skip_ifs_splitting, variable_names)?;
+        return assign_to_named_variables(
+            shell,
+            input_line,
+            ifs,
+            skip_ifs_splitting,
+            variable_names,
+        );
     } else {
         shell.env_mut().update_or_add(
             "REPLY",
@@ -248,7 +261,16 @@ fn assign_input_to_variables(
             env::EnvironmentScope::Global,
         )?;
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Whether `name` is a variable's name, or an element of one (`name[subscript]`).
+fn is_variable_or_element(name: &str) -> bool {
+    let base = name
+        .split_once('[')
+        .filter(|(_, rest)| rest.ends_with(']'))
+        .map_or(name, |(base, _)| base);
+    env::valid_variable_name(base)
 }
 
 /// Assigns split fields to named variables.
@@ -262,12 +284,15 @@ fn assign_to_named_variables(
     ifs: &str,
     skip_ifs_splitting: bool,
     variable_names: &[String],
-) -> Result<(), brush_core::Error> {
+) -> Result<Option<String>, brush_core::Error> {
     let mut fields =
         build_variable_fields(input_line, ifs, skip_ifs_splitting, variable_names.len());
 
     for (i, name) in variable_names.iter().enumerate() {
         let is_last = i == variable_names.len() - 1;
+        if !is_variable_or_element(name) {
+            return Ok(Some(name.clone()));
+        }
 
         let value = if fields.is_empty() {
             String::new()
@@ -290,7 +315,7 @@ fn assign_to_named_variables(
             break;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Builds array field values from input, optionally splitting by IFS.

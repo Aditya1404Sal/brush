@@ -151,6 +151,26 @@ impl builtins::Command for DeclareCommand {
                         Ok(false) => result = ExecutionResult::general_error(),
                         // Bash names the readonly variable a declaration could not change;
                         // `readonly` itself reports it without its own name.
+                        // Bash words a refused conversion with the variable's name.
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                ErrorKind::ConvertingAssociativeArrayToIndexedArray
+                                    | ErrorKind::ConvertingIndexedArrayToAssociativeArray
+                            ) =>
+                        {
+                            let name = Self::declaration_to_name_and_value(declaration)?.0;
+                            let what = if matches!(
+                                error.kind(),
+                                ErrorKind::ConvertingAssociativeArrayToIndexedArray
+                            ) {
+                                "associative to indexed"
+                            } else {
+                                "indexed to associative"
+                            };
+                            context.report(format_args!("{name}: cannot convert {what} array"))?;
+                            result = ExecutionResult::general_error();
+                        }
                         Err(error) if is_readonly_error(&error) => {
                             let name = Self::declaration_to_name_and_value(declaration)?.0;
                             if matches!(verb, DeclareVerb::Readonly) {
@@ -343,6 +363,22 @@ impl DeclareCommand {
         if !env::valid_variable_name(name.as_str()) {
             context.report(format_args!("`{name}': not a valid identifier"))?;
             return Ok(false);
+        }
+
+        // A nameref must name a variable or an element of one.
+        if self.make_nameref.to_bool() == Some(true)
+            && let Some(ShellValueLiteral::Scalar(target)) = &initial_value
+        {
+            let base = target
+                .split_once('[')
+                .filter(|(_, rest)| rest.ends_with(']'))
+                .map_or(target.as_str(), |(base, _)| base);
+            if !target.is_empty() && !env::valid_variable_name(base) {
+                context.report(format_args!(
+                    "`{target}': invalid variable name for name reference"
+                ))?;
+                return Ok(false);
+            }
         }
 
         // A nameref to itself is refused at the top level; in a function bash only warns.
