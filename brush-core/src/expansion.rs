@@ -1188,7 +1188,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 if cmd_output.contains('\0') {
                     writeln!(
                         self.params.stderr(self.shell),
-                        "warning: command substitution: ignored null byte in input",
+                        "{}warning: command substitution: ignored null byte in input",
+                        self.shell.diagnostic_prefix()
                     )?;
                     cmd_output.retain(|c| c != '\0');
                 }
@@ -1451,11 +1452,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         } else {
                             "parameter not set".to_owned()
                         };
-                        let err: error::Error = error::ErrorKind::CheckedExpansionError(format!(
-                            "{}: {message}",
-                            diagnostic_name(&parameter)
-                        ))
-                        .into();
+                        // Bash names a positional parameter here by its number alone.
+                        let name = match &parameter {
+                            brush_parser::word::Parameter::Positional(n) => n.to_string(),
+                            parameter => diagnostic_name(parameter),
+                        };
+                        let err: error::Error =
+                            error::ErrorKind::CheckedExpansionError(format!("{name}: {message}"))
+                                .into();
 
                         // Expansion errors are fatal per POSIX spec
                         Err(err.into_fatal())
@@ -1907,7 +1911,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 concatenate: _,
             }
             | brush_parser::word::Parameter::Special(_) => {
-                return Err(error::ErrorKind::CannotAssignToSpecialParameter.into());
+                return Err(
+                    error::ErrorKind::CannotAssignToSpecialParameter(diagnostic_name(parameter))
+                        .into(),
+                );
             }
         };
 
@@ -1943,8 +1950,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         } else {
             let expansion = self.expand_parameter(parameter, false).await?;
             let parameter_str: String = self.fields_to_string(expansion);
+            // Bash names a value that is no parameter as an invalid variable name.
             let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)
+                    .map_err(|_error| {
+                    error::ErrorKind::CheckedExpansionError(format!(
+                        "{parameter_str}: invalid variable name"
+                    ))
+                })?;
             Ok(self.try_resolve_parameter_to_variable_without_indirect(&inner_parameter))
         }
     }
@@ -2018,8 +2031,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             Ok(expansion)
         } else {
             let parameter_str: String = self.fields_to_string(expansion);
+            // Bash names a value that is no parameter as an invalid variable name.
             let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)
+                    .map_err(|_error| {
+                    error::ErrorKind::CheckedExpansionError(format!(
+                        "{parameter_str}: invalid variable name"
+                    ))
+                })?;
 
             self.expand_parameter_without_indirect(&inner_parameter, allow_unset_vars)
                 .await

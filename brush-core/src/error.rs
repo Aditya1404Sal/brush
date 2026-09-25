@@ -54,8 +54,8 @@ pub enum ErrorKind {
     FailedToSendSignal,
 
     /// An attempt was made to assign a value to a special parameter.
-    #[error("cannot assign in this way")]
-    CannotAssignToSpecialParameter,
+    #[error("{0}: cannot assign in this way")]
+    CannotAssignToSpecialParameter(String),
 
     /// Checked expansion error.
     #[error("{0}")]
