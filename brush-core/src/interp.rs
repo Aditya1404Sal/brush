@@ -1670,9 +1670,10 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
                     {
                         // An expansion error that ends the shell (a bad substitution in a
-                        // file name) still does, as in bash; in a here-document or here-string,
-                        // or any other failed redirection, it fails the command.
-                        if e.is_fatal()
+                        // file name) or abandons the top-level command (failglob) still does, as
+                        // in bash; in a here-document or here-string, or any other failed
+                        // redirection, it fails the command.
+                        if (e.is_fatal() || e.abandons_command())
                             && !matches!(
                                 redirect,
                                 ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..)

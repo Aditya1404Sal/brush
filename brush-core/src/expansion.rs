@@ -1203,6 +1203,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         if expansion.is_unmatched_glob()
             && self.shell.options().fail_expansion_on_globs_without_match
         {
+            // As in bash, this abandons the top-level command, from a function or a redirection
+            // as much as from the command itself (see `Error::abandons_command`).
             let field_str = String::from(field);
             return Err(error::ErrorKind::NoMatch(field_str).into());
         }

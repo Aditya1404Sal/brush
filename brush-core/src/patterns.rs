@@ -186,10 +186,7 @@ impl Pattern {
 
         // Similarly, if we're *confident* the pattern doesn't require expansion, then we
         // know there's a single expansion (before filtering).
-        } else if !self.pieces.iter().any(|piece| {
-            matches!(piece, PatternPiece::Pattern(_))
-                && requires_expansion(piece.as_str(), self.enable_extended_globbing)
-        }) {
+        } else if !pieces_require_expansion(&self.pieces, self.enable_extended_globbing) {
             let concatenated: String = self.pieces.iter().map(|piece| piece.as_str()).collect();
 
             if let Some(filter) = path_filter
@@ -300,10 +297,7 @@ impl Pattern {
                 continue;
             }
 
-            if !component.iter().any(|piece| {
-                matches!(piece, PatternPiece::Pattern(_))
-                    && requires_expansion(piece.as_str(), self.enable_extended_globbing)
-            }) {
+            if !pieces_require_expansion(&component, self.enable_extended_globbing) {
                 let flattened = component
                     .iter()
                     .map(|piece| piece.as_str())
@@ -515,6 +509,41 @@ fn walk_for_globstar(
             walk_for_globstar(&entry.path(), directories_only, allow_dot_files, found);
         }
     }
+}
+
+/// Whether the pieces hold a glob. That is decided on the whole of them, quoted pieces escaped:
+/// an extglob can hold a quoted character (`@(\*|b)`), which splits it into pieces that are not
+/// globs by themselves.
+fn pieces_require_expansion(pieces: &[PatternPiece], enable_extended_globbing: bool) -> bool {
+    if !pieces
+        .iter()
+        .any(|piece| matches!(piece, PatternPiece::Pattern(_)))
+    {
+        return false;
+    }
+    let pattern: String = pieces
+        .iter()
+        .map(|piece| match piece {
+            PatternPiece::Pattern(s) => s.clone(),
+            PatternPiece::Literal(s) => escape_for_pattern(s),
+        })
+        .collect();
+    requires_expansion(&pattern, enable_extended_globbing)
+}
+
+/// `s` with every character that means something in a pattern backslash-escaped.
+fn escape_for_pattern(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '*' | '?' | '[' | ']' | '\\' | '(' | ')' | '|' | '@' | '!' | '+'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 fn requires_expansion(s: &str, enable_extended_globbing: bool) -> bool {

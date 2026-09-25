@@ -460,7 +460,11 @@ impl Error {
     /// readonly variable does in bash: it passes through function calls rather than becoming
     /// the call's status.
     pub const fn abandons_command(&self) -> bool {
-        matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_))
+        // A failed glob under failglob does the same.
+        matches!(
+            self.kind,
+            ErrorKind::ReadonlyVariableNamed(_) | ErrorKind::NoMatch(_)
+        )
     }
 
     /// The reason a path could not be used, as the system words it ("No such file or
