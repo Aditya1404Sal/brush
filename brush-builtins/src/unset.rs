@@ -171,7 +171,8 @@ async fn unset_array_index(
         shell.basic_expand_string(params, index).await?.into()
     } else {
         // First evaluate the index expression.
-        let index_as_expr = brush_parser::arithmetic::parse(index)?;
+        let index_as_expr =
+            brush_core::arithmetic::parse(index).map_err(brush_core::Error::from)?;
         let evaluated_index = shell.eval_arithmetic(&index_as_expr)?;
         evaluated_index.to_string().into()
     };
