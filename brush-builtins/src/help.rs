@@ -35,7 +35,7 @@ impl builtins::Command for HelpCommand {
         }
 
         // Match bash: succeed if at least one requested topic pattern matched
-        // something; return a non-zero exit code only when none of them matched.
+        // something; only when none of them matched, report the last one and fail.
         let mut any_matched = false;
         for topic_pattern in &self.topic_patterns {
             if self.display_help_for_topic_pattern(&context, topic_pattern)? {
@@ -46,6 +46,12 @@ impl builtins::Command for HelpCommand {
         if any_matched {
             Ok(ExecutionResult::success())
         } else {
+            if let Some(pattern) = self.topic_patterns.last() {
+                context.report(format_args!(
+                    "no help topics match `{pattern}'.  Try `help help' or `man -k {pattern}' or \
+                     `info {pattern}'."
+                ))?;
+            }
             Ok(ExecutionResult::general_error())
         }
     }
@@ -106,10 +112,6 @@ impl HelpCommand {
             }
         }
 
-        if !matched {
-            writeln!(context.stderr(), "No help topics match '{topic_pattern}'")?;
-        }
-
         Ok(matched)
     }
 
@@ -148,6 +150,8 @@ impl HelpCommand {
     }
 }
 
+/// The shell's builtins in name order, leaving out those that stand for a program bash has no
+/// builtin for (`cat`): bash has no help topic for them.
 fn get_builtins_sorted_by_name<'a, SE: brush_core::ShellExtensions>(
     context: &'a brush_core::ExecutionContext<'_, SE>,
 ) -> Vec<(&'a String, &'a builtins::Registration<SE>)> {
@@ -155,6 +159,7 @@ fn get_builtins_sorted_by_name<'a, SE: brush_core::ShellExtensions>(
         .shell
         .builtins()
         .iter()
+        .filter(|(name, _)| !context.shell.is_file_program(name))
         .sorted_by_key(|(name, _)| *name)
         .collect()
 }

@@ -223,6 +223,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) nesting: usize,
 
+    /// Builtins that stand for programs a Linux system has as files in `/bin` and `/usr/bin`
+    /// (see `builtin_registry`): the embedder runs such a program in-process.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    programs: std::sync::Arc<HashMap<String, builtins::ProgramKind>>,
+
     /// The top-level command running now, as (program, index): an alias defined while it runs
     /// is not expanded until a later one, as bash reads a whole command before running any of it.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -318,6 +323,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             last_stopwatch_offset: self.last_stopwatch_offset,
             loop_depth: self.loop_depth,
             nesting: self.nesting,
+            programs: self.programs.clone(),
             command_unit: self.command_unit,
             alias_units: self.alias_units.clone(),
             programs_started: self.programs_started,

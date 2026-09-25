@@ -209,14 +209,27 @@ pub fn is_null_sink(file: &OpenFile) -> bool {
     NULL_SINK_TYPE.with(|id| id.get() == Some(any.type_id()))
 }
 
-/// The most a substitution (`$( )`, `<( )`, `>( )`) holds in memory: 16 MiB. Writers past it are
-/// refused as a closed pipe refuses them, and whoever reads the cut-off output learns it was cut.
-pub const MAX_SUBSTITUTION_BYTES: usize = 16 * 1024 * 1024;
+/// The limit, in MiB, of [`MAX_SUBSTITUTION_BYTES`], as a literal so messages can name it.
+macro_rules! substitution_limit_mib {
+    () => {
+        64
+    };
+}
+
+/// The most any one in-memory buffer holds.
+///
+/// That is a substitution (`$( )`, `<( )`, `>( )`) or a synchronous builtin's output into a
+/// pipe; bash-tool uses the same limit for everything it buffers. Writers past it are refused as
+/// a closed pipe refuses them, and whoever reads the cut-off output learns it was cut.
+pub const MAX_SUBSTITUTION_BYTES: usize = substitution_limit_mib!() * 1024 * 1024;
 
 /// The error a reader gets at the end of a process substitution's output that was cut off at
 /// [`MAX_SUBSTITUTION_BYTES`].
-pub const TRUNCATED_SUBSTITUTION: &str =
-    "process substitution output over 16 MiB is unsupported in bash-tool";
+pub const TRUNCATED_SUBSTITUTION: &str = concat!(
+    "process substitution output over ",
+    substitution_limit_mib!(),
+    " MiB is unsupported in bash-tool"
+);
 
 /// Creates a read-only shared byte stream, suitable for fully staged here-documents.
 /// This storage is invocation input, rather than an undrained bounded pipe.
@@ -827,9 +840,10 @@ mod mem_pipe {
                     .len()
                     .min(super::MAX_SUBSTITUTION_BYTES.saturating_sub(inner.buf.len()));
                 if n == 0 {
-                    return Poll::Ready(Err(std::io::Error::other(
-                        "synchronous output to a pipe over 16 MiB is unsupported in bash-tool",
-                    )));
+                    return Poll::Ready(Err(std::io::Error::other(format!(
+                        "synchronous output to a pipe over {} MiB is unsupported in bash-tool",
+                        super::MAX_SUBSTITUTION_BYTES >> 20
+                    ))));
                 }
             }
             inner.buf.extend(data[..n].iter().copied());
@@ -1212,6 +1226,15 @@ mod mem_pipe_tests {
 
     /// Bytes written are read back in order. With the writer still open, an empty read is an
     /// error, not end-of-stream; once the writer drops it is a clean EOF.
+    #[test]
+    fn limit_messages_name_the_limit() {
+        let limit = format!(" {} MiB ", super::MAX_SUBSTITUTION_BYTES >> 20);
+        assert_eq!(super::MAX_SUBSTITUTION_BYTES, 64 * 1024 * 1024);
+        assert!(super::TRUNCATED_SUBSTITUTION.contains(&limit));
+        let error = super::error::Error::from(super::error::ErrorKind::SubstitutionTooLarge);
+        assert!(error.to_string().contains(&limit), "{error}");
+    }
+
     #[test]
     fn descriptors_that_share_a_target_are_recognised() {
         let (_, writer) = super::test_pipe(8);

@@ -225,7 +225,8 @@ pub(crate) fn apply_unary_predicate_to_str(
         }
         ast::UnaryPredicate::FileExistsAndIsExecutable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.executable_or_searchable())
+            // A program a builtin stands for (`/bin/cat`) can be executed.
+            Ok(path.executable_or_searchable() || shell.program_builtin(operand).is_some())
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
             let path = shell.absolute_path(Path::new(operand));
