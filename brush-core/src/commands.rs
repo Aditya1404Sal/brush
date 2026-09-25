@@ -1091,6 +1091,9 @@ async fn run_substitution_command(
     // TODO(source-info): review this
     let source_info = crate::SourceInfo::from("main");
 
+    // The substitution's lines are numbered on from the command it is part of.
+    shell.begin_nested_code();
+
     // Handle the parse result using default shell behavior.
     shell
         .run_parsed_result(parse_result, Some(&command), &source_info, &params)

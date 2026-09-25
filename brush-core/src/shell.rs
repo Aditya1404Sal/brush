@@ -360,6 +360,24 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         self.call_stack.increment_current_line_offset(delta);
     }
 
+    /// Numbers the code about to run in this frame on from the command running now, as bash
+    /// numbers `eval`'d code and command substitutions: their first line is that command's line.
+    /// Returns the shift, to undo with [`Self::end_nested_code`].
+    pub fn begin_nested_code(&mut self) -> usize {
+        let shift = self
+            .call_stack
+            .current_frame()
+            .and_then(|frame| frame.current.as_ref())
+            .map_or(0, |position| position.line.saturating_sub(1));
+        self.call_stack.increment_current_line_offset(shift);
+        shift
+    }
+
+    /// Undoes [`Self::begin_nested_code`].
+    pub fn end_nested_code(&mut self, shift: usize) {
+        self.call_stack.decrement_current_line_offset(shift);
+    }
+
     /// Updates the currently executing command in the shell.
     pub fn set_current_cmd(&mut self, cmd: &impl brush_parser::ast::Node) {
         self.call_stack

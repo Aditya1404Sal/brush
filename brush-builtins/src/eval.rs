@@ -34,11 +34,15 @@ impl builtins::Command for EvalCommand {
             // Return the direct result of running the string; we intentionally
             // pass through the result and honor its requested control flow. eval
             // executes in the current environment, so all control flow (return,
-            // exit, break, continue) should propagate.
-            context
+            // exit, break, continue) should propagate. Its lines are numbered on from the
+            // eval command's, as in bash.
+            let shift = context.shell.begin_nested_code();
+            let result = context
                 .shell
                 .run_string(args_concatenated, &source_info, &context.params)
-                .await
+                .await;
+            context.shell.end_nested_code(shift);
+            result
         } else {
             Ok(ExecutionResult::success())
         }

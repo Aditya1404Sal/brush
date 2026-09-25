@@ -443,6 +443,13 @@ impl CallStack {
         frame.current_line_offset += delta;
     }
 
+    /// Undoes [`Self::increment_current_line_offset`].
+    pub(crate) fn decrement_current_line_offset(&mut self, delta: usize) {
+        if let Some(frame) = self.frames.front_mut() {
+            frame.current_line_offset = frame.current_line_offset.saturating_sub(delta);
+        }
+    }
+
     /// Pushes a new script call frame onto the stack.
     ///
     /// # Arguments

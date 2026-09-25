@@ -281,7 +281,16 @@ impl Execute for ast::CompoundList {
 
                 result = ExecutionResult::success();
             } else {
-                result = ao_list.execute(shell, params).await?;
+                result = match ao_list.execute(shell, params).await {
+                    Ok(result) => result,
+                    // An error that ends the shell is reported where it happened, while LINENO
+                    // still names that line (in a function body, not the call).
+                    Err(error) if error.is_fatal() && !error.is_reported() => {
+                        let _ = shell.display_error(&mut params.stderr(shell), &error);
+                        return Err(error.into_reported());
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 // Update status
                 shell.set_last_exit_status(result.exit_code.into());
