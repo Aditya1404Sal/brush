@@ -127,7 +127,30 @@ pub fn bash_diagnostic(
     source: &str,
     options: &crate::ParserOptions,
 ) -> Vec<String> {
+    // Bash reads the end of a command string as the end of a line, so what fails at the end of
+    // input without a final newline (`echo first; fi`) fails at that newline, where bash names
+    // the token it could not use.
+    if matches!(error, ParseError::ParsingAtEndOfInput) && !source.ends_with('\n') {
+        let with_newline = std::format!("{source}\n");
+        let mut reader = std::io::BufReader::new(with_newline.as_bytes());
+        if let Err(error @ ParseError::ParsingNear(_)) =
+            crate::Parser::new(&mut reader, options).parse_program()
+        {
+            return bash_diagnostic(&error, &with_newline, options);
+        }
+    }
     let end_line = source.lines().count() + 1;
+    // In a conditional command, bash's own parser for them words the error.
+    let failed_at = match error {
+        ParseError::ParsingNear(position) => Some(Some(position.index)),
+        ParseError::ParsingAtEndOfInput => Some(None),
+        ParseError::Tokenizing { .. } => None,
+    };
+    if let Some(lines) =
+        failed_at.and_then(|failed_at| conditional_diagnostic(source, options, failed_at))
+    {
+        return lines;
+    }
     let tokens = || {
         tokenizer::tokenize_str_with_options(source, &options.tokenizer_options())
             .unwrap_or_default()
@@ -151,6 +174,8 @@ pub fn bash_diagnostic(
             let tokens = tokens();
             if let Some((token, line)) = misplaced_last(&tokens) {
                 near(token, line)
+            } else if let Some(line) = open_function_parenthesis(&tokens) {
+                near("newline", line)
             } else if let Some((keyword, line)) = unclosed_command(&tokens) {
                 vec![std::format!(
                     "line {end_line}: syntax error: unexpected end of file from `{keyword}' command on line {line}"
@@ -181,6 +206,469 @@ pub fn bash_diagnostic(
             )]
         }
     }
+}
+
+/// Bash's diagnostic for the first conditional command (`[[ ... ]]`), up to where the parse
+/// failed (`failed_at`, a character index; `None` for the end of the input), that bash's parser
+/// for them rejects, or `None` when there is none.
+fn conditional_diagnostic(
+    source: &str,
+    options: &crate::ParserOptions,
+    failed_at: Option<usize>,
+) -> Option<Vec<String>> {
+    // The input ends with a newline, as bash reads it.
+    let text = if source.ends_with('\n') {
+        std::borrow::Cow::Borrowed(source)
+    } else {
+        std::borrow::Cow::Owned(std::format!("{source}\n"))
+    };
+    let tokens = tokenizer::tokenize_str_with_options(&text, &options.tokenizer_options()).ok()?;
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut command_start = true;
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        if failed_at.is_some_and(|at| token.location().start.index > at) {
+            return None;
+        }
+        let word = token.to_str();
+        if command_start && matches!(token, crate::Token::Word(..)) && word == "[[" {
+            let mut conditional = Conditional {
+                tokens: &tokens,
+                lines: &lines,
+                next: index + 1,
+                cond_token: CondToken::Error,
+                failed: CondToken::Error,
+                messages: vec![],
+            };
+            match conditional.command(token.location().start.line) {
+                Ok(next) => {
+                    index = next;
+                    command_start = false;
+                    continue;
+                }
+                Err(diagnostic) => return Some(diagnostic),
+            }
+        }
+        command_start = match token {
+            crate::Token::Operator(..) => matches!(
+                word,
+                ";" | "\n" | "&" | "&&" | "||" | "|" | "|&" | "(" | ")" | ";;" | ";&" | ";;&"
+            ),
+            crate::Token::Word(..) => {
+                command_start
+                    && matches!(
+                        word,
+                        "if" | "then"
+                            | "else"
+                            | "elif"
+                            | "while"
+                            | "until"
+                            | "do"
+                            | "{"
+                            | "!"
+                            | "time"
+                    )
+            }
+        };
+        index += 1;
+    }
+    None
+}
+
+/// What bash's conditional parser holds as its current token.
+#[derive(Clone, Copy)]
+enum CondToken {
+    /// The token at this index.
+    At(usize),
+    /// The end of the input.
+    End,
+    /// An error was found (bash's `COND_ERROR`).
+    Error,
+}
+
+/// Bash's parser for conditional commands (`cond_expr`, `cond_term` and the rest in bash's
+/// `parse.y`), run over the tokens after a `[[` to find the error bash reports and word it.
+struct Conditional<'a> {
+    tokens: &'a [crate::Token],
+    /// The lines of the input, each with its newline.
+    lines: &'a [&'a str],
+    next: usize,
+    cond_token: CondToken,
+    /// The token read last when the error was found.
+    failed: CondToken,
+    messages: Vec<String>,
+}
+
+impl Conditional<'_> {
+    /// Parses the command through its `]]`, returning the index after it, or bash's diagnostic.
+    fn command(&mut self, cond_line: usize) -> Result<usize, Vec<String>> {
+        self.expr();
+        match self.cond_token {
+            CondToken::At(i) if self.is_word(i, "]]") => return Ok(i + 1),
+            CondToken::Error => {}
+            CondToken::End => {
+                self.messages.push(std::format!(
+                    "line {cond_line}: unexpected EOF while looking for `]]'"
+                ));
+                self.failed = CondToken::End;
+            }
+            token @ CondToken::At(_) => {
+                let text = self.text(token);
+                self.messages.push(std::format!(
+                    "line {cond_line}: syntax error in conditional expression: unexpected token `{text}'"
+                ));
+                self.failed = token;
+            }
+        }
+        let mut diagnostic = std::mem::take(&mut self.messages);
+        if let CondToken::At(i) = self.failed {
+            diagnostic.extend(self.near(i));
+        } else {
+            diagnostic.push(std::format!(
+                "line {}: syntax error: unexpected end of file from `[[' command on line {cond_line}",
+                self.lines.len() + 1
+            ));
+        }
+        Err(diagnostic)
+    }
+
+    fn expr(&mut self) {
+        self.and();
+        if matches!(self.cond_token, CondToken::At(i) if self.is_operator(i, "||")) {
+            self.expr();
+        }
+    }
+
+    fn and(&mut self) {
+        self.term();
+        if matches!(self.cond_token, CondToken::At(i) if self.is_operator(i, "&&")) {
+            self.and();
+        }
+    }
+
+    fn term(&mut self) {
+        let token = self.skip_newlines();
+        let CondToken::At(i) = token else {
+            return self.fail(token, "unexpected token `EOF' in conditional command");
+        };
+        if self.is_word(i, "]]") {
+            self.failed = token;
+            self.cond_token = CondToken::Error;
+        } else if self.is_operator(i, "(") {
+            self.group(token);
+        } else if self.is_word(i, "!") {
+            self.term();
+        } else if self.is_operand(i) && is_unary_operator(self.tokens[i].to_str()) {
+            let argument = self.read();
+            if matches!(argument, CondToken::At(j) if self.is_operand(j)) {
+                self.cond_token = self.skip_newlines();
+            } else {
+                let text = self.text(argument);
+                self.fail(
+                    argument,
+                    &std::format!("unexpected argument `{text}' to conditional unary operator"),
+                );
+            }
+        } else if self.is_operand(i) {
+            self.binary();
+        } else {
+            let text = self.text(token);
+            self.fail(
+                token,
+                &std::format!("unexpected token `{text}' in conditional command"),
+            );
+        }
+    }
+
+    /// The rest of a `( ... )` group, after its `(`.
+    fn group(&mut self, open: CondToken) {
+        let line = self.line(open);
+        self.expr();
+        match self.cond_token {
+            CondToken::At(j) if self.is_operator(j, ")") => {
+                self.cond_token = self.skip_newlines();
+            }
+            CondToken::Error => self
+                .messages
+                .push(std::format!("line {line}: expected `)'")),
+            other => {
+                let text = self.text(other);
+                self.messages.push(std::format!(
+                    "line {line}: unexpected token `{text}', expected `)'"
+                ));
+                self.failed = other;
+                self.cond_token = CondToken::Error;
+            }
+        }
+    }
+
+    /// The rest of a binary expression, or of a word tested alone, after its first word.
+    fn binary(&mut self) {
+        let operator = self.read();
+        let CondToken::At(j) = operator else {
+            return self.fail(
+                operator,
+                "unexpected token `EOF', conditional binary operator expected",
+            );
+        };
+        let binary = self.is_operator(j, "<")
+            || self.is_operator(j, ">")
+            || (self.is_operand(j) && is_binary_operator(self.tokens[j].to_str()));
+        if !binary {
+            // `[[ word ]]` tests that the word is not empty.
+            if self.is_word(j, "]]")
+                || self.is_operator(j, "&&")
+                || self.is_operator(j, "||")
+                || self.is_operator(j, ")")
+            {
+                self.cond_token = operator;
+            } else {
+                let text = self.text(operator);
+                self.fail(
+                    operator,
+                    &std::format!(
+                        "unexpected token `{text}', conditional binary operator expected"
+                    ),
+                );
+            }
+            return;
+        }
+        let regex = self.is_word(j, "=~");
+        let argument = self.read();
+        match argument {
+            CondToken::At(k) if self.is_operand(k) || (regex && self.is_operator(k, "(")) => {
+                if regex {
+                    self.skip_regex(k);
+                }
+                self.cond_token = self.skip_newlines();
+            }
+            _ => {
+                let text = self.text(argument);
+                self.fail(
+                    argument,
+                    &std::format!("unexpected argument `{text}' to conditional binary operator"),
+                );
+            }
+        }
+    }
+
+    /// Reads the rest of a regular expression that starts with the token at `first`: the tokens
+    /// that follow it with no blank between, and anything inside parentheses.
+    fn skip_regex(&mut self, first: usize) {
+        let depth_change = |token: &crate::Token| match token {
+            crate::Token::Operator(o, _) if o == "(" => 1,
+            crate::Token::Operator(o, _) if o == ")" => -1,
+            _ => 0,
+        };
+        let mut depth = depth_change(&self.tokens[first]);
+        let mut last = first;
+        while let Some(token) = self.tokens.get(self.next) {
+            let adjacent = token.location().start.index == self.tokens[last].location().end.index;
+            if depth <= 0 && (!adjacent || token.to_str() == "\n") {
+                break;
+            }
+            depth += depth_change(token);
+            last = self.next;
+            self.next += 1;
+        }
+    }
+
+    fn read(&mut self) -> CondToken {
+        if self.next < self.tokens.len() {
+            self.next += 1;
+            CondToken::At(self.next - 1)
+        } else {
+            CondToken::End
+        }
+    }
+
+    fn skip_newlines(&mut self) -> CondToken {
+        loop {
+            match self.read() {
+                CondToken::At(i) if self.is_operator(i, "\n") => {}
+                token => return token,
+            }
+        }
+    }
+
+    /// Reports `message` for an error found after reading `token`.
+    fn fail(&mut self, token: CondToken, message: &str) {
+        let line = self.line(token);
+        self.messages.push(std::format!("line {line}: {message}"));
+        self.failed = token;
+        self.cond_token = CondToken::Error;
+    }
+
+    fn is_word(&self, i: usize, word: &str) -> bool {
+        matches!(&self.tokens[i], crate::Token::Word(w, _) if w == word)
+    }
+
+    fn is_operator(&self, i: usize, operator: &str) -> bool {
+        matches!(&self.tokens[i], crate::Token::Operator(o, _) if o == operator)
+    }
+
+    /// A word other than `]]`, which ends the command.
+    fn is_operand(&self, i: usize) -> bool {
+        matches!(&self.tokens[i], crate::Token::Word(w, _) if w != "]]")
+    }
+
+    /// A token as bash names it in a diagnostic.
+    fn text(&self, token: CondToken) -> String {
+        match token {
+            CondToken::At(i) if self.is_operator(i, "\n") => "newline".to_owned(),
+            CondToken::At(i) => self.tokens[i].to_str().to_owned(),
+            CondToken::End | CondToken::Error => "EOF".to_owned(),
+        }
+    }
+
+    /// The line bash is on once it has read `token`.
+    fn line(&self, token: CondToken) -> usize {
+        match token {
+            CondToken::At(i) if self.is_operator(i, "\n") => self.tokens[i].location().start.line,
+            CondToken::At(i) => self.tokens[i].location().end.line,
+            CondToken::End | CondToken::Error => self.lines.len() + 1,
+        }
+    }
+
+    /// Bash's `syntax error near` for an error found after reading the token at `i`: the text
+    /// bash finds before that point, and the line it is on.
+    fn near(&self, i: usize) -> [String; 2] {
+        let line = self.line(CondToken::At(i));
+        let text = self
+            .lines
+            .get(line.saturating_sub(1))
+            .copied()
+            .unwrap_or_default();
+        let chars: Vec<char> = text.chars().collect();
+        let read = if self.is_operator(i, "\n") {
+            chars.len()
+        } else {
+            self.tokens[i].location().end.column.saturating_sub(1)
+        };
+        let word = error_token_from_text(&chars, read.min(chars.len()));
+        [
+            std::format!("line {line}: syntax error near `{word}'"),
+            std::format!("line {line}: `{}'", text.trim_end_matches('\n')),
+        ]
+    }
+}
+
+/// Whether bash's `[[` takes `word` as a unary operator (`-f`).
+fn is_unary_operator(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars.next() == Some('-')
+        && chars
+            .next()
+            .is_some_and(|c| "abcdefghknoprstuvwxzGLOSNR".contains(c))
+        && chars.next().is_none()
+}
+
+/// Whether bash's `[[` takes `word` as a binary operator (`==`, `-lt`).
+fn is_binary_operator(word: &str) -> bool {
+    matches!(
+        word,
+        "=" | "=="
+            | "!="
+            | "=~"
+            | "-nt"
+            | "-ot"
+            | "-ef"
+            | "-eq"
+            | "-ne"
+            | "-lt"
+            | "-le"
+            | "-gt"
+            | "-ge"
+    )
+}
+
+/// The token bash names from the text of the line it is reading, `read` characters in
+/// (`error_token_from_text` in bash's `parse.y`): the last run of characters before there that
+/// are not blanks or `;|&`, or else the one such character there.
+fn error_token_from_text(line: &[char], read: usize) -> String {
+    let at = |i: usize| line.get(i).copied().unwrap_or('\0');
+    let blank = |c: char| matches!(c, ' ' | '\t' | '\n');
+    let mut i = read;
+    if i > 0 && at(i) == '\0' {
+        i -= 1;
+    }
+    while i > 0 && blank(at(i)) {
+        i -= 1;
+    }
+    let token_end = if i > 0 { i + 1 } else { 0 };
+    while i > 0 && !matches!(at(i), ' ' | '\n' | '\t' | ';' | '|' | '&') {
+        i -= 1;
+    }
+    while i != token_end && blank(at(i)) {
+        i += 1;
+    }
+    if token_end > 0 {
+        line.get(i..token_end).unwrap_or_default().iter().collect()
+    } else {
+        at(i).to_string()
+    }
+}
+
+/// The line of a command's first word followed by `(` and then a newline or the end of the
+/// input (`f (`): bash takes it for a function definition wanting its `)` there.
+fn open_function_parenthesis(tokens: &[crate::Token]) -> Option<usize> {
+    let mut command_start = true;
+    for (i, token) in tokens.iter().enumerate() {
+        let text = token.to_str();
+        if command_start
+            && matches!(token, crate::Token::Word(..))
+            && !matches!(
+                text,
+                "if" | "then"
+                    | "else"
+                    | "elif"
+                    | "fi"
+                    | "do"
+                    | "done"
+                    | "case"
+                    | "esac"
+                    | "while"
+                    | "until"
+                    | "for"
+                    | "select"
+                    | "{"
+                    | "}"
+                    | "!"
+                    | "[["
+                    | "]]"
+                    | "time"
+                    | "function"
+                    | "in"
+                    | "coproc"
+            )
+            && tokens.get(i + 1).is_some_and(|t| t.to_str() == "(")
+            && tokens.get(i + 2).is_none_or(|t| t.to_str() == "\n")
+        {
+            return Some(tokens[i + 1].location().start.line);
+        }
+        command_start = match token {
+            crate::Token::Operator(..) => matches!(
+                text,
+                ";" | "\n" | "&" | "&&" | "||" | "|" | "|&" | "(" | ")" | ";;" | ";&" | ";;&"
+            ),
+            crate::Token::Word(..) => {
+                command_start
+                    && matches!(
+                        text,
+                        "if" | "then"
+                            | "else"
+                            | "elif"
+                            | "while"
+                            | "until"
+                            | "do"
+                            | "{"
+                            | "!"
+                            | "time"
+                    )
+            }
+        };
+    }
+    None
 }
 
 /// A reserved word that ends the input where a command was expected (`if then`): bash names it
@@ -217,6 +705,14 @@ fn unexpected_token(
     if index > 0
         && matches!(tokens[index].to_str(), ";" | "\n" | "&")
         && RESERVED.contains(&tokens[index - 1].to_str())
+    {
+        index -= 1;
+    }
+    // A `!` starts a pipeline, not a command within one (`a | ! b`); the parser fails at the
+    // command after it, and bash names the `!`.
+    if index > 1
+        && tokens[index - 1].to_str() == "!"
+        && matches!(tokens[index - 2].to_str(), "|" | "|&")
     {
         index -= 1;
     }
@@ -352,6 +848,86 @@ mod tests {
         assert_eq!(
             diagnose("if true; then\n  while x; do\n    echo if done\n")[0],
             "line 4: syntax error: unexpected end of file from `while' command on line 2"
+        );
+    }
+
+    #[test]
+    fn names_the_token_on_a_last_line_without_a_newline() {
+        assert_eq!(
+            diagnose("echo first; fi"),
+            [
+                "line 1: syntax error near unexpected token `fi'",
+                "line 1: `echo first; fi'"
+            ]
+        );
+        assert_eq!(
+            diagnose("echo ("),
+            [
+                "line 1: syntax error near unexpected token `newline'",
+                "line 1: `echo ('"
+            ]
+        );
+        assert_eq!(
+            diagnose("if ("),
+            ["line 2: syntax error: unexpected end of file from `(' command on line 1"]
+        );
+        assert_eq!(
+            diagnose("! true | ! true"),
+            [
+                "line 1: syntax error near unexpected token `!'",
+                "line 1: `! true | ! true'"
+            ]
+        );
+    }
+
+    #[test]
+    fn words_conditional_command_errors_as_bash() {
+        assert_eq!(
+            diagnose("echo x; [[ ( a\n&& b ) ]]"),
+            [
+                "line 1: unexpected token `newline', conditional binary operator expected",
+                "line 1: expected `)'",
+                "line 1: syntax error near `a'",
+                "line 1: `echo x; [[ ( a'",
+            ]
+        );
+        assert_eq!(
+            diagnose("[[ a && && b ]]"),
+            [
+                "line 1: unexpected token `&&' in conditional command",
+                "line 1: syntax error near `&'",
+                "line 1: `[[ a && && b ]]'",
+            ]
+        );
+        assert_eq!(
+            diagnose("if [[ -n x ]]; then [[ ( a ) b ]]; fi"),
+            [
+                "line 1: syntax error in conditional expression: unexpected token `b'",
+                "line 1: syntax error near `b'",
+                "line 1: `if [[ -n x ]]; then [[ ( a ) b ]]; fi'",
+            ]
+        );
+        assert_eq!(
+            diagnose("[[ a =~ (x|y)z && -f ]]"),
+            [
+                "line 1: unexpected argument `]]' to conditional unary operator",
+                "line 1: syntax error near `]]'",
+                "line 1: `[[ a =~ (x|y)z && -f ]]'",
+            ]
+        );
+        assert_eq!(
+            diagnose("[[ a == b"),
+            [
+                "line 1: unexpected EOF while looking for `]]'",
+                "line 2: syntax error: unexpected end of file from `[[' command on line 1",
+            ]
+        );
+        assert_eq!(
+            diagnose("[["),
+            [
+                "line 2: unexpected token `EOF' in conditional command",
+                "line 2: syntax error: unexpected end of file from `[[' command on line 1",
+            ]
         );
     }
 

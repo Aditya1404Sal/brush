@@ -75,7 +75,7 @@ fn expand_brace_expr_member(bem: word::BraceExpressionMember) -> Box<dyn Iterato
             }
 
             if start <= end {
-                Box::new((start..=end).step_by(increment).map(|c| c.to_string()))
+                Box::new((start..=end).step_by(increment).map(sequence_char))
             } else {
                 // Iterate from start down to end by decrementing.
                 let increment = increment as u32;
@@ -84,7 +84,7 @@ fn expand_brace_expr_member(bem: word::BraceExpressionMember) -> Box<dyn Iterato
                         let next = char::from_u32((c as u32).checked_sub(increment)?)?;
                         (next >= end).then_some(next)
                     })
-                    .map(|c| c.to_string()),
+                    .map(sequence_char),
                 )
             }
         }
@@ -93,6 +93,17 @@ fn expand_brace_expr_member(bem: word::BraceExpressionMember) -> Box<dyn Iterato
             // Chain all element iterators together
             Box::new(generate_and_combine_brace_expansions(elements).into_iter())
         }
+    }
+}
+
+/// A member of a letter sequence, as word text. A range from an upper-case to a lower-case letter
+/// (`{Z..a}`) passes the punctuation between them; bash's quote removal takes the backslash
+/// away, and keeps a backquote with nothing after it literal.
+fn sequence_char(c: char) -> String {
+    match c {
+        '\\' => String::from("''"),
+        '`' => String::from("\\`"),
+        c => c.to_string(),
     }
 }
 

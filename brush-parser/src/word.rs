@@ -57,6 +57,8 @@ pub enum WordPiece {
     CommandSubstitution(String),
     /// A backquoted command substitution.
     BackquotedCommandSubstitution(String),
+    /// A process substitution inside a word (`--file=<(list)`): its kind and its command.
+    ProcessSubstitution(ast::ProcessSubstitutionKind, String),
     /// An escape sequence.
     EscapeSequence(String),
     /// An arithmetic expression.
@@ -424,6 +426,44 @@ pub enum ParameterExpr {
         /// Whether to concatenate the results.
         concatenate: bool,
     },
+    /// Toggle the case of the first character of the given parameter.
+    ToggleCaseFirstChar {
+        /// The parameter.
+        parameter: Parameter,
+        /// Whether to treat the expanded parameter as an indirect
+        /// reference, which should be subsequently dereferenced
+        /// for the expansion.
+        indirect: bool,
+        /// Optionally provides a pattern to match.
+        pattern: Option<String>,
+    },
+    /// Toggle the case of the portion of the given parameter matching the given pattern.
+    ToggleCasePattern {
+        /// The parameter.
+        parameter: Parameter,
+        /// Whether to treat the expanded parameter as an indirect
+        /// reference, which should be subsequently dereferenced
+        /// for the expansion.
+        indirect: bool,
+        /// Optionally provides a pattern to match.
+        pattern: Option<String>,
+    },
+    /// A command run in the current shell (bash 5.3): `${ command; }`, whose value is its
+    /// output, or `${| command; }`, whose value is what it leaves in `REPLY`.
+    FunctionSubstitution {
+        /// The command.
+        command: String,
+        /// Whether the value is `REPLY` (`${| ...; }`) rather than the output.
+        reply: bool,
+    },
+    /// A `${...}` that is not a valid expansion, or a backquote left open in a here-document,
+    /// which is an error when the word is expanded.
+    BadSubstitution {
+        /// The text, from `${` through `}`, or from the backquote through the end of the body.
+        text: String,
+        /// Whether it is a parameter followed by a `@` transformation that does not exist.
+        transform: bool,
+    },
 }
 
 /// Kind of substring match.
@@ -604,6 +644,36 @@ fn cacheable_parse(
     Ok(pieces)
 }
 
+/// Whether bash, reading `$((expr))` as a command substitution to find where it ends, takes a
+/// `#` in `expr` for a comment that runs past the closing `))` (`$((1 # c))`): a `#` after a
+/// blank or a newline, outside quotes and not escaped, with no newline after it.
+fn comment_hides_close(expr: &str) -> bool {
+    let mut previous = '(';
+    let mut quote = None;
+    let mut in_comment = false;
+    let mut chars = expr.chars();
+    while let Some(mut c) = chars.next() {
+        if in_comment {
+            in_comment = c != '\n';
+        } else if c == '\\' && quote != Some('\'') {
+            // The escaped character is the one before whatever follows.
+            c = chars.next().unwrap_or(c);
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => quote = Some(c),
+                '#' if matches!(previous, ' ' | '\t' | '\n') => in_comment = true,
+                _ => (),
+            }
+        }
+        previous = c;
+    }
+    in_comment
+}
+
 /// Parse a heredoc body, treating `"` and `'` as literal characters.
 ///
 /// # Arguments
@@ -615,6 +685,24 @@ pub fn parse_heredoc(
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
     expansion_parser::unexpanded_heredoc_word(word, options)
+        .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
+}
+
+/// Parse the text of an arithmetic expression into pieces to expand.
+///
+/// The text is the inside of `$((...))`, `((...))` or `$[...]`. Bash expands it as if it were
+/// inside double quotes, except that a double quote is removed rather than quoting; a single
+/// quote is an ordinary character.
+///
+/// # Arguments
+///
+/// * `word` - The text to parse.
+/// * `options` - The parser options to use.
+pub fn parse_arithmetic_text(
+    word: &str,
+    options: &ParserOptions,
+) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    expansion_parser::unexpanded_arithmetic_text(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
 
@@ -790,7 +878,7 @@ peg::parser! {
         pub(crate) rule unexpanded_word() -> Vec<WordPieceWithSource> = traced(<word(<![_]>)>)
 
         rule word<T>(stop_condition: rule<T>) -> Vec<WordPieceWithSource> =
-            tilde:tilde_expr_prefix_with_source()? pieces:word_piece_with_source(<stop_condition()>, false /*in_command*/)* {
+            tilde:tilde_expr_prefix_with_source()? pieces:word_piece_or_process_substitution(<stop_condition()>)* {
                 let mut all_pieces = Vec::new();
                 if let Some(tilde) = tilde {
                     all_pieces.push(tilde);
@@ -798,6 +886,26 @@ peg::parser! {
                 all_pieces.extend(pieces);
                 all_pieces
             }
+
+        // As in bash, `<(list)` and `>(list)` are process substitutions anywhere in an unquoted
+        // word.
+        rule word_piece_or_process_substitution<T>(stop_condition: rule<T>) -> WordPieceWithSource =
+            start_index:position!() piece:process_substitution() end_index:position!() {
+                WordPieceWithSource { piece, start_index, end_index }
+            } /
+            word_piece_with_source(<stop_or_process_substitution(<stop_condition()>)>, false /*in_command*/)
+
+        rule process_substitution() -> WordPiece =
+            "<(" c:command() ")" {
+                WordPiece::ProcessSubstitution(ast::ProcessSubstitutionKind::Read, c.to_owned())
+            } /
+            ">(" c:command() ")" {
+                WordPiece::ProcessSubstitution(ast::ProcessSubstitutionKind::Write, c.to_owned())
+            }
+
+        rule stop_or_process_substitution<T>(stop_condition: rule<T>) -> () =
+            stop_condition() {} /
+            ['<' | '>'] "(" {}
 
         // Takes a word as input.
         pub(crate) rule brace_expansions() -> Option<Vec<BraceExpressionOrText>> =
@@ -899,22 +1007,32 @@ peg::parser! {
             // into us, because if we see an opening parenthesis then we *must* find its closing
             // partner.
             "(" arithmetic_word_plus_right_paren() {} /
+            // Likewise a subscript's brackets, wherever the subscript starts (`++a[0]`, `z>=a[1]`),
+            // so its `]` does not end a `$[...]`.
+            "[" arithmetic_word_plus_right_bracket() {} /
             // This branch handles the case where we have an array element name with square brackets,
             // which may (legitimately) contain the stop condition.
             array_element_name() {} /
             // This branch matches any standard piece of a word, stopping as soon as we reach
-            // either the overall stop condition *OR* an opening parenthesis. We add this latter
-            // condition to ensure that *we* handle matching parentheses.
+            // either the overall stop condition *OR* an opening parenthesis or bracket. We add
+            // the latter conditions to ensure that *we* handle matching them.
             !"(" word_piece(<param_rule_or_open_paren(<stop_condition()>)>, false /*in_command*/) {}
 
-        // This is a helper rule that matches either the provided stop condition or an opening parenthesis.
+        // This is a helper rule that matches either the provided stop condition or an opening
+        // parenthesis or bracket.
         rule param_rule_or_open_paren<T>(stop_condition: rule<T>) -> () =
             stop_condition() {} /
-            "(" {}
+            "(" {} /
+            "[" {}
 
         // This rule matches an arithmetic word followed by a right parenthesis. It must consume the right parenthesis.
         rule arithmetic_word_plus_right_paren() =
             arithmetic_word(<[')']>) ")"
+
+        // This rule matches an arithmetic word followed by a right bracket. It must consume the
+        // right bracket.
+        rule arithmetic_word_plus_right_bracket() =
+            arithmetic_word(<[']']>) "]"
 
         rule word_piece_with_source<T>(stop_condition: rule<T>, in_command: bool) -> WordPieceWithSource =
             start_index:position!() piece:word_piece(<stop_condition()>, in_command) end_index:position!() {
@@ -946,7 +1064,7 @@ peg::parser! {
         rule double_quoted_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
-            command_substitution() /
+            double_quoted_command_substitution() /
             parameter_expansion() /
             double_quoted_escape_sequence() /
             double_quoted_text()
@@ -1044,13 +1162,44 @@ peg::parser! {
             command_substitution() /
             parameter_expansion() /
             heredoc_escape_sequence() /
-            heredoc_literal_text()
+            heredoc_literal_text() /
+            // A backquote left open is an error when the body is expanded, as in bash.
+            "`" rest:$([_]*) {
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution {
+                    text: std::format!("`{rest}"),
+                    transform: false,
+                })
+            }
 
         rule heredoc_escape_sequence() -> WordPiece =
             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }
 
         rule heredoc_literal_text() -> WordPiece =
             s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() [^'`'])+) {
+                WordPiece::Text(s.to_owned())
+            }
+
+        // An arithmetic expression's text: like double-quoted content, except that a double
+        // quote is removed rather than quoting, and a single quote is an ordinary character.
+        pub(crate) rule unexpanded_arithmetic_text() -> Vec<WordPieceWithSource> =
+            traced(<arithmetic_text_pieces()>)
+
+        rule arithmetic_text_pieces() -> Vec<WordPieceWithSource> =
+            pieces:arithmetic_text_piece_with_source()* { pieces.into_iter().flatten().collect() }
+
+        rule arithmetic_text_piece_with_source() -> Option<WordPieceWithSource> =
+            "\"" { None } /
+            start_index:position!() piece:arithmetic_text_piece() end_index:position!() {
+                Some(WordPieceWithSource { piece, start_index, end_index })
+            }
+
+        rule arithmetic_text_piece() -> WordPiece =
+            arithmetic_expansion() /
+            legacy_arithmetic_expansion() /
+            command_substitution() /
+            parameter_expansion() /
+            double_quoted_escape_sequence() /
+            s:$((!double_quoted_escape_sequence() !dollar_sign_word_piece() [^'\"' | '`'])+) {
                 WordPiece::Text(s.to_owned())
             }
 
@@ -1096,8 +1245,22 @@ peg::parser! {
         // TODO(parser): Deal with fact that there may be a quoted word or escaped closing brace chars.
         // TODO(parser): Improve on how we handle a '$' not followed by a valid variable name or parameter.
         rule parameter_expansion() -> WordPiece =
+            "${|" c:$(funsub_piece()*) "}" {
+                WordPiece::ParameterExpansion(ParameterExpr::FunctionSubstitution { command: c.to_owned(), reply: true })
+            } /
+            "${" &[' ' | '\t' | '\n'] c:$(funsub_piece()*) "}" {
+                WordPiece::ParameterExpansion(ParameterExpr::FunctionSubstitution { command: c.to_owned(), reply: false })
+            } /
             "${" e:parameter_expression() "}" {
                 WordPiece::ParameterExpansion(e)
+            } /
+            // Anything else from `${` to its closing brace is a bad substitution, which bash
+            // reports when it expands the word.
+            text:$("${" parameter_indirection() parameter() "@" bad_braced_text() "}") {
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text: text.to_owned(), transform: true })
+            } /
+            text:$("${" bad_braced_text() "}") {
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text: text.to_owned(), transform: false })
             } /
             "$" parameter:unbraced_parameter() {
                 WordPiece::ParameterExpansion(ParameterExpr::Parameter { parameter, indirect: false })
@@ -1106,7 +1269,19 @@ peg::parser! {
                 WordPiece::Text("$".to_owned())
             }
 
+        // The text between `${` and its closing brace: nested braces, quotes and escapes included.
+        rule bad_braced_text() =
+            ("{" bad_braced_text() "}" /
+             "\\" [_] /
+             "'" [^'\'']* "'" /
+             "\"" ("\\" [_] / [^'"'])* "\"" /
+             [^'{' | '}' | '\\' | '\'' | '"'])*
+
         rule parameter_expression() -> ParameterExpr =
+            // `${#?}`, `${#-}`, `${##}` and `${#@}` are the lengths of those special parameters.
+            "#" parameter:special_length_parameter() &"}" {
+                ParameterExpr::ParameterLength { parameter, indirect: false }
+            } /
             indirect:parameter_indirection() parameter:parameter() test_type:parameter_test_type() "-" default_value:parameter_expression_word()? {
                 ParameterExpr::UseDefaultValues { parameter, indirect, test_type, default_value }
             } /
@@ -1156,7 +1331,8 @@ peg::parser! {
             "!" variable_name:variable_name() "[@]" {
                 ParameterExpr::MemberKeys { variable_name: variable_name.to_owned(), concatenate: false }
             } /
-            indirect:parameter_indirection() parameter:parameter() ":" offset:substring_offset() length:(":" l:substring_length() { l })? {
+            // `${v:}`, with nothing after the colon, is a bad substitution.
+            indirect:parameter_indirection() parameter:parameter() ":" !"}" offset:substring_offset() length:(":" l:substring_length() { l })? {
                 ParameterExpr::Substring { parameter, indirect, offset, length }
             } /
             indirect:parameter_indirection() parameter:parameter() "@" op:non_posix_parameter_transformation_op() {
@@ -1191,10 +1367,19 @@ peg::parser! {
             } /
             indirect:parameter_indirection() parameter:parameter() "," pattern:parameter_expression_word()? {
                 ParameterExpr::LowercaseFirstChar { parameter, indirect, pattern }
+            } /
+            indirect:parameter_indirection() parameter:parameter() "~~" pattern:parameter_expression_word()? {
+                ParameterExpr::ToggleCasePattern { parameter, indirect, pattern }
+            } /
+            indirect:parameter_indirection() parameter:parameter() "~" pattern:parameter_expression_word()? {
+                ParameterExpr::ToggleCaseFirstChar { parameter, indirect, pattern }
             }
 
+        // A `!` names what follows as the variable to expand indirectly only when a name, a
+        // digit or one of `#?@*` follows it, as in bash; otherwise it is the special parameter
+        // `$!` (`${!}`, `${!-word}`, `${!:+word}`).
         rule parameter_indirection() -> bool =
-            non_posix_extensions_enabled() "!" { true } /
+            non_posix_extensions_enabled() "!" &['a'..='z' | 'A'..='Z' | '_' | '0'..='9' | '#' | '?' | '@' | '*'] { true } /
             { false }
 
         rule non_posix_parameter_transformation_op() -> ParameterTransformOp =
@@ -1231,6 +1416,12 @@ peg::parser! {
         rule unbraced_positional_parameter() -> u32 =
             n:$(['1'..='9']) {? n.parse().or(Err("u32")) }
 
+        rule special_length_parameter() -> Parameter =
+            "?" { Parameter::Special(SpecialParameter::LastExitStatus) } /
+            "-" { Parameter::Special(SpecialParameter::CurrentOptionFlags) } /
+            "#" { Parameter::Special(SpecialParameter::PositionalParameterCount) } /
+            "@" { Parameter::Special(SpecialParameter::AllPositionalParameters { concatenate: false }) }
+
         rule special_parameter() -> SpecialParameter =
             "@" { SpecialParameter::AllPositionalParameters { concatenate: false } } /
             "*" { SpecialParameter::AllPositionalParameters { concatenate: true } } /
@@ -1246,26 +1437,71 @@ peg::parser! {
 
         pub(crate) rule command_substitution() -> WordPiece =
             "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
-            "`" c:backquoted_command() "`" { WordPiece::BackquotedCommandSubstitution(c) }
+            "`" c:backquoted_command(false) "`" { WordPiece::BackquotedCommandSubstitution(c) }
+
+        // Inside double quotes, a backslash in backquotes also escapes a double quote.
+        rule double_quoted_command_substitution() -> WordPiece =
+            "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
+            "`" c:backquoted_command(true) "`" { WordPiece::BackquotedCommandSubstitution(c) }
 
         pub(crate) rule command() -> &'input str =
             $(command_piece()*)
 
+        // Text runs stop at blanks and separators, so each word of the command is a piece of its
+        // own and a `case` command is seen where it starts.
         pub(crate) rule command_piece() -> () =
-            word_piece(<[')']>, true /*in_command*/) {} /
-            ([' ' | '\t'])+ {} /
+            case_command() {} /
+            word_piece(<command_piece_stop()>, true /*in_command*/) {} /
+            ([' ' | '\t' | '\n' | ';' | '&' | '|'])+ {} /
             ['\'' | '`'] {}
 
-        rule backquoted_command() -> String =
-            chars:(backquoted_char()*) { chars.into_iter().collect() }
+        rule command_piece_stop() -> () = [')' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
 
-        rule backquoted_char() -> &'input str =
+        // A case command, whose patterns end in `)`, taken whole through its `esac` (bash reads
+        // a substitution as a command).
+        rule case_command() =
+            "case" &keyword_end() (!("esac" keyword_end()) case_command_piece())* "esac" &keyword_end()
+
+        rule case_command_piece() =
+            case_command() /
+            word_piece(<case_command_stop()>, true /*in_command*/) {} /
+            [_] {}
+
+        rule case_command_stop() -> () = [')' | '(' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
+
+        rule keyword_end() = [' ' | '\t' | '\n' | ';' | ')' | '&' | '|'] / ![_]
+
+        // A piece of the command in `${ command; }`, which ends at a `}` that closes no brace
+        // group or brace expression of its own.
+        rule funsub_piece() =
+            case_command() /
+            "{" (!"}" funsub_piece())* "}" {} /
+            word_piece(<funsub_stop()>, true /*in_command*/) {} /
+            [' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')'] {}
+
+        rule funsub_stop() -> () = ['{' | '}' | ' ' | '\t' | '\n' | ';' | '&' | '|'] {}
+
+        // As in bash, a backslash in backquotes escapes only `$`, a backquote and a backslash
+        // (and, inside double quotes, a double quote); the command is the text left.
+        rule backquoted_command(in_double_quotes: bool) -> String =
+            chars:(backquoted_char(in_double_quotes)*) { chars.into_iter().collect() }
+
+        rule backquoted_char(in_double_quotes: bool) -> &'input str =
             "\\`" { "`" } /
-            "\\\\" { "\\\\" } /
+            "\\\\" { "\\" } /
+            "\\$" { "$" } /
+            is_true(in_double_quotes) "\\\"" { "\"" } /
             s:$([^'`']) { s }
 
         rule arithmetic_expansion() -> WordPiece =
-            "$((" e:$(arithmetic_word(<"))">)) "))" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
+            text:$("$((" arithmetic_word(<"))">) "))") {
+                let e = text.get(3..text.len() - 2).unwrap_or_default();
+                if comment_hides_close(e) {
+                    WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text: text.to_owned(), transform: false })
+                } else {
+                    WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() })
+                }
+            }
 
         rule legacy_arithmetic_expansion() -> WordPiece =
             "$[" e:$(arithmetic_word(<"]">)) "]" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
@@ -1370,6 +1606,154 @@ mod tests {
             input: word,
             result: parsed,
         })
+    }
+
+    #[test]
+    fn parse_case_command_in_substitution() -> Result<()> {
+        for (word, command, rest) in [
+            (
+                "$(case a in a) echo m;; (b|c) echo n;; esac)x",
+                "case a in a) echo m;; (b|c) echo n;; esac",
+                "x",
+            ),
+            (
+                "$(echo 1; case x in x) case y in y) echo z;; esac;; esac; echo e)",
+                "echo 1; case x in x) case y in y) echo z;; esac;; esac; echo e",
+                "",
+            ),
+            ("$(echo mycase in a) b", "echo mycase in a", " b"),
+        ] {
+            let parsed = super::parse(word, &ParserOptions::default())?;
+            assert_matches!(
+                &parsed[0].piece,
+                WordPiece::CommandSubstitution(c) if c == command,
+                "{word}"
+            );
+            let tail: String = parsed[1..]
+                .iter()
+                .map(|p| match &p.piece {
+                    WordPiece::Text(t) => t.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(tail, rest, "{word}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn parse_special_bang_toggles_and_bad_substitutions() -> Result<()> {
+        let expr = |word: &str| -> Result<ParameterExpr> {
+            let parsed = super::parse(word, &ParserOptions::default())?;
+            match parsed.into_iter().next().map(|p| p.piece) {
+                Some(WordPiece::ParameterExpansion(expr)) => Ok(expr),
+                other => Err(anyhow::anyhow!("{word}: {other:?}")),
+            }
+        };
+        let bang = Parameter::Special(SpecialParameter::LastBackgroundProcessId);
+        // `!` is `$!` unless a name or one of `#?@*` follows it.
+        assert_matches!(expr("${!}")?, ParameterExpr::Parameter { parameter, indirect: false } if parameter == bang);
+        assert_matches!(expr("${!-x}")?, ParameterExpr::UseDefaultValues { parameter, indirect: false, .. } if parameter == bang);
+        assert_matches!(expr("${!:+x}")?, ParameterExpr::UseAlternativeValue { parameter, indirect: false, .. } if parameter == bang);
+        assert_matches!(expr("${#!}")?, ParameterExpr::ParameterLength { parameter, .. } if parameter == bang);
+        assert_matches!(
+            expr("${!v}")?,
+            ParameterExpr::Parameter { indirect: true, .. }
+        );
+        assert_matches!(
+            expr("${!#}")?,
+            ParameterExpr::Parameter { indirect: true, .. }
+        );
+        assert_matches!(expr("${v~}")?, ParameterExpr::ToggleCaseFirstChar { .. });
+        assert_matches!(
+            expr("${v~~[ab]}")?,
+            ParameterExpr::ToggleCasePattern {
+                pattern: Some(_),
+                ..
+            }
+        );
+        for bad in [
+            "${v:}", "${}", "${1a}", "${v w}", "${a[}", "${#v:-x}", "${${v}}",
+        ] {
+            assert_matches!(expr(bad)?, ParameterExpr::BadSubstitution { text, transform: false } if text == bad);
+        }
+        assert_matches!(
+            expr("${v@Z}")?,
+            ParameterExpr::BadSubstitution {
+                transform: true,
+                ..
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_comment_hiding_arithmetic_close() -> Result<()> {
+        let first = |word: &str| -> Result<WordPiece> {
+            Ok(super::parse(word, &ParserOptions::default())?
+                .into_iter()
+                .next()
+                .map(|p| p.piece)
+                .ok_or_else(|| anyhow::anyhow!("no pieces"))?)
+        };
+        // A `#` after a blank starts a comment that hides the `))` on its line.
+        for word in ["$((1 # c))", "$((1 #c))", "$(( (1) # c ))", "$((1\\ #c))"] {
+            assert_matches!(
+                first(word)?,
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text, .. }) if text == word
+            );
+        }
+        // Not after a blank, quoted, escaped or ended by a newline, it is text for the evaluator.
+        for word in [
+            "$(( 2#101 ))",
+            "$((#))",
+            "$((1+#2))",
+            "$(( '#' ))",
+            "$((1 \\# c))",
+            "$(( 1 # c\n))",
+        ] {
+            assert_matches!(first(word)?, WordPiece::ArithmeticExpression(_), "{word}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_process_substitutions_in_words() -> Result<()> {
+        let pieces = |word: &str| -> Result<Vec<WordPiece>> {
+            Ok(super::parse(word, &ParserOptions::default())?
+                .into_iter()
+                .map(|p| p.piece)
+                .collect())
+        };
+        let read = ast::ProcessSubstitutionKind::Read;
+        let write = ast::ProcessSubstitutionKind::Write;
+        assert_eq!(
+            pieces("--f=<(echo \"a)\"; case x in x) :;; esac)z")?,
+            [
+                WordPiece::Text("--f=".into()),
+                WordPiece::ProcessSubstitution(read, "echo \"a)\"; case x in x) :;; esac".into()),
+                WordPiece::Text("z".into()),
+            ]
+        );
+        assert_eq!(
+            pieces(">(cat)<(b)")?,
+            [
+                WordPiece::ProcessSubstitution(write, "cat".into()),
+                WordPiece::ProcessSubstitution(ast::ProcessSubstitutionKind::Read, "b".into()),
+            ]
+        );
+        // Quoted or escaped, or not followed by `(`, `<` and `>` are text.
+        assert_eq!(pieces("a<b")?, [WordPiece::Text("a<b".into())]);
+        assert_matches!(
+            pieces("\"<(x)\"")?.as_slice(),
+            [WordPiece::DoubleQuotedSequence(_)]
+        );
+        assert_matches!(
+            pieces("\\<(x)")?.as_slice(),
+            [WordPiece::EscapeSequence(_), WordPiece::Text(_)]
+        );
+        Ok(())
     }
 
     #[test]

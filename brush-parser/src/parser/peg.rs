@@ -109,13 +109,38 @@ peg::parser! {
             non_posix_extensions_enabled() c:extended_test_command() { ast::CompoundCommand::ExtendedTest(c) } /
             expected!("compound command")
 
+        // Bash keeps the text between `((` and `))` as written, blanks and all.
         pub(crate) rule arithmetic_command() -> ast::ArithmeticCommand =
-            start:specific_operator("(") specific_operator("(") expr:arithmetic_expression() specific_operator(")") end:specific_operator(")") {
+            start:double_open_paren() expr:arithmetic_expression() close:specific_operator(")") end:specific_operator(")")
+            text:text_between(start, close) {
                 let loc = SourceSpan::within(
                     start.location(),
                     end.location()
                 );
-                ast::ArithmeticCommand { expr, loc }
+                // `start` is the first of two adjacent `(`. Without the source, blanks around the
+                // expression become one space each.
+                let value = text
+                    .and_then(|t| t.get(1..).map(str::to_owned))
+                    .unwrap_or_else(|| if expr.value.is_empty() { expr.value } else { std::format!(" {} ", expr.value) });
+                ast::ArithmeticCommand { expr: ast::UnexpandedArithmeticExpr { value }, loc }
+            }
+
+        // The source text after the token `from` and before the token `to`, when the source is
+        // known.
+        rule text_between(from: &'input Token, to: &'input Token) -> Option<String> =
+            #{|input, pos| peg::RuleResult::Matched(pos, input.text_between(from, to))}
+
+        rule source_known() -> bool =
+            #{|input, pos| peg::RuleResult::Matched(pos, input.source.is_some())}
+
+        // `((` with nothing between the parentheses; `( (` opens two subshells, as in bash.
+        rule double_open_paren() -> &'input Token =
+            start:specific_operator("(") second:specific_operator("(") {?
+                if second.location().start.index == start.location().end.index {
+                    Ok(start)
+                } else {
+                    Err("((")
+                }
             }
 
         pub(crate) rule arithmetic_expression() -> ast::UnexpandedArithmeticExpr =
@@ -162,7 +187,7 @@ peg::parser! {
             }
 
         rule for_clause() -> ast::ForClauseCommand =
-            s:specific_word("for") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:do_group() {
+            s:specific_word("for") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
                 let start = s.location();
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
@@ -173,15 +198,25 @@ peg::parser! {
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
                 ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            } /
+            s:specific_word("for") n:name() sequential_sep() d:brace_body() {
+                let start = s.location();
+                let end = &d.loc;
+                let loc = SourceSpan::within(start, end);
+                ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
             }
 
         // N.B. select is a non-sh extension; its grammar is the for loop's.
         rule select_clause() -> ast::SelectClauseCommand =
-            s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:do_group() {
+            s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
                 let loc = SourceSpan::within(s.location(), &d.loc);
                 ast::SelectClauseCommand { variable_name: n.to_owned(), values: w, body: d, loc }
             } /
             s:specific_word("select") n:name() sequential_sep()? d:do_group() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            } /
+            s:specific_word("select") n:name() sequential_sep() d:brace_body() {
                 let loc = SourceSpan::within(s.location(), &d.loc);
                 ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
             }
@@ -191,7 +226,7 @@ peg::parser! {
             s:specific_word("for")
             specific_operator("(") specific_operator("(")
                 clauses:arithmetic_for_clauses()
-            specific_operator(")") specific_operator(")")
+            specific_operator(")")
             body:arithmetic_for_body() {
                 let (initializer, condition, updater) = clauses;
                 let start = s.location();
@@ -206,15 +241,29 @@ peg::parser! {
             Option<ast::UnexpandedArithmeticExpr>,
             Option<ast::UnexpandedArithmeticExpr>,
         ) =
-            initializer:arithmetic_expression()? specific_operator(";")
-                condition:arithmetic_expression()? specific_operator(";")
-                updater:arithmetic_expression()? { (initializer, condition, updater) } /
-            initializer:arithmetic_expression()? specific_operator(";;")
-                updater:arithmetic_expression()? { (initializer, None, updater) }
+            initializer:arithmetic_for_expression(";")
+                condition:arithmetic_for_expression(";")
+                updater:arithmetic_for_expression(")") { (Some(initializer), Some(condition), Some(updater)) } /
+            initializer:arithmetic_for_expression(";;")
+                updater:arithmetic_for_expression(")") {
+                    let condition = ast::UnexpandedArithmeticExpr { value: "1".to_owned() };
+                    (Some(initializer), Some(condition), Some(updater))
+                }
+
+        // An arithmetic `for` expression and the operator after it (the updater's is the first
+        // `)` of `))`). Bash keeps the blanks after the expression but not those before it, and
+        // takes an empty one as `1`.
+        rule arithmetic_for_expression(end: &'static str) -> ast::UnexpandedArithmeticExpr =
+            known:source_known() text:$(arithmetic_expression() specific_operator(end)) {
+                let value = text.strip_suffix(end).unwrap_or(&text);
+                let value = if known { value } else { value.trim_end() };
+                let value = if value.trim().is_empty() { "1" } else { value };
+                ast::UnexpandedArithmeticExpr { value: value.to_owned() }
+            }
 
         rule arithmetic_for_body() -> ast::DoGroupCommand =
             sequential_sep()? body:do_group() { body } /
-            body:brace_group() { ast::DoGroupCommand { list: body.list, loc: body.loc } }
+            sequential_sep()? body:brace_body() { body }
 
         rule extended_test_command() -> ast::ExtendedTestExprCommand =
             s:specific_word("[[") linebreak() expr:extended_test_expression() e:specific_word("]]") {
@@ -488,6 +537,15 @@ peg::parser! {
                 let loc = SourceSpan::within(start.location(), end.location());
                 ast::BraceGroupCommand { list, loc }
             }
+
+        // A for or select loop's body after its separator: `do ... done`, or, as bash also takes,
+        // `{ ... }`.
+        rule for_body() -> ast::DoGroupCommand =
+            do_group() /
+            brace_body()
+
+        rule brace_body() -> ast::DoGroupCommand =
+            b:brace_group() { ast::DoGroupCommand { list: b.list, loc: b.loc } }
 
         rule do_group() -> ast::DoGroupCommand =
             start:specific_word("do") list:compound_list() end:specific_word("done") {
@@ -796,6 +854,19 @@ fn locations_are_contiguous(loc_left: &crate::SourceSpan, loc_right: &crate::Sou
     loc_left.end.index == loc_right.start.index
 }
 
+impl Tokens<'_> {
+    /// The source text from character `from` to character `to`, when the source is known.
+    fn source_text(&self, from: usize, to: usize) -> Option<String> {
+        let source = self.source?;
+        (from <= to).then(|| source.chars().skip(from).take(to - from).collect())
+    }
+
+    /// The source text after the token `from` and before the token `to`.
+    fn text_between(&self, from: &Token, to: &Token) -> Option<String> {
+        self.source_text(from.location().end.index, to.location().start.index)
+    }
+}
+
 impl peg::Parse for Tokens<'_> {
     type PositionRepr = usize;
 
@@ -844,6 +915,18 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
     /// false and no space is inserted — a safe degradation to the previous
     /// behavior, which also omitted spaces between non-word tokens.
     fn parse_slice(&'a self, start: usize, end: usize) -> Self::Slice {
+        // With the source known, the text is as written.
+        if let (Some(first), Some(last)) = (
+            self.tokens.get(start),
+            end.checked_sub(1).and_then(|e| self.tokens.get(e)),
+        ) {
+            if let Some(text) =
+                self.source_text(first.location().start.index, last.location().end.index)
+            {
+                return text;
+            }
+        }
+
         let mut result = String::new();
         let mut prev_end_index: Option<usize> = None;
 

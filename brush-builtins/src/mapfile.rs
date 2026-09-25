@@ -137,7 +137,7 @@ impl MapFileCommand {
         mut input_file: brush_core::openfiles::OpenFile,
     ) -> Result<variables::ArrayLiteral, brush_core::Error> {
         let _term_mode = setup_terminal_settings(&input_file)?;
-        // Only a terminal sends Ctrl+C and Ctrl+D as keys; elsewhere they are data.
+        // Ctrl+C and Ctrl+D are keys only on a terminal; other input holds them as characters.
         let terminal = input_file.is_terminal();
 
         let mut entries = vec![];
@@ -145,7 +145,10 @@ impl MapFileCommand {
         let max_count = self.max_count.try_into()?;
         let delimiter = match &self.delimiter {
             Some(d) if d.is_empty() => b'\0',
-            Some(d) => d.as_bytes().first().copied().unwrap_or(b'\n'),
+            Some(d) => brush_core::rawbytes::encode(d)
+                .first()
+                .copied()
+                .unwrap_or(b'\n'),
             None => b'\n',
         };
 
@@ -195,7 +198,8 @@ impl MapFileCommand {
                 line.truncate(nul);
             }
 
-            let line_str = String::from_utf8_lossy(&line).to_string();
+            // Bytes that are not UTF-8 are kept (see `rawbytes`).
+            let line_str = brush_core::rawbytes::decode_vec(line);
 
             entries.push((None, line_str));
         }

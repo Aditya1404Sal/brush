@@ -145,7 +145,7 @@ peg::parser! {
             &[_] {? if enable_extended_globbing { Ok(()) } else { Err("extglob disabled") } }
 
         pub(crate) rule extended_glob_pattern() -> String =
-            kind:extended_glob_prefix() "(" branches:extended_glob_body() ")" {
+            kind:extended_glob_prefix() "(" body_nullable:&(n:(nullable_pieces() ** "|") { n.into_iter().any(|n| n) }) branches:extended_glob_body() ")" {
                 let mut s = String::new();
 
                 // fancy_regex uses ?! to indicate a negative lookahead.
@@ -155,7 +155,12 @@ peg::parser! {
                         s.push_str(&branches.join("|"));
                         s.push_str(").*|(?>");
                         s.push_str(&branches.join("|"));
-                        s.push_str(").+?|)");
+                        s.push_str(").+?");
+                        // The empty string, unless the inner pattern matches it (`!(*)`).
+                        if !body_nullable {
+                            s.push('|');
+                        }
+                        s.push(')');
                     } else {
                         s.push_str("(?:.+)");
                     }
@@ -193,6 +198,28 @@ peg::parser! {
             &['|' | ')'] { String::new() } /
             pieces:(!['|' | ')'] piece:pattern_piece() { piece })+ {
                 pieces.join("")
+            }
+
+        // Whether the pieces of a pattern, up to the `|` or `)` that ends an extglob branch, can
+        // match the empty string.
+        rule nullable_pieces() -> bool =
+            n:(!['|' | ')'] n:nullable_piece() { n })* { n.into_iter().all(|n| n) }
+
+        rule nullable_piece() -> bool =
+            escape_sequence() { false } /
+            bracket_expression() { false } /
+            extglob_enabled() n:nullable_extended_glob() { n } /
+            "*" { true } /
+            [_] { false }
+
+        rule nullable_extended_glob() -> bool =
+            kind:extended_glob_prefix() "(" n:(nullable_pieces() ** "|") ")" {
+                let any = n.into_iter().any(|n| n);
+                match kind {
+                    ExtendedGlobKind::Star | ExtendedGlobKind::Question => true,
+                    ExtendedGlobKind::At | ExtendedGlobKind::Plus => any,
+                    ExtendedGlobKind::Exclamation => !any,
+                }
             }
 
         // A glob metacharacter construct: wildcard, bracket expression, or extglob.
@@ -246,6 +273,21 @@ pub const fn regex_char_needs_escaping(c: char) -> bool {
 mod tests {
     use super::*;
     use anyhow::Result;
+
+    #[test]
+    fn test_negated_extglob_matches_empty_only_when_inner_cannot() -> Result<()> {
+        // `!(*)` matches nothing, not even the empty string; `!(a)` matches it.
+        assert_eq!(
+            pattern_to_regex_str("!(*)", true)?,
+            "(?:(?!.*).*|(?>.*).+?)"
+        );
+        assert_eq!(pattern_to_regex_str("!(a)", true)?, "(?:(?!a).*|(?>a).+?|)");
+        assert_eq!(
+            pattern_to_regex_str("!(x|*(y))", true)?,
+            "(?:(?!x|(y)*).*|(?>x|(y)*).+?)"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_bracket_exprs() -> Result<()> {

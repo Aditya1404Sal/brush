@@ -33,7 +33,7 @@ ParseResult(
                                   seq: [
                                     Compound(Arithmetic(ArithmeticCommand(
                                       expr: UnexpandedArithmeticExpr(
-                                        value: "0",
+                                        value: " 0 ",
                                       ),
                                       loc: "[location]",
                                     )), None),
