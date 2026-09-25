@@ -277,6 +277,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             history: None,
             processes: crate::process_table::ProcessTable::default(),
             own_pid: None,
+            shell_pid: None,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
         }

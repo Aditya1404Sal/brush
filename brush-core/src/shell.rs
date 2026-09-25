@@ -181,6 +181,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     own_pid: Option<crate::process_table::Pid>,
 
+    /// `$$` of a shell started as a new process (`bash -c`); `None` keeps the session's.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    shell_pid: Option<crate::process_table::Pid>,
+
     /// Registered processes for the stages of this background job's pipeline, in stage order.
     #[cfg(target_arch = "wasm32")]
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -232,6 +236,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             depth: self.depth + 1,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
+            shell_pid: self.shell_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
         }
@@ -259,6 +264,18 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Marks this shell clone as running as numbered process `pid`.
     pub const fn set_own_pid(&mut self, pid: crate::process_table::Pid) {
         self.own_pid = Some(pid);
+    }
+
+    /// Makes `pid` this shell's `$$`, as for a new shell process (`bash -c`); its subshells keep
+    /// it.
+    pub const fn set_shell_pid(&mut self, pid: crate::process_table::Pid) {
+        self.shell_pid = Some(pid);
+    }
+
+    /// This shell's `$$`: the session's shell number, or its own if it was started as a new
+    /// shell process.
+    pub fn shell_pid(&self) -> crate::process_table::Pid {
+        self.shell_pid.unwrap_or_else(|| self.processes.shell_pid())
     }
 
     /// Hands this background job the registered processes of its pipeline's stages.
@@ -593,7 +610,7 @@ pub struct SavedCommandStatus {
 impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns the number of the logical process this shell runs as (`$$` for the main shell).
     pub fn own_pid(&self) -> crate::process_table::Pid {
-        self.own_pid.unwrap_or_else(|| self.processes.shell_pid())
+        self.own_pid.unwrap_or_else(|| self.shell_pid())
     }
 
     /// Returns whether or not this shell is a subshell.

@@ -699,12 +699,8 @@ async fn spawn_pipeline_processes(
         {
             if !run_in_current_shell {
                 let stage_process = shell.take_stage_process();
-                let mut stage_shell = shell.clone();
-                if let Some(stage_process) = &stage_process {
-                    stage_shell.set_own_pid(stage_process.pid());
-                }
                 let join_handle =
-                    spawn_pipeline_stage(stage_shell, command.clone(), cmd_params, stage_process);
+                    spawn_pipeline_stage(shell.clone(), command.clone(), cmd_params, stage_process);
                 stage_tasks.0.push(join_handle.abort_handle());
                 spawn_results.push_back(ExecutionSpawnResult::StartedTask(join_handle));
                 continue;
@@ -796,6 +792,21 @@ impl Drop for StageTasks {
     }
 }
 
+/// Registers a new numbered process for `subshell`, a copy of the shell about to run as a
+/// subshell, and makes it the subshell's `$BASHPID`. It inherits the running process's
+/// dispositions (caught handlers reset) and the subshell's own PIPE disposition.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn subshell_process(
+    subshell: &mut Shell<impl extensions::ShellExtensions>,
+) -> crate::execution::process::NumberedProcess {
+    use crate::execution::process;
+    let table = subshell.processes().clone();
+    let pid = table.allocate(subshell.own_pid(), String::new());
+    subshell.set_own_pid(pid);
+    let dispositions = process::inherited_dispositions(subshell.traps().pipe_disposition());
+    process::NumberedProcess::register(&table, pid, dispositions)
+}
+
 /// Runs one pipeline stage as its own task on `wasm32`, in a copy of the shell (as a subshell).
 ///
 /// Stages share one thread and hand control to each other at the yield points in the in-memory
@@ -809,12 +820,19 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
     params: ExecutionParameters,
     numbered: Option<crate::execution::process::NumberedProcess>,
 ) -> crate::execution::CommandTask {
-    use crate::execution::process;
     let services = shell.execution_services();
     shell.traps_mut().reset_pipe_for_subshell();
     // A stage is a subshell: it runs only an EXIT trap it sets itself, when it ends.
     shell.traps_mut().reset_exit_for_subshell();
-    let disposition = shell.traps().pipe_disposition();
+    // It is a process of its own, with its own `$BASHPID`: a background pipeline registered its
+    // stages already.
+    let numbered = match numbered {
+        Some(numbered) => {
+            shell.set_own_pid(numbered.pid());
+            numbered
+        }
+        None => subshell_process(&mut shell),
+    };
     services.spawn(async move {
         let completed = std::cell::Cell::new(false);
         let body = async {
@@ -838,10 +856,7 @@ fn spawn_pipeline_stage<SE: extensions::ShellExtensions>(
                 ..ExecutionResult::from(result.exit_code)
             })
         };
-        let result = match numbered {
-            Some(numbered) => numbered.run(body).await,
-            None => process::run_process(disposition, body).await,
-        };
+        let result = numbered.run(body).await;
         if !completed.get() {
             shell.exit_trap_after_signal(&result, &params).await;
         }
@@ -995,8 +1010,9 @@ impl Execute for ast::CompoundCommand {
                 subshell.loop_depth = 0;
                 // Nor does it list the jobs around it, as a pipeline stage does.
                 subshell.jobs_mut().jobs.clear();
+                // It is a process of its own, with its own `$BASHPID`.
                 #[cfg(target_arch = "wasm32")]
-                let disposition = subshell.traps().pipe_disposition();
+                let numbered_subshell = subshell_process(&mut subshell);
                 #[cfg(target_arch = "wasm32")]
                 let completed = std::cell::Cell::new(false);
                 let body = async {
@@ -1010,7 +1026,7 @@ impl Execute for ast::CompoundCommand {
                 // Handle errors within the subshell context to prevent fatal errors
                 // from propagating to the parent shell.
                 #[cfg(target_arch = "wasm32")]
-                let execution = crate::execution::process::run_process(disposition, body).await;
+                let execution = numbered_subshell.run(body).await;
                 #[cfg(not(target_arch = "wasm32"))]
                 let execution = body.await;
                 // A signal ended the subshell before its commands finished.

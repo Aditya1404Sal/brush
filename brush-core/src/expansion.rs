@@ -2202,7 +2202,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::SpecialParameter::ProcessId => {
                 // WASM has no host process id; `$$` is the session's synthetic shell number.
                 #[cfg(target_arch = "wasm32")]
-                return Expansion::from(self.shell.processes().shell_pid().to_string());
+                return Expansion::from(self.shell.shell_pid().to_string());
                 #[cfg(not(target_arch = "wasm32"))]
                 Expansion::from(std::process::id().to_string())
             }

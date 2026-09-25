@@ -1023,18 +1023,20 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
         let mut output_str = String::new();
-        let disposition = subshell.traps().pipe_disposition();
+        // It is a process of its own, with its own `$BASHPID`.
+        let numbered = interp::subshell_process(&mut subshell);
         // The substitution's output ends when the subshell, its EXIT trap and every job still
         // holding its output are done.
         let command = async move {
             let completed = std::cell::Cell::new(false);
-            let result = crate::execution::process::run_process(disposition, async {
-                let result = run_wasm_substitution_command(&mut subshell, &mut params, s).await;
-                let result = subshell.exit_with_trap_in(result, &params).await;
-                completed.set(true);
-                result
-            })
-            .await;
+            let result = numbered
+                .run(async {
+                    let result = run_wasm_substitution_command(&mut subshell, &mut params, s).await;
+                    let result = subshell.exit_with_trap_in(result, &params).await;
+                    completed.set(true);
+                    result
+                })
+                .await;
             if !completed.get() {
                 subshell.exit_trap_after_signal(&result, &params).await;
             }
