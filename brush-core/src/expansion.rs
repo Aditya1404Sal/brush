@@ -2225,6 +2225,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 };
                 let kind = if transform {
                     error::ErrorKind::CheckedExpansionError(format!("{context}: bad substitution"))
+                } else if text.starts_with("$((") {
+                    // A comment hid the closing `))` (`$((1 # c))`); bash quotes the word.
+                    error::ErrorKind::BadSubstitution(format!(
+                        "bad substitution: no closing `)' in {}",
+                        self.outer_word.as_deref().unwrap_or(&text)
+                    ))
                 } else if unclosed_subscript {
                     error::ErrorKind::BadSubstitution(format!(
                         "bad substitution: no closing `}}' in {}",

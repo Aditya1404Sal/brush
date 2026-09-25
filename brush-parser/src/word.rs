@@ -644,6 +644,36 @@ fn cacheable_parse(
     Ok(pieces)
 }
 
+/// Whether bash, reading `$((expr))` as a command substitution to find where it ends, takes a
+/// `#` in `expr` for a comment that runs past the closing `))` (`$((1 # c))`): a `#` after a
+/// blank or a newline, outside quotes and not escaped, with no newline after it.
+fn comment_hides_close(expr: &str) -> bool {
+    let mut previous = '(';
+    let mut quote = None;
+    let mut in_comment = false;
+    let mut chars = expr.chars();
+    while let Some(mut c) = chars.next() {
+        if in_comment {
+            in_comment = c != '\n';
+        } else if c == '\\' && quote != Some('\'') {
+            // The escaped character is the one before whatever follows.
+            c = chars.next().unwrap_or(c);
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => quote = Some(c),
+                '#' if matches!(previous, ' ' | '\t' | '\n') => in_comment = true,
+                _ => (),
+            }
+        }
+        previous = c;
+    }
+    in_comment
+}
+
 /// Parse a heredoc body, treating `"` and `'` as literal characters.
 ///
 /// # Arguments
@@ -1464,7 +1494,14 @@ peg::parser! {
             s:$([^'`']) { s }
 
         rule arithmetic_expansion() -> WordPiece =
-            "$((" e:$(arithmetic_word(<"))">)) "))" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
+            text:$("$((" arithmetic_word(<"))">) "))") {
+                let e = text.get(3..text.len() - 2).unwrap_or_default();
+                if comment_hides_close(e) {
+                    WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text: text.to_owned(), transform: false })
+                } else {
+                    WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() })
+                }
+            }
 
         rule legacy_arithmetic_expansion() -> WordPiece =
             "$[" e:$(arithmetic_word(<"]">)) "]" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
@@ -1648,6 +1685,36 @@ mod tests {
                 ..
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_comment_hiding_arithmetic_close() -> Result<()> {
+        let first = |word: &str| -> Result<WordPiece> {
+            Ok(super::parse(word, &ParserOptions::default())?
+                .into_iter()
+                .next()
+                .map(|p| p.piece)
+                .ok_or_else(|| anyhow::anyhow!("no pieces"))?)
+        };
+        // A `#` after a blank starts a comment that hides the `))` on its line.
+        for word in ["$((1 # c))", "$((1 #c))", "$(( (1) # c ))", "$((1\\ #c))"] {
+            assert_matches!(
+                first(word)?,
+                WordPiece::ParameterExpansion(ParameterExpr::BadSubstitution { text, .. }) if text == word
+            );
+        }
+        // Not after a blank, quoted, escaped or ended by a newline, it is text for the evaluator.
+        for word in [
+            "$(( 2#101 ))",
+            "$((#))",
+            "$((1+#2))",
+            "$(( '#' ))",
+            "$((1 \\# c))",
+            "$(( 1 # c\n))",
+        ] {
+            assert_matches!(first(word)?, WordPiece::ArithmeticExpression(_), "{word}");
+        }
         Ok(())
     }
 
