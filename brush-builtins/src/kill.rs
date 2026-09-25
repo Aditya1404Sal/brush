@@ -100,7 +100,11 @@ impl builtins::Command for KillCommand {
             print_signals(&context, self.args.as_ref())
         } else {
             if targets.is_empty() {
-                context.report("usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]")?;
+                // Bash prints its usage line without the diagnostic prefix.
+                writeln!(
+                    context.stderr(),
+                    "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"
+                )?;
                 return Ok(ExecutionExitCode::InvalidUsage.into());
             }
 
@@ -192,14 +196,23 @@ fn signal_target<SE: brush_core::ShellExtensions>(
             process::signal_process_group(&table, leader, number);
         }
     } else {
-        let pid: brush_core::process_table::Pid = brush_core::int_utils::parse(target, 10)?;
+        let Ok(pid) = brush_core::int_utils::parse::<brush_core::process_table::Pid>(target, 10)
+        else {
+            let prefix = shell.diagnostic_prefix();
+            writeln!(
+                stderr,
+                "{prefix}{command_name}: `{target}': not a pid or valid job spec"
+            )?;
+            return Ok(Some(ExecutionResult::general_error()));
+        };
         let delivered = if probe_only {
             process::process_exists(&table, pid)
         } else {
             process::signal_process(&table, pid, number)
         };
         if !delivered {
-            writeln!(stderr, "{command_name}: ({pid}) - No such process")?;
+            let prefix = shell.diagnostic_prefix();
+            writeln!(stderr, "{prefix}{command_name}: ({pid}) - No such process")?;
             return Ok(Some(ExecutionResult::general_error()));
         }
     }

@@ -74,8 +74,14 @@ impl builtins::Command for WaitCommand {
                     // It's a process ID: a synthetic job number on WASM.
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let pid: brush_core::process_table::Pid =
-                            brush_core::int_utils::parse(id.as_str(), 10)?;
+                        let Ok(pid) = brush_core::int_utils::parse::<brush_core::process_table::Pid>(
+                            id.as_str(),
+                            10,
+                        ) else {
+                            context.report(format_args!("`{id}': not a pid or valid job spec"))?;
+                            result = ExecutionExitCode::GeneralError.into();
+                            continue;
+                        };
                         let job = context
                             .shell
                             .jobs_mut()
