@@ -15,6 +15,43 @@ pub(crate) async fn expand_prompt(
     params: &ExecutionParameters,
     spec: &str,
 ) -> Result<String, error::Error> {
+    // A prompt whose expansion expands a prompt (`x='${x@P}'`) nests like code does: one the
+    // stack cannot hold ends the shell rather than trapping (bash itself overflows its stack).
+    #[cfg(target_arch = "wasm32")]
+    {
+        if shell.nesting >= crate::shell::MAX_NESTING
+            || crate::sys::wasm::stack::remaining() < crate::shell::STACK_RESERVE
+        {
+            return Err(error::Error::from(error::ErrorKind::NestingTooDeep).into_fatal());
+        }
+        shell.nesting += 1;
+        let mut frame = crate::shell::FrameGuard::new(shell, leave_prompt, None);
+        let result = expand_prompt_text(frame.shell(), params, spec).await;
+        frame.finish()?;
+        result
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    expand_prompt_text(shell, params, spec).await
+}
+
+/// Leaves a prompt expansion entered by [`expand_prompt`].
+#[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "a frame guard's cleanup is fallible"
+)]
+const fn leave_prompt(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+) -> Result<(), error::Error> {
+    shell.nesting = shell.nesting.saturating_sub(1);
+    Ok(())
+}
+
+async fn expand_prompt_text(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    spec: &str,
+) -> Result<String, error::Error> {
     // Parse the prompt spec into its pieces.
     let prompt_pieces = parse_prompt(spec)?;
 
