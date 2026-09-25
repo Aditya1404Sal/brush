@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::io::Write;
 
 use brush_core::{ExecutionExitCode, ExecutionResult, builtins, error};
 
@@ -52,86 +51,151 @@ impl builtins::Command for WaitCommand {
         if self.wait_for_terminate {
             return error::unimp("wait -f");
         }
-        if self.wait_for_first_or_next {
-            // Report exactly one finished job per call, oldest first, so simultaneous
-            // completions are not lost between successive `wait -n` calls.
-            #[cfg(target_arch = "wasm32")]
-            loop {
-                let jobs = &mut context.shell.jobs_mut().jobs;
-                if jobs.is_empty() {
-                    return Ok(ExecutionExitCode::from(127).into());
-                }
-                for index in 0..jobs.len() {
-                    if let Some(result) = jobs[index].poll_done()? {
-                        jobs.remove(index);
-                        return result;
-                    }
-                }
-                if let Some(signal) = brush_core::execution::process::pending_trapped_signal() {
-                    return Ok(ExecutionExitCode::from(128 + signal).into());
-                }
-                (context.shell.execution_services().yield_now)().await;
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            return error::unimp("wait -n");
-        }
         if self.variable_to_receive_id.is_some() {
             return error::unimp("wait -p");
         }
-
-        let mut result = ExecutionResult::success();
-
-        if !self.ids.is_empty() {
-            for id in &self.ids {
-                if id.starts_with('%') {
-                    // It's a job spec.
-                    if let Some(job) = context.shell.jobs_mut().resolve_job_spec(id) {
-                        match interruptible(job.wait()).await? {
-                            Ok(status) => result = status,
-                            Err(interrupted) => return Ok(interrupted),
-                        }
-                    } else {
-                        context.report(format_args!("{id}: no such job"))?;
-
-                        result = ExecutionExitCode::GeneralError.into();
-                    }
-                } else {
-                    // It's a process ID: a synthetic job number on WASM.
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let pid: brush_core::process_table::Pid =
-                            brush_core::int_utils::parse(id.as_str(), 10)?;
-                        // `disown` takes a job out of the table, but it is still a child to wait for.
-                        let job = context.shell.jobs_mut().job_with_pid_mut(pid);
-                        if let Some(job) = job {
-                            match interruptible(job.wait()).await? {
-                                Ok(status) => result = status,
-                                Err(interrupted) => return Ok(interrupted),
-                            }
-                        } else {
-                            context
-                                .report(format_args!("pid {pid} is not a child of this shell"))?;
-                            result = ExecutionExitCode::from(127).into();
-                        }
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    return error::unimp("wait with process IDs");
-                }
-            }
-        } else {
-            // Wait for all jobs.
-            let jobs = match interruptible(context.shell.jobs_mut().wait_all()).await? {
-                Ok(jobs) => jobs,
-                Err(interrupted) => return Ok(interrupted),
-            };
-
-            if context.shell.options().enable_job_control {
-                for job in jobs {
-                    writeln!(context.stdout(), "{job}")?;
-                }
-            }
+        if self.wait_for_first_or_next {
+            #[cfg(target_arch = "wasm32")]
+            return wait_next(context, &self.ids).await;
+            #[cfg(not(target_arch = "wasm32"))]
+            return error::unimp("wait -n");
         }
 
+        if self.ids.is_empty() {
+            // Wait for every job of this shell; as in bash, their statuses are not kept.
+            let serials: Vec<u64> = context
+                .shell
+                .jobs()
+                .jobs
+                .iter()
+                .filter(|job| !job.is_listing_copy())
+                .map(|job| job.serial)
+                .collect();
+            for serial in serials {
+                let jobs = context.shell.jobs_mut();
+                let Some(job) = jobs.jobs.iter_mut().find(|job| job.serial == serial) else {
+                    continue;
+                };
+                match interruptible(job.wait()).await? {
+                    Ok(_) => jobs.remove_finished(serial, None),
+                    Err(interrupted) => return Ok(interrupted),
+                }
+            }
+            return Ok(ExecutionResult::success());
+        }
+
+        let mut result = ExecutionResult::success();
+        for id in &self.ids {
+            let jobs = context.shell.jobs_mut();
+            let job = if id.starts_with('%') {
+                match jobs.find_job_spec(id) {
+                    Ok(job) => job,
+                    Err(brush_core::jobs::JobSpecError::Ambiguous) => {
+                        let name = id.trim_start_matches(['%', '?']);
+                        context.report(format_args!("{name}: ambiguous job spec"))?;
+                        result = ExecutionExitCode::from(127).into();
+                        continue;
+                    }
+                    Err(brush_core::jobs::JobSpecError::NoSuchJob) => {
+                        context.report(format_args!("{id}: no such job"))?;
+                        result = ExecutionExitCode::from(127).into();
+                        continue;
+                    }
+                }
+            } else {
+                // A process ID: a synthetic process number on WASM.
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let Ok(pid) = id.parse::<brush_core::process_table::Pid>() else {
+                        context.report(format_args!("`{id}': not a pid or valid job spec"))?;
+                        result = ExecutionResult::general_error();
+                        continue;
+                    };
+                    // `disown` takes a job out of the table, but it is still a child to wait for.
+                    match jobs.job_with_pid_mut(pid) {
+                        Some(job) => job,
+                        None => {
+                            // A job reaped earlier still has its status, as in bash.
+                            if let Some(status) = jobs.reaped_status(pid) {
+                                result = status;
+                            } else {
+                                context.report(format_args!(
+                                    "pid {pid} is not a child of this shell"
+                                ))?;
+                                result = ExecutionExitCode::from(127).into();
+                            }
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                return error::unimp("wait with process IDs");
+            };
+            let serial = job.serial;
+            match interruptible(job.wait()).await? {
+                Ok(status) => {
+                    context.shell.jobs_mut().mark_reaped(serial, &status);
+                    result = status;
+                }
+                Err(interrupted) => return Ok(interrupted),
+            }
+        }
         Ok(result)
+    }
+}
+
+/// `wait -n`: waits for the next of this shell's jobs to finish, among those `ids` name if any,
+/// and returns its status; 127 if there is none to wait for.
+#[cfg(target_arch = "wasm32")]
+async fn wait_next(
+    context: brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    ids: &[String],
+) -> Result<ExecutionResult, brush_core::Error> {
+    let mut wanted = Vec::new();
+    for id in ids {
+        let jobs = context.shell.jobs_mut();
+        let job = if id.starts_with('%') {
+            jobs.find_job_spec(id).ok()
+        } else {
+            id.parse::<brush_core::process_table::Pid>()
+                .ok()
+                .and_then(|pid| jobs.job_with_pid_mut(pid))
+        };
+        match job {
+            Some(job) => wanted.push(job.serial),
+            None => context.report(format_args!("`{id}': not a pid or valid job spec"))?,
+        }
+    }
+    if !ids.is_empty() && wanted.is_empty() {
+        return Ok(ExecutionExitCode::from(127).into());
+    }
+    // Report exactly one finished job per call, oldest first, so simultaneous completions are not
+    // lost between successive `wait -n` calls.
+    loop {
+        let jobs = context.shell.jobs_mut();
+        let candidates: Vec<u64> = jobs
+            .jobs
+            .iter()
+            .filter(|job| !job.is_listing_copy() && !job.is_reaped())
+            .filter(|job| wanted.is_empty() || wanted.contains(&job.serial))
+            .map(|job| job.serial)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(ExecutionExitCode::from(127).into());
+        }
+        for serial in candidates {
+            let Some(job) = jobs.jobs.iter_mut().find(|job| job.serial == serial) else {
+                continue;
+            };
+            if let Some(result) = job.poll_done()? {
+                let status = result?;
+                jobs.remove_finished(serial, Some(&status));
+                return Ok(status);
+            }
+        }
+        if let Some(signal) = brush_core::execution::process::pending_trapped_signal() {
+            return Ok(ExecutionExitCode::from(128 + signal).into());
+        }
+        (context.shell.execution_services().yield_now)().await;
     }
 }

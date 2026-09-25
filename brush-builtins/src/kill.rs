@@ -178,11 +178,17 @@ fn signal_target<SE: brush_core::ShellExtensions>(
         .and_then(|number| u8::try_from(number).ok())
         .unwrap_or(process::signals::TERM);
     if target.starts_with('%') {
-        let leader = shell
-            .jobs_mut()
-            .resolve_job_spec(target)
-            .and_then(|job| job.leader())
-            .filter(|pid| process::process_exists(&table, *pid));
+        let leader = match shell.jobs_mut().find_job_spec(target) {
+            Ok(job) => job.leader(),
+            Err(brush_core::jobs::JobSpecError::Ambiguous) => {
+                let prefix = shell.diagnostic_prefix();
+                let name = target.trim_start_matches(['%', '?']);
+                writeln!(stderr, "{prefix}{command_name}: {name}: ambiguous job spec")?;
+                return Ok(Some(ExecutionResult::general_error()));
+            }
+            Err(brush_core::jobs::JobSpecError::NoSuchJob) => None,
+        }
+        .filter(|pid| process::process_exists(&table, *pid));
         let Some(leader) = leader else {
             let prefix = shell.diagnostic_prefix();
             writeln!(stderr, "{prefix}{command_name}: {target}: no such job")?;

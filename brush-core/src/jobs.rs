@@ -24,7 +24,22 @@ pub struct JobManager {
     /// Jobs `disown` took out of the table: they keep running, but `jobs` no longer lists them
     /// and `wait` no longer waits for them.
     disowned: Vec<Job>,
+    /// Final statuses of reaped jobs by their process numbers, oldest first: `wait PID` still
+    /// finds one after its job has left the table, as with bash's saved statuses.
+    reaped: VecDeque<(sys::process::ProcessId, u8, Option<u8>)>,
 }
+
+/// Why a job specification names no job.
+#[derive(Debug)]
+pub enum JobSpecError {
+    /// No job matches.
+    NoSuchJob,
+    /// More than one job's command matches a `%name` or `%?text` prefix.
+    Ambiguous,
+}
+
+/// How many reaped jobs' statuses a shell remembers.
+const REAPED_KEPT: usize = 1024;
 
 /// Represents a task that is part of a job.
 pub enum JobTask {
@@ -94,6 +109,9 @@ impl JobTask {
     }
 }
 
+/// Numbers every job ever added, so a job can be found again after its table changed.
+static NEXT_JOB_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Most background jobs one session keeps running at once, however deeply they are nested.
 pub const MAX_RUNNING_JOBS: usize = 256;
 
@@ -114,6 +132,7 @@ impl JobManager {
         reason = "push() guarantees the vector length is >= 1"
     )]
     pub fn add_as_current(&mut self, mut job: Job) -> &Job {
+        self.clean_up_reaped();
         // The current job becomes the previous one, and the previous one loses its mark.
         for j in &mut self.jobs {
             j.annotation = match j.annotation {
@@ -126,6 +145,7 @@ impl JobManager {
         // order (kill %1 while job 2 lives → the next job would also get id 2).
         let id = self.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
         job.id = id;
+        job.serial = NEXT_JOB_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         job.annotation = JobAnnotation::Current;
         self.jobs.push(job);
 
@@ -167,7 +187,84 @@ impl JobManager {
         Self {
             jobs: self.jobs.iter().map(Job::listing_copy).collect(),
             disowned: Vec::new(),
+            reaped: VecDeque::new(),
         }
+    }
+
+    /// Marks a job `wait` has waited for as reaped, remembering its final status for its process
+    /// numbers. As in bash, it stays in the table (so `wait %N` finds it again) until the table
+    /// is next cleaned up: when a new job starts or `jobs` runs.
+    pub fn mark_reaped(&mut self, serial: u64, status: &ExecutionResult) {
+        let Some(job) = self
+            .jobs
+            .iter_mut()
+            .chain(self.disowned.iter_mut())
+            .find(|job| job.serial == serial)
+        else {
+            return;
+        };
+        job.reaped = true;
+        let pids: Vec<_> = job.pids.iter().chain(job.leader.iter()).copied().collect();
+        self.remember(&pids, status);
+    }
+
+    /// Takes a finished job out of the table, as `wait -n` and `wait` without operands do; the
+    /// status is remembered only when `remember` is set.
+    pub fn remove_finished(&mut self, serial: u64, status: Option<&ExecutionResult>) {
+        let removed = if let Some(index) = self.jobs.iter().position(|job| job.serial == serial) {
+            Some(self.remove_listed(index))
+        } else {
+            self.disowned
+                .iter()
+                .position(|job| job.serial == serial)
+                .map(|index| self.disowned.remove(index))
+        };
+        if let (Some(job), Some(status)) = (removed, status) {
+            let pids: Vec<_> = job.pids.iter().chain(job.leader.iter()).copied().collect();
+            self.remember(&pids, status);
+        }
+    }
+
+    /// Drops the jobs already reaped by `wait` from the table.
+    fn clean_up_reaped(&mut self) {
+        while let Some(index) = self.jobs.iter().position(|job| job.reaped) {
+            self.remove_listed(index);
+        }
+        self.disowned.retain(|job| !job.reaped);
+    }
+
+    /// Removes a listed job; the previous job becomes current if it was.
+    fn remove_listed(&mut self, index: usize) -> Job {
+        let job = self.jobs.remove(index);
+        if matches!(job.annotation, JobAnnotation::Current)
+            && let Some(previous) = self.prev_job_mut()
+        {
+            previous.annotation = JobAnnotation::Current;
+        }
+        job
+    }
+
+    fn remember(&mut self, pids: &[sys::process::ProcessId], status: &ExecutionResult) {
+        for pid in pids {
+            self.reaped.retain(|(reaped, _, _)| reaped != pid);
+            self.reaped
+                .push_back((*pid, u8::from(status.exit_code), status.terminating_signal));
+        }
+        while self.reaped.len() > REAPED_KEPT {
+            self.reaped.pop_front();
+        }
+    }
+
+    /// The final status of a job reaped earlier, by one of its process numbers.
+    pub fn reaped_status(&self, pid: sys::process::ProcessId) -> Option<ExecutionResult> {
+        self.reaped
+            .iter()
+            .rev()
+            .find(|(reaped, _, _)| *reaped == pid)
+            .map(|(_, code, signal)| ExecutionResult {
+                terminating_signal: *signal,
+                ..ExecutionResult::new(*code)
+            })
     }
 
     /// Takes the job with this id out of the table, as `disown` does; returns whether there was
@@ -191,11 +288,13 @@ impl JobManager {
         &self.disowned
     }
 
-    /// The job, listed or disowned, one of whose process numbers is `pid`.
+    /// The job of this shell, listed or disowned, one of whose process numbers is `pid`. A
+    /// subshell's copies of its parent's jobs are not its own.
     pub fn job_with_pid_mut(&mut self, pid: crate::process_table::Pid) -> Option<&mut Job> {
         self.jobs
             .iter_mut()
             .chain(self.disowned.iter_mut())
+            .filter(|job| !job.listing_only)
             .find(|job| job.pids.contains(&pid) || job.leader == Some(pid))
     }
 
@@ -205,20 +304,43 @@ impl JobManager {
     ///
     /// * `job_spec` - The job specification to resolve.
     pub fn resolve_job_spec(&mut self, job_spec: &str) -> Option<&mut Job> {
-        let remainder = job_spec.strip_prefix('%')?;
+        self.find_job_spec(job_spec).ok()
+    }
 
+    /// Resolves a job specification to one of this shell's own jobs: `%N`, `%%`, `%+`, `%-`,
+    /// `%name` (a command starting with `name`) or `%?text` (a command containing `text`). A
+    /// subshell's copies of its parent's jobs are listed by `jobs` but are not its own.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_spec` - The job specification to resolve.
+    pub fn find_job_spec(&mut self, job_spec: &str) -> Result<&mut Job, JobSpecError> {
+        let remainder = job_spec.strip_prefix('%').ok_or(JobSpecError::NoSuchJob)?;
+        let own = |job: &&mut Job| !job.listing_only;
         match remainder {
-            "%" | "+" => self.current_job_mut(),
-            "-" => self.prev_job_mut(),
+            "" | "%" | "+" => self.current_job_mut().filter(|job| !job.listing_only),
+            "-" => self.prev_job_mut().filter(|job| !job.listing_only),
             s if s.chars().all(char::is_numeric) => {
-                let id = s.parse::<usize>().ok()?;
-                self.jobs.iter_mut().find(|j| j.id == id)
+                let id = s.parse::<usize>().map_err(|_| JobSpecError::NoSuchJob)?;
+                self.jobs.iter_mut().filter(own).find(|j| j.id == id)
             }
-            _ => {
-                tracing::warn!(target: trace_categories::UNIMPLEMENTED, "unimplemented: job spec naming command: '{job_spec}'");
-                None
+            s => {
+                let matches = |job: &Job| match s.strip_prefix('?') {
+                    Some(text) => job.command_line.contains(text),
+                    None => job.command_line.starts_with(s),
+                };
+                let count = self
+                    .jobs
+                    .iter()
+                    .filter(|job| !job.listing_only && matches(job))
+                    .count();
+                if count > 1 {
+                    return Err(JobSpecError::Ambiguous);
+                }
+                self.jobs.iter_mut().filter(own).find(|job| matches(job))
             }
         }
+        .ok_or(JobSpecError::NoSuchJob)
     }
 
     /// Waits for all managed jobs to complete.
@@ -232,12 +354,17 @@ impl JobManager {
 
     /// Polls all managed jobs for completion.
     pub fn poll(&mut self) -> Result<Vec<JobResult>, error::Error> {
+        self.clean_up_reaped();
         let mut results = Vec::with_capacity(self.jobs.len());
 
         let mut i = 0;
         while i != self.jobs.len() {
             if let Some(result) = self.jobs[i].poll_done()? {
                 let job = self.jobs.remove(i);
+                if let Ok(status) = &result {
+                    let pids: Vec<_> = job.pids.iter().chain(job.leader.iter()).copied().collect();
+                    self.remember(&pids, status);
+                }
                 results.push((job, result));
             } else if matches!(self.jobs[i].state, JobState::Done) {
                 // TODO(jobs): This is a workaround to remove jobs that are done but for which we
@@ -326,6 +453,15 @@ pub struct Job {
     /// The shell-internal ID of the job.
     pub id: usize,
 
+    /// Identifies this job for as long as it exists, unlike `id`, which a later job can reuse.
+    pub serial: u64,
+
+    /// `wait` has waited for this job; it leaves the table at the next cleanup.
+    reaped: bool,
+
+    /// How the job ended, once it has: its status and the signal that ended it, if one did.
+    final_status: Option<(u8, Option<u8>)>,
+
     /// The command line of the job.
     pub command_line: String,
 
@@ -371,6 +507,9 @@ impl Job {
     {
         Self {
             id: 0,
+            serial: 0,
+            reaped: false,
+            final_status: None,
             tasks: tasks.into_iter().collect(),
             pgid: None,
             annotation: JobAnnotation::None,
@@ -397,6 +536,9 @@ impl Job {
             pgid: self.pgid,
             annotation: self.annotation.clone(),
             id: self.id,
+            serial: self.serial,
+            reaped: self.reaped,
+            final_status: self.final_status,
             command_line: self.command_line.clone(),
             state: self.state.clone(),
             leader: self.leader,
@@ -423,6 +565,17 @@ impl Job {
         job.leader = Some(leader);
         job.pids = pids;
         job
+    }
+
+    /// Whether this is a subshell's copy of its parent's job: `jobs` lists it, but it is not
+    /// this shell's to wait for or signal.
+    pub const fn is_listing_copy(&self) -> bool {
+        self.listing_only
+    }
+
+    /// Whether `wait` has already waited for this job.
+    pub const fn is_reaped(&self) -> bool {
+        self.reaped
     }
 
     /// The numbered process running this job, if it has one.
@@ -495,12 +648,33 @@ impl Job {
         tracing::debug!(target: trace_categories::JOBS, "Job {} has completed.", self.id);
 
         self.state = JobState::Done;
+        if let Some(Ok(result)) = &result {
+            self.record_final_status(result);
+        }
 
         Ok(result)
     }
 
+    /// How the job ended, once it has.
+    pub fn final_status(&self) -> Option<ExecutionResult> {
+        self.final_status.map(|(code, signal)| ExecutionResult {
+            terminating_signal: signal,
+            ..ExecutionResult::new(code)
+        })
+    }
+
+    fn record_final_status(&mut self, result: &ExecutionResult) {
+        self.final_status = Some((u8::from(result.exit_code), result.terminating_signal));
+    }
+
     /// Waits for the job to complete.
     pub async fn wait(&mut self) -> Result<ExecutionResult, error::Error> {
+        // Waiting again for a finished job gives the same status.
+        if self.tasks.is_empty()
+            && let Some(status) = self.final_status()
+        {
+            return Ok(status);
+        }
         let mut result = ExecutionResult::success();
 
         while let Some(task) = self.tasks.back_mut() {
@@ -517,6 +691,7 @@ impl Job {
         }
 
         self.state = JobState::Done;
+        self.record_final_status(&result);
 
         Ok(result)
     }
