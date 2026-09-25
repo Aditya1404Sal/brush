@@ -104,6 +104,11 @@ impl builtins::Command for MapFileCommand {
             None => variables::ArrayLiteral(vec![]),
         };
 
+        // Bash looks the array up once, and a circular name reference warns.
+        context
+            .shell
+            .warn_circular_nameref(&context.params, &self.array_var_name, 1, false);
+
         if let Some(origin) = origin {
             // -O: preserve existing array, assign at offset.
             for (elem_idx, (_key, value)) in results.0.into_iter().enumerate() {

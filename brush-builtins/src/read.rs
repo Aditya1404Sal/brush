@@ -177,6 +177,20 @@ impl builtins::Command for ReadCommand {
             ReadResult::InputReady => (None, brush_core::ExecutionResult::success()),
         };
 
+        // A circular name reference warns as bash's lookups of it do: an array once, a variable
+        // as it is bound.
+        if let Some(array) = self.array_variable.as_deref() {
+            context
+                .shell
+                .warn_circular_nameref(&context.params, array, 1, false);
+        } else {
+            for name in &self.variable_names {
+                context
+                    .shell
+                    .warn_circular_nameref(&context.params, name, 0, true);
+            }
+        }
+
         // Assign input to variables based on options. A name that is not a variable is reported
         // where bash reaches it, after the names before it are assigned.
         if let Some(invalid) = assign_input_to_variables(

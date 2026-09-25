@@ -267,6 +267,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             stage_subshell: false,
             no_fork: crate::interp::NoFork::default(),
             exec_last: None,
+            nameref_warnings: None,
             no_fork_call: false,
             name: None,
             args: std::sync::Arc::default(),

@@ -356,7 +356,10 @@ fn update_variables<SE: brush_core::ShellExtensions>(
     variable_name: &str,
     result: GetOptsResult,
 ) -> Result<ExecutionResult, brush_core::Error> {
-    // Update variable value.
+    // Update variable value. A circular name reference warns as bash binds it.
+    context
+        .shell
+        .warn_circular_nameref(&context.params, variable_name, 0, true);
     context.shell.env_mut().update_or_add(
         variable_name,
         variables::ShellValueLiteral::Scalar(result.variable_value),

@@ -105,8 +105,13 @@ impl ExportCommand {
                     }
                 }
                 // Try to find the variable already present; if we find it, then mark it
-                // exported.
-                else if let Some((_, variable)) = context.shell.env_mut().get_mut(s) {
+                // exported. Bash looks the name up once; a circular name reference warns.
+                else if let Some((_, variable)) = {
+                    context
+                        .shell
+                        .warn_circular_nameref(&context.params, s, 1, false);
+                    context.shell.env_mut().get_mut(s)
+                } {
                     if self.unexport {
                         variable.unexport();
                     } else {

@@ -166,6 +166,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) exec_last: Option<crate::interp::CommandString>,
 
+    /// The warnings a circular name reference gets from an arithmetic expression being evaluated
+    /// (see [`Self::note_circular_nameref`]), held until the expression is done; `None` when no
+    /// evaluation collects them.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) nameref_warnings: Option<String>,
+
     /// Whether the function about to be called runs its last command without forking, as the
     /// call itself would have been (see [`crate::interp::NoFork`]).
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -333,6 +339,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             stage_subshell: self.stage_subshell,
             no_fork: self.no_fork,
             exec_last: None,
+            nameref_warnings: None,
             no_fork_call: false,
             processes: self.processes.clone(),
             own_pid: self.own_pid,

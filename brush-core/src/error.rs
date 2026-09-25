@@ -219,6 +219,10 @@ pub enum ErrorKind {
     #[error("{0}: invalid variable name")]
     InvalidVariableName(String),
 
+    /// `${!ref}` of a name reference that cannot be followed (`local -n v=v`).
+    #[error("{0}: invalid indirect expansion")]
+    InvalidIndirectExpansion(String),
+
     /// An error occurred while creating a child process.
     #[error("failed to create child process")]
     ChildCreationFailure,
@@ -530,6 +534,7 @@ impl Error {
                 self.kind,
                 ErrorKind::NoMatch(_)
                     | ErrorKind::InvalidVariableName(_)
+                    | ErrorKind::InvalidIndirectExpansion(_)
                     | ErrorKind::BadArrayElement(_)
             )
     }

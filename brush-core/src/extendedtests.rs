@@ -272,7 +272,11 @@ pub(crate) fn apply_unary_predicate_to_str(
                 Ok(false)
             }
         }
-        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(variable_is_set(shell, operand)),
+        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => {
+            // Bash looks the name up once, and a circular name reference warns.
+            shell.warn_circular_nameref(params, operand, 1, false);
+            Ok(variable_is_set(shell, operand))
+        }
         ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get_raw(operand) {
             Some((_, reffed)) => Ok(reffed.value().is_set() && reffed.is_treated_as_nameref()),
             None => Ok(false),

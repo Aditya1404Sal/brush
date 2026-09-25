@@ -327,8 +327,38 @@ impl DeclareCommand {
         }
 
         // Extract the variable name and the initial value being assigned (if any).
-        let (name, assigned_index, initial_value, name_is_array, append) =
+        let (mut name, assigned_index, initial_value, name_is_array, append) =
             Self::declaration_to_name_and_value(declaration)?;
+
+        // `local r=value` for a name reference already local here declares the variable it
+        // refers to (`local -n r=x; local r=2` makes a local `x`), as bash does; one that comes
+        // back to itself takes the value as the name it should refer to, which is refused.
+        if create_var_local
+            && self.make_nameref.to_bool().is_none()
+            && assigned_index.is_none()
+            && context
+                .shell
+                .env()
+                .get_using_policy_raw(&name, EnvironmentLookup::OnlyInCurrentLocal)
+                .is_some_and(ShellVariable::is_treated_as_nameref)
+            && let Some(value) = &initial_value
+        {
+            if context.shell.env().circular_nameref(&name).is_some() {
+                context
+                    .shell
+                    .warn_circular_nameref(&context.params, &name, 2, false);
+                if let ShellValueLiteral::Scalar(value) = value {
+                    context.report(format_args!(
+                        "`{value}': invalid variable name for name reference"
+                    ))?;
+                }
+                return Ok(false);
+            }
+            let target = context.shell.env().resolve_nameref(&name).into_owned();
+            if env::valid_variable_name(&target) {
+                name = target;
+            }
+        }
 
         // `readonly` takes names, not array elements, as in bash.
         if let (DeclareVerb::Readonly, Some(index)) = (verb, &assigned_index) {
@@ -499,6 +529,19 @@ impl DeclareCommand {
                 .is_some_and(ShellVariable::is_readonly)
         {
             return Err(ErrorKind::ReadonlyVariable.into());
+        }
+
+        // Bash looks a name given no value up once for `readonly` and twice for `declare -x`; a
+        // circular name reference warns at each.
+        if initial_value.is_none() {
+            let lookups = match verb {
+                DeclareVerb::Readonly => 1,
+                _ if self.make_exported.to_bool() == Some(true) => 2,
+                _ => 0,
+            };
+            context
+                .shell
+                .warn_circular_nameref(&context.params, &name, lookups, false);
         }
 
         // Look up the variable.

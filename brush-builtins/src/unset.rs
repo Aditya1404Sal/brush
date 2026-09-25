@@ -68,6 +68,13 @@ impl builtins::Command for UnsetCommand {
                         brush_parser::word::Parameter::Positional(_)
                         | brush_parser::word::Parameter::Special(_) => continue,
                         brush_parser::word::Parameter::Named(name) => {
+                            // Bash looks the name up twice; a circular name reference warns.
+                            context.shell.warn_circular_nameref(
+                                &context.params,
+                                name.as_str(),
+                                2,
+                                false,
+                            );
                             let outcome = context.shell.env_mut().unset(name.as_str());
                             (name, outcome.map(|unset| unset.is_some()))
                         }

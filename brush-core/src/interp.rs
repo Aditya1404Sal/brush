@@ -1876,11 +1876,14 @@ impl Execute for ast::ForClauseCommand {
             }
 
             // Update the variable. A nameref control variable is pointed at each word in turn
-            // rather than assigned through, as bash does.
+            // rather than assigned through, as bash does; a circular one (`local -n v=v`) cannot
+            // be followed, so the word is assigned to the global variable, with bash's warning.
+            shell.warn_circular_nameref(params, &self.variable_name, 0, true);
             let nameref = shell
                 .env()
                 .get_raw(&self.variable_name)
-                .is_some_and(|(_, var)| var.is_treated_as_nameref());
+                .is_some_and(|(_, var)| var.is_treated_as_nameref())
+                && shell.env().circular_nameref(&self.variable_name).is_none();
             if nameref {
                 if let Some(var) = shell
                     .env_mut()
@@ -2003,6 +2006,7 @@ impl Execute for ast::SelectClauseCommand {
                 .and_then(|choice| values.get(choice.checked_sub(1)?))
                 .cloned()
                 .unwrap_or_default();
+            shell.warn_circular_nameref(params, &self.variable_name, 0, true);
             shell.env_mut().update_or_add(
                 &self.variable_name,
                 ShellValueLiteral::Scalar(chosen),

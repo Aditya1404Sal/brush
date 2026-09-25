@@ -156,8 +156,25 @@ async fn eval_expanded(
     }
 
     // Now evaluate.
-    expr.eval(shell)
+    eval_reporting(&expr, shell, params)
         .map_err(|error| EvalError::in_expression(&expanded_self, error))
+}
+
+/// Evaluates a parsed expression, writing the warnings a circular name reference gets from it
+/// (see `Shell::note_circular_nameref`) to the standard error of `params`.
+pub fn eval_reporting(
+    expr: &ast::ArithmeticExpr,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Result<i64, EvalError> {
+    let outer = shell.nameref_warnings.replace(String::new());
+    let result = expr.eval(shell);
+    let warnings = std::mem::replace(&mut shell.nameref_warnings, outer).unwrap_or_default();
+    if !warnings.is_empty() {
+        use std::io::Write as _;
+        let _ = params.stderr(shell).write_all(warnings.as_bytes());
+    }
+    result
 }
 
 /// How deeply an expression may nest (see `syntax::nesting`): the parser and the evaluator
@@ -390,6 +407,11 @@ fn deref_lvalue(
     lvalue: &ast::ArithmeticTarget,
     depth: u32,
 ) -> Result<i64, EvalError> {
+    // Bash looks a variable up once to read it, an element twice.
+    match lvalue {
+        ast::ArithmeticTarget::Variable(name) => shell.note_circular_nameref(name, 1, false),
+        ast::ArithmeticTarget::ArrayElement(name, _) => shell.note_circular_nameref(name, 2, false),
+    }
     let value_str: Cow<'_, str> = match lvalue {
         ast::ArithmeticTarget::Variable(name) => get_var_value(shell, name.as_str())?,
         ast::ArithmeticTarget::ArrayElement(name, index) => {
@@ -583,6 +605,11 @@ fn assign(
     value: i64,
     depth: u32,
 ) -> Result<i64, EvalError> {
+    // Bash looks a variable up once and binds it to assign it (an element: three lookups).
+    match lvalue {
+        ast::ArithmeticTarget::Variable(name) => shell.note_circular_nameref(name, 1, true),
+        ast::ArithmeticTarget::ArrayElement(name, _) => shell.note_circular_nameref(name, 3, false),
+    }
     match lvalue {
         ast::ArithmeticTarget::Variable(name) => {
             shell
