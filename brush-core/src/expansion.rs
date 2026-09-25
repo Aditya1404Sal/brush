@@ -2346,8 +2346,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         value: String,
     ) -> Result<brush_parser::word::Parameter, error::Error> {
         // As in bash, this abandons the top-level command (see `Error::abandons_command`).
-        brush_parser::word::parse_parameter(value.as_str(), &self.parser_options)
-            .map_err(|_| error::ErrorKind::InvalidVariableName(value).into())
+        brush_parser::word::parse_parameter(value.as_str(), &self.parser_options).map_err(|error| {
+            match error {
+                brush_parser::WordParseError::NestedTooDeeply => error.into(),
+                _ => error::ErrorKind::InvalidVariableName(value).into(),
+            }
+        })
     }
 
     async fn try_resolve_parameter_to_variable(

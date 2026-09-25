@@ -98,6 +98,10 @@ pub enum WordParseError {
     /// An error occurred while parsing a word.
     #[error("failed to parse word '{0}'")]
     Word(String, ParseErrorLocation),
+
+    /// The text nests brackets or substitutions deeper than the word parser can hold.
+    #[error("maximum nesting level exceeded: deeper nesting is unsupported in bash-tool")]
+    NestedTooDeeply,
 }
 
 /// Represents an error that occurred while parsing a (non-extended) test command.

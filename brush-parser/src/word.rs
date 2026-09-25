@@ -622,7 +622,75 @@ pub fn parse(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    check_nesting(word, true)?;
     cacheable_parse(word, options)
+}
+
+/// How deeply text may nest brackets and substitutions for the word parser, which recurses once
+/// per level. A word built at run time (a subscript from a variable's value, text given to brace
+/// expansion) is not checked before it is parsed, so deeper text fails instead of exhausting the
+/// stack.
+const MAX_NESTING: usize = 128;
+
+/// Fails text nested deeper than [`MAX_NESTING`] (see [`nesting`]).
+fn check_nesting(text: &str, quotes: bool) -> Result<(), error::WordParseError> {
+    if nesting(text, quotes) > MAX_NESTING {
+        Err(error::WordParseError::NestedTooDeeply)
+    } else {
+        Ok(())
+    }
+}
+
+/// The deepest nesting of brackets and substitutions in `text`, found in one pass without
+/// recursing: `$(`, `${` and `$[` count everywhere, other brackets outside double quotes. With
+/// `quotes`, single-quoted text is skipped; otherwise (a here-document body) quotes are text.
+fn nesting(text: &str, quotes: bool) -> usize {
+    let bytes = text.as_bytes();
+    // The closing bracket each open level waits for; `"` marks double quotes, which do not nest.
+    let mut open: Vec<u8> = Vec::new();
+    let (mut depth, mut deepest) = (0_usize, 0_usize);
+    let mut index = 0;
+    while index < bytes.len() {
+        let quoted = open.last() == Some(&b'"');
+        match bytes[index] {
+            b'\\' => index += 1,
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{' | b'[')) => {
+                index += 1;
+                open.push(closing_bracket(bytes[index]));
+                depth += 1;
+            }
+            b'"' if quotes && quoted => {
+                open.pop();
+            }
+            b'"' if quotes => open.push(b'"'),
+            b'\'' if quotes && !quoted => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    index += 1;
+                }
+            }
+            byte @ (b'(' | b'{' | b'[') if !quoted => {
+                open.push(closing_bracket(byte));
+                depth += 1;
+            }
+            byte if byte != b'"' && open.last() == Some(&byte) => {
+                open.pop();
+                depth -= 1;
+            }
+            _ => {}
+        }
+        deepest = deepest.max(depth);
+        index += 1;
+    }
+    deepest
+}
+
+const fn closing_bracket(open: u8) -> u8 {
+    match open {
+        b'(' => b')',
+        b'{' => b'}',
+        _ => b']',
+    }
 }
 
 #[cached::macros::cached(
@@ -778,6 +846,7 @@ pub fn parse_heredoc(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    check_nesting(word, false)?;
     expansion_parser::unexpanded_heredoc_word(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
@@ -796,6 +865,7 @@ pub fn parse_arithmetic_text(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    check_nesting(word, false)?;
     expansion_parser::unexpanded_arithmetic_text(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
@@ -810,6 +880,7 @@ pub fn parse_parameter(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Parameter, error::WordParseError> {
+    check_nesting(word, true)?;
     expansion_parser::parameter(word, options)
         .map_err(|err| error::WordParseError::Parameter(word.to_owned(), err.into()))
 }
@@ -824,6 +895,7 @@ pub fn parse_brace_expansions(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Option<Vec<BraceExpressionOrText>>, error::WordParseError> {
+    check_nesting(word, true)?;
     expansion_parser::brace_expansions(word, options)
         .map_err(|err| error::WordParseError::BraceExpansion(word.to_owned(), err.into()))
 }
@@ -841,6 +913,7 @@ pub fn parse_scalar_assignment(
     word: &str,
     options: &ParserOptions,
 ) -> Result<ast::Assignment, error::WordParseError> {
+    check_nesting(word, true)?;
     expansion_parser::name_equals_scalar_value(word, options)
         .map_err(|err| error::WordParseError::Word(word.to_owned(), err.into()))
 }
@@ -860,6 +933,7 @@ pub fn parse_compound_assignment_value(
     value: &str,
     options: &ParserOptions,
 ) -> Option<Vec<(Option<ast::Word>, ast::Word)>> {
+    check_nesting(value, true).ok()?;
     let elements = crate::parser::parse_compound_assignment_value(value, options)?;
     parse_array_elements(elements.iter(), options).ok()
 }
@@ -876,6 +950,7 @@ pub(crate) fn parse_array_assignment(
     elements: &[&String],
     options: &ParserOptions,
 ) -> Result<ast::Assignment, &'static str> {
+    check_nesting(word, true).map_err(|_| "nested too deeply")?;
     let (assignment_name, append) =
         expansion_parser::name_equals(word, options).map_err(|_| "not array assignment word")?;
 
@@ -945,6 +1020,7 @@ fn parse_array_elements<'a>(
     elements
         .into_iter()
         .map(|element| {
+            check_nesting(element, true).map_err(|_| "nested too deeply")?;
             let (key, value) = expansion_parser::literal_array_element(element, options)
                 .map_err(|_| "invalid array element in literal")?;
             Ok((
@@ -1815,6 +1891,33 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn deep_nesting_fails_before_the_parser_recurses() {
+        assert_eq!(
+            super::nesting("a[(1+(2))] ${x:-$(y)} \"((\" '((('", true),
+            3
+        );
+        assert_eq!(super::nesting("'((('", false), 3);
+        assert_eq!(super::nesting(&"${a} (b) ".repeat(500), true), 1);
+        let deep = format!("a[{}1{}]", "(".repeat(10000), ")".repeat(10000));
+        assert!(matches!(
+            super::parse_parameter(&deep, &ParserOptions::default()),
+            Err(crate::error::WordParseError::NestedTooDeeply)
+        ));
+        let braces = format!("{{{}z{}}}", "a,{".repeat(3000), "}".repeat(3000));
+        assert!(matches!(
+            super::parse_brace_expansions(&braces, &ParserOptions::default()),
+            Err(crate::error::WordParseError::NestedTooDeeply)
+        ));
+        assert!(
+            super::parse(
+                &format!("${{a[{}]}}", "(".repeat(100) + &")".repeat(100)),
+                &ParserOptions::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
