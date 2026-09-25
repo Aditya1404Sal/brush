@@ -609,6 +609,34 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         self.next_token_until(None, false /* include space? */)
     }
 
+    /// Sets aside the here-documents pending on the current line while a nested construct
+    /// (`$(...)`, `$((...))`, `$[...]` or `${...}`) is tokenized.
+    ///
+    /// The construct's tokens belong to it, not to the tokens queued up after a pending here tag,
+    /// and the pending bodies start on the line after the one the construct ends on, as in bash.
+    /// A here-document opened inside the construct is tokenized there.
+    fn set_aside_pending_here_docs(&mut self) -> (HereState, Vec<HereTag>) {
+        (
+            std::mem::take(&mut self.cross_state.here_state),
+            std::mem::take(&mut self.cross_state.current_here_tags),
+        )
+    }
+
+    /// Restores here-documents set aside by `set_aside_pending_here_docs`, keeping any the
+    /// nested construct left pending after them.
+    fn restore_pending_here_docs(
+        &mut self,
+        (here_state, mut here_tags): (HereState, Vec<HereTag>),
+    ) {
+        if here_tags.is_empty() && matches!(here_state, HereState::None) {
+            return;
+        }
+
+        here_tags.append(&mut self.cross_state.current_here_tags);
+        self.cross_state.current_here_tags = here_tags;
+        self.cross_state.here_state = here_state;
+    }
+
     /// Consumes a nested construct (e.g., `$((...))` or `$[...]`), handling nested delimiters
     /// and here-documents.
     ///
@@ -945,7 +973,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                 self.cross_state.arithmetic_expansion = true;
                             }
 
+                            let pending = self.set_aside_pending_here_docs();
                             self.consume_nested_construct(&mut state, ')', "(", initial_nesting)?;
+                            self.restore_pending_here_docs(pending);
 
                             if is_arithmetic {
                                 self.cross_state.arithmetic_expansion = false;
@@ -963,7 +993,9 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                             // some text will be interpreted differently as a result.
                             self.cross_state.arithmetic_expansion = true;
 
+                            let pending = self.set_aside_pending_here_docs();
                             self.consume_nested_construct(&mut state, ']', "[", 1)?;
+                            self.restore_pending_here_docs(pending);
 
                             self.cross_state.arithmetic_expansion = false;
                         }
@@ -975,6 +1007,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                             // Consume the '{' and add it to the token.
                             state.append_char(self.next_char()?.unwrap());
 
+                            let pending = self.set_aside_pending_here_docs();
                             let mut pending_here_doc_tokens = vec![];
                             let mut drain_here_doc_tokens = false;
 
@@ -1038,6 +1071,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                                     _ => (),
                                 }
                             }
+                            self.restore_pending_here_docs(pending);
                         }
                         _ => {
                             // This is either a different character, or else the end of the string.
@@ -1571,6 +1605,54 @@ HERE2
 echo after
 "
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_expansions_after_here_doc_operator() -> Result<()> {
+        // Tokens after a here tag wait for the here-document's body, but the pieces of a nested
+        // construct are not tokens of that line: `${f}` stays whole instead of losing its `f`.
+        let strs = |input: &str| -> Result<Vec<String>> {
+            Ok(tokenize_str(input)?
+                .iter()
+                .map(|t| t.to_str().to_owned())
+                .collect())
+        };
+        assert_eq!(
+            strs("cat <<EOF > \"${f}\" $(echo x) $((1+2)) $[3]\nhello\nEOF\n")?,
+            [
+                "cat",
+                "<<",
+                "EOF",
+                "hello\n",
+                "EOF",
+                ">",
+                "\"${f}\"",
+                "$(echo x)",
+                "$((1+2))",
+                "$[3]",
+                "\n"
+            ]
+        );
+        // A substitution spanning lines ends before the pending body starts.
+        assert_eq!(
+            strs("cat <<EOF; x=$(\necho hi\n)\nbody\nEOF\n")?,
+            [
+                "cat",
+                "<<",
+                "EOF",
+                "body\n",
+                "EOF",
+                ";",
+                "x=$(\necho hi\n)",
+                "\n"
+            ]
+        );
+        // A here tag spelled with an expansion is the tag, literally.
+        assert_eq!(
+            strs("cat <<${x}\nbody\n${x}\n")?,
+            ["cat", "<<", "${x}", "body\n", "${x}", "\n"]
+        );
         Ok(())
     }
 
