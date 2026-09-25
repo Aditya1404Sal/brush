@@ -656,7 +656,9 @@ fn check_synchronous_input(file: &OpenFile) -> std::io::Result<()> {
 
 /// A bounded in-memory pipe for single-threaded WASM execution.
 /// Async views park on empty/full buffers and register wakeups under the state lock.
-/// Synchronous compatibility reports `WouldBlock`, never a premature EOF or capacity failure.
+/// A synchronous reader of an empty pipe gets `WouldBlock`, never a premature EOF. A synchronous
+/// writer (a builtin such as `declare -p` or `type`) cannot wait for the reader, so what it writes
+/// is kept past the capacity, up to [`super::MAX_SUBSTITUTION_BYTES`] in all.
 /// Last-writer closure delivers EOF after draining; last-reader closure wakes writers with
 /// `BrokenPipe`. The state machine is platform independent and tested on the host.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -769,13 +771,22 @@ mod mem_pipe {
                 }
                 return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
-            let n = data.len().min(inner.capacity - inner.buf.len());
+            let mut n = data
+                .len()
+                .min(inner.capacity.saturating_sub(inner.buf.len()));
             if n == 0 {
                 if let Some(waker) = waker {
                     inner.write_wakers.insert(self.1, waker.clone());
                     return Poll::Pending;
                 }
-                return Poll::Ready(Err(std::io::ErrorKind::WouldBlock.into()));
+                n = data
+                    .len()
+                    .min(super::MAX_SUBSTITUTION_BYTES.saturating_sub(inner.buf.len()));
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "synchronous output to a pipe over 16 MiB is unsupported in bash-tool",
+                    )));
+                }
             }
             inner.buf.extend(data[..n].iter().copied());
             let wake = std::mem::take(&mut inner.read_wakers);
@@ -1224,14 +1235,24 @@ mod mem_pipe_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
-    /// Capacity exhaustion is recoverable backpressure, not a broken pipe.
+    /// A synchronous writer cannot wait for the reader, so a full pipe keeps its bytes anyway, up
+    /// to the hard bound.
     #[test]
-    fn write_beyond_capacity_would_block() {
-        let (_reader, mut writer) = mem_pipe::pipe(8);
+    fn synchronous_writes_beyond_capacity_are_kept() {
+        let (mut reader, mut writer) = mem_pipe::pipe(8);
 
         writer.write_all(b"12345678").unwrap();
-        let err = writer.write_all(b"9").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        writer.write_all(b"9").unwrap();
+        let mut out = [0; 9];
+        reader.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"123456789");
+
+        let big = vec![b'x'; super::MAX_SUBSTITUTION_BYTES];
+        writer.write_all(&big).unwrap();
+        assert_eq!(
+            writer.write_all(b"y").unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
     }
 
     fn open_pipe(capacity: usize) -> (super::OpenFile, super::OpenFile) {
@@ -1309,14 +1330,11 @@ mod mem_pipe_tests {
     fn synchronous_oversized_write_reports_partial_progress() {
         let (mut reader, mut writer) = mem_pipe::pipe(1);
         assert_eq!(writer.write(b"abc").unwrap(), 1);
-        assert_eq!(
-            writer.write(b"bc").unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        // Full: a synchronous write goes past the capacity rather than failing.
+        assert_eq!(writer.write(b"bc").unwrap(), 2);
         let mut buf = [0; 4];
-        assert_eq!(reader.read(&mut buf).unwrap(), 1);
-        assert_eq!(buf[0], b'a');
-        assert_eq!(writer.write(b"bc").unwrap(), 1);
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"abc");
     }
 
     #[test]
