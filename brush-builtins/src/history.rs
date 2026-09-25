@@ -1,4 +1,4 @@
-use brush_core::{ExecutionExitCode, ExecutionResult, builtins, error, history};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins, history};
 use clap::Parser;
 use std::{
     io::Write,
@@ -85,7 +85,7 @@ impl HistoryCommand {
         &self,
         history: &mut history::History,
         config: &HistoryConfig,
-        stdout: impl Write,
+        mut stdout: impl Write,
         mut stderr: impl Write,
     ) -> Result<ExecutionResult, brush_core::Error> {
         if self.clear_history {
@@ -135,12 +135,32 @@ impl HistoryCommand {
             return Ok(ExecutionResult::success());
         }
 
-        if self.append_rest_of_file_to_session.is_some() {
-            return error::unimp("history -n is not yet implemented");
+        // `-n` ("remaining" entries not yet read into this session) and `-r` (the whole file)
+        // differ, in real bash, only from what an earlier read of the same file in this session
+        // (typically the interactive startup load) already brought in. This shell never
+        // auto-loads `HISTFILE` at startup -- there is no interactive session to do it for -- so
+        // nothing has been read from any file yet the first time either is called; the two are
+        // the same operation here. (A script that called `-r FILE` and then `-n FILE` would see
+        // FILE's lines twice, unlike real bash's cross-call tracking; that's the one corner this
+        // doesn't cover.)
+        if let Some(option) = &self.append_rest_of_file_to_session {
+            if let Some(file_path) = get_effective_history_file_path(
+                config.default_history_file_path.as_deref(),
+                option.as_deref(),
+            ) {
+                append_file_to_session(history, file_path)?;
+            }
+            return Ok(ExecutionResult::success());
         }
 
-        if self.append_file_to_session.is_some() {
-            return error::unimp("history -r is not yet implemented");
+        if let Some(option) = &self.append_file_to_session {
+            if let Some(file_path) = get_effective_history_file_path(
+                config.default_history_file_path.as_deref(),
+                option.as_deref(),
+            ) {
+                append_file_to_session(history, file_path)?;
+            }
+            return Ok(ExecutionResult::success());
         }
 
         if let Some(write_option) = &self.write_session_to_file {
@@ -159,8 +179,8 @@ impl HistoryCommand {
             return Ok(ExecutionResult::success());
         }
 
-        if self.expand_args.is_some() {
-            return error::unimp("history -p is not yet implemented");
+        if let Some(args) = &self.expand_args {
+            return expand_and_print(args, history, &mut stdout, &mut stderr);
         }
 
         if let Some(args) = &self.append_args_to_session {
@@ -169,7 +189,10 @@ impl HistoryCommand {
         }
 
         let max_entries: Option<usize> = if let Some(arg) = self.args.first() {
-            Some(brush_core::int_utils::parse(arg.as_str(), 10)?)
+            match parse_count_arg(arg, &mut stderr)? {
+                Ok(value) => Some(value),
+                Err(result) => return Ok(result),
+            }
         } else {
             None
         };
@@ -214,11 +237,199 @@ fn display_history(
     Ok(())
 }
 
+/// Parses `history`'s own trailing `N` argument (how many recent entries to show); on failure,
+/// writes bash's own wording for it and returns the exit code to report instead.
+fn parse_count_arg(
+    arg: &str,
+    mut stderr: impl Write,
+) -> Result<Result<usize, ExecutionResult>, brush_core::Error> {
+    if let Ok(value) = arg.parse::<usize>() {
+        Ok(Ok(value))
+    } else {
+        writeln!(stderr, "{arg}: numeric argument required")?;
+        Ok(Err(ExecutionExitCode::InvalidUsage.into()))
+    }
+}
+
+/// Implements `history -p`: expands each argument's `!`-event designators and prints the
+/// result, or reports "event not found" for one that doesn't resolve -- matching bash's own
+/// per-argument handling (one bad reference doesn't stop the rest from being printed).
+fn expand_and_print(
+    args: &[String],
+    history: &history::History,
+    mut stdout: impl Write,
+    mut stderr: impl Write,
+) -> Result<ExecutionResult, brush_core::Error> {
+    let mut failed = false;
+    for arg in args {
+        match expand_history_references(arg, history) {
+            Ok(expanded) => writeln!(stdout, "{expanded}")?,
+            Err(event) => {
+                writeln!(stderr, "history: {event}: event not found")?;
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed {
+        ExecutionExitCode::GeneralError.into()
+    } else {
+        ExecutionResult::success()
+    })
+}
+
 fn get_effective_history_file_path<'a>(
     default_history_file_path: Option<&'a Path>,
     option: Option<&'a str>,
 ) -> Option<&'a Path> {
     option.map(Path::new).or(default_history_file_path)
+}
+
+/// Reads `file_path` and appends each command line in it as a new history item, matching
+/// `history::History::import`'s own timestamp-comment handling (`#SECONDS` lines set the
+/// timestamp of the line that follows) and its tolerance of unreadable lines (skipped, with a
+/// warning logged, rather than failing the whole read).
+fn append_file_to_session(
+    history: &mut history::History,
+    file_path: impl AsRef<Path>,
+) -> Result<(), brush_core::Error> {
+    let file = std::fs::File::open(file_path.as_ref())?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut next_timestamp = None;
+    for line_result in std::io::BufRead::lines(reader) {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::warn!("unreadable history line; {err}");
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        if let Some(comment) = line.strip_prefix('#') {
+            next_timestamp = comment
+                .trim()
+                .parse()
+                .ok()
+                .and_then(|seconds| history::ItemTimestamp::from_timestamp(seconds, 0));
+            continue;
+        }
+
+        history.add(history::Item {
+            id: 0, // `History::add` assigns the real ID.
+            command_line: line,
+            timestamp: next_timestamp.take(),
+            dirty: false,
+        })?;
+    }
+
+    Ok(())
+}
+
+/// The most recent history item whose command line satisfies `matches`, searching from the
+/// newest item backward (`History`'s iterator is oldest-first and not double-ended, so this
+/// goes through `History::search` with `Direction::Backward` instead of reversing it).
+fn most_recent_matching(
+    history: &history::History,
+    matches: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let query = history::Query {
+        direction: history::Direction::Backward,
+        ..Default::default()
+    };
+    history
+        .search(query)
+        .ok()?
+        .find(|item| matches(item.command_line.as_str()))
+        .map(|item| item.command_line.clone())
+}
+
+/// Applies bash's `!`-event designators to `text` and returns the expanded result, or the
+/// unresolved token (for an "event not found" diagnostic) if one doesn't match anything.
+///
+/// Covers the designators bash documents as selecting an event: `!!` (the previous command),
+/// `!N` (absolute item N), `!-N` (N items back), `!string` (the most recent item starting with
+/// `string`) and `!?string?` (the most recent item containing `string`). Word designators and
+/// modifiers (`:0`, `:$`, `:s/old/new/`, ...) are not covered: a `!` this doesn't recognize as
+/// the start of one of these forms (including one followed by whitespace, `=` or `(`, which
+/// bash itself never treats as the start of an event) is left in the output unexpanded, exactly
+/// as bash leaves it.
+fn expand_history_references(text: &str, history: &history::History) -> Result<String, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '!' || i + 1 >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let next = chars[i + 1];
+        if next.is_whitespace() || next == '=' || next == '(' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let is_word_char = |c: char| !c.is_whitespace();
+        let start = i;
+        let event_end;
+        let resolved: Option<String> = if next == '!' {
+            event_end = i + 2;
+            history
+                .count()
+                .checked_sub(1)
+                .and_then(|index| history.get(index))
+                .map(|item| item.command_line.clone())
+        } else if next == '-' || next.is_ascii_digit() {
+            let digits_start = if next == '-' { i + 2 } else { i + 1 };
+            let mut end = digits_start;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
+            }
+            event_end = end;
+            if end == digits_start {
+                None
+            } else {
+                let digits: String = chars[digits_start..end].iter().collect();
+                digits.parse::<usize>().ok().and_then(|n| {
+                    let index = if next == '-' {
+                        history.count().checked_sub(n)
+                    } else {
+                        n.checked_sub(1)
+                    };
+                    index
+                        .and_then(|index| history.get(index))
+                        .map(|item| item.command_line.clone())
+                })
+            }
+        } else if next == '?' {
+            let mut end = i + 2;
+            while end < chars.len() && chars[end] != '?' {
+                end += 1;
+            }
+            let needle: String = chars[i + 2..end].iter().collect();
+            event_end = if end < chars.len() { end + 1 } else { end };
+            most_recent_matching(history, |line| line.contains(needle.as_str()))
+        } else {
+            let mut end = i + 1;
+            while end < chars.len() && is_word_char(chars[end]) {
+                end += 1;
+            }
+            let prefix: String = chars[i + 1..end].iter().collect();
+            event_end = end;
+            most_recent_matching(history, |line| line.starts_with(prefix.as_str()))
+        };
+
+        match resolved {
+            Some(command_line) => {
+                out.push_str(&command_line);
+                i = event_end;
+            }
+            None => return Err(chars[start..event_end].iter().collect()),
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
