@@ -3372,11 +3372,15 @@ async fn apply_assignment(
             let _ = shell.display_error(&mut params.stderr(shell), &error);
             error.into_reported()
         }
-        // Bash names the element: `a[-3]: bad array subscript`.
-        error::ErrorKind::ArrayIndexOutOfRange(index) => error::ErrorKind::ArrayIndexOutOfRange(
-            format!("{}[{index}]", assignment.name.base_name()),
-        )
-        .into(),
+        // Bash names the element as written: `a[-(1)]: bad array subscript`. (An error in the
+        // value's expansion is fatal, and names what it expanded.)
+        error::ErrorKind::ArrayIndexOutOfRange(evaluated) if !error.is_fatal() => {
+            let name = match &assignment.name {
+                ast::AssignmentName::ArrayElementName(name, index) => format!("{name}[{index}]"),
+                ast::AssignmentName::VariableName(name) => format!("{name}[{evaluated}]"),
+            };
+            error::ErrorKind::ArrayIndexOutOfRange(name).into()
+        }
         _ => error,
     })
 }
