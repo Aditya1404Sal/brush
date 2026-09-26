@@ -3,7 +3,7 @@ use std::io::Read;
 
 use clap::Parser;
 
-use brush_core::{ExecutionExitCode, ExecutionResult, builtins, env, error, variables};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins, env, variables};
 
 /// Read lines from standard input into an indexed array variable.
 #[derive(Parser)]
@@ -52,10 +52,6 @@ impl builtins::Command for MapFileCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        if self.callback_group_size != 5000 || self.callback.is_some() {
-            return error::unimp("mapfile -C/-c is not yet implemented");
-        }
-
         if !brush_core::env::valid_variable_name(&self.array_var_name) {
             context.report(format_args!(
                 "`{}': not a valid identifier",
@@ -93,6 +89,23 @@ impl builtins::Command for MapFileCommand {
         let fd = self
             .fd
             .unwrap_or(brush_core::openfiles::OpenFiles::STDIN_FD);
+        // With a callback, elements are assigned as they are read, so the callback sees the
+        // array as it grows, as in bash.
+        if let Some(callback) = &self.callback {
+            let Some(input_file) = context.try_fd(fd) else {
+                context.report(format_args!(
+                    "{fd}: invalid file descriptor: Bad file descriptor"
+                ))?;
+                return Ok(ExecutionExitCode::GeneralError.into());
+            };
+            context
+                .shell
+                .warn_circular_nameref(&context.params, &self.array_var_name, 1, false);
+            return self
+                .read_with_callback(context, input_file, callback, origin)
+                .await;
+        }
+
         let results = match context.try_fd(fd) {
             Some(input_file) => self.read_entries(input_file).await?,
             None if self.fd.is_some() => {
@@ -140,49 +153,138 @@ impl builtins::Command for MapFileCommand {
 }
 
 impl MapFileCommand {
-    #[cfg_attr(
-        not(target_arch = "wasm32"),
-        allow(clippy::unused_async, reason = "WASM pipe input is awaited")
-    )]
-    async fn read_entries(
-        &self,
-        mut input_file: brush_core::openfiles::OpenFile,
-    ) -> Result<variables::ArrayLiteral, brush_core::Error> {
-        let _term_mode = setup_terminal_settings(&input_file)?;
-        // Ctrl+C and Ctrl+D are keys only on a terminal; other input holds them as characters.
-        let terminal = input_file.is_terminal();
-
-        let mut entries = vec![];
-        let mut read_count = 0;
-        let max_count = self.max_count.try_into()?;
-        let delimiter = match &self.delimiter {
+    /// The delimiter that ends each line: `-d`'s first byte, NUL for `-d ''`, else a newline.
+    fn delimiter(&self) -> u8 {
+        match &self.delimiter {
             Some(d) if d.is_empty() => b'\0',
             Some(d) => brush_core::rawbytes::encode(d)
                 .first()
                 .copied()
                 .unwrap_or(b'\n'),
             None => b'\n',
-        };
+        }
+    }
 
-        let mut buf = [0u8; 1];
-
+    async fn read_entries(
+        &self,
+        mut input_file: brush_core::openfiles::OpenFile,
+    ) -> Result<variables::ArrayLiteral, brush_core::Error> {
+        let _term_mode = setup_terminal_settings(&input_file)?;
+        let mut lines = Lines::new(&input_file, self);
+        let mut entries = vec![];
+        let max_count: usize = self.max_count.try_into()?;
         while max_count == 0 || entries.len() < max_count {
+            let Some(line) = lines.next(&mut input_file).await? else {
+                break;
+            };
+            entries.push((None, line));
+        }
+        Ok(variables::ArrayLiteral(entries))
+    }
+
+    /// Reads as bash does with `-C CALLBACK`: every `-c` lines, before it assigns a line, bash
+    /// evaluates the callback with the line's index and the line (quoted) appended.
+    async fn read_with_callback<SE: brush_core::ShellExtensions>(
+        &self,
+        context: brush_core::ExecutionContext<'_, SE>,
+        mut input_file: brush_core::openfiles::OpenFile,
+        callback: &str,
+        origin: Option<i64>,
+    ) -> Result<brush_core::ExecutionResult, brush_core::Error> {
+        let _term_mode = setup_terminal_settings(&input_file)?;
+        // Without -O the array starts empty.
+        if origin.is_none() {
+            context.shell.env_mut().update_or_add(
+                &self.array_var_name,
+                variables::ShellValueLiteral::Array(variables::ArrayLiteral(vec![])),
+                |_| Ok(()),
+                env::EnvironmentLookup::Anywhere,
+                env::EnvironmentScope::Global,
+            )?;
+        }
+        let mut lines = Lines::new(&input_file, self);
+        let max_count: i64 = self.max_count;
+        let mut index = origin.unwrap_or(0);
+        let mut count: i64 = 0;
+        while max_count == 0 || count < max_count {
+            let Some(line) = lines.next(&mut input_file).await? else {
+                break;
+            };
+            count += 1;
+            if count % self.callback_group_size == 0 {
+                let quoted = brush_core::escape::force_quote(
+                    &line,
+                    brush_core::escape::QuoteMode::SingleQuote,
+                );
+                let source_info = brush_core::SourceInfo::from("main");
+                context
+                    .shell
+                    .run_string(
+                        format!("{callback} {index} {quoted}"),
+                        &source_info,
+                        &context.params,
+                    )
+                    .await?;
+            }
+            context.shell.env_mut().update_or_add_array_element(
+                &self.array_var_name,
+                index.to_string(),
+                line,
+                |_| Ok(()),
+                env::EnvironmentLookup::Anywhere,
+                env::EnvironmentScope::Global,
+            )?;
+            index += 1;
+        }
+        Ok(ExecutionResult::success())
+    }
+}
+
+/// The lines `mapfile` reads: `-s` lines skipped, `-t` delimiters removed.
+struct Lines {
+    delimiter: u8,
+    /// Ctrl+C and Ctrl+D are keys only on a terminal; other input holds them as characters.
+    terminal: bool,
+    to_skip: i64,
+    remove_delimiter: bool,
+}
+
+impl Lines {
+    fn new(input_file: &brush_core::openfiles::OpenFile, command: &MapFileCommand) -> Self {
+        Self {
+            delimiter: command.delimiter(),
+            terminal: input_file.is_terminal(),
+            to_skip: command.skip_count,
+            remove_delimiter: command.remove_delimiter,
+        }
+    }
+
+    /// The next line, or `None` at the end of the input.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(clippy::unused_async, reason = "WASM pipe input is awaited")
+    )]
+    async fn next(
+        &mut self,
+        input_file: &mut brush_core::openfiles::OpenFile,
+    ) -> Result<Option<String>, brush_core::Error> {
+        let mut buf = [0u8; 1];
+        loop {
             let mut line = vec![];
             let mut saw_delimiter = false;
-
             loop {
                 #[cfg(target_arch = "wasm32")]
                 let read = futures::io::AsyncReadExt::read(input_file.async_io(), &mut buf).await;
                 #[cfg(not(target_arch = "wasm32"))]
                 let read = input_file.read(&mut buf);
                 match read {
-                    Ok(0) => break,                                                     // End of input
-                    Ok(1) if terminal && buf[0] == b'\x03' => break,                    // Ctrl+C
-                    Ok(1) if terminal && buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
+                    Ok(0) => break,                                       // End of input
+                    Ok(1) if self.terminal && buf[0] == b'\x03' => break, // Ctrl+C
+                    Ok(1) if self.terminal && buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
                     Ok(1) => {
                         let byte = buf[0];
                         line.push(byte);
-                        if byte == delimiter {
+                        if byte == self.delimiter {
                             saw_delimiter = true;
                             break;
                         }
@@ -193,15 +295,15 @@ impl MapFileCommand {
             }
 
             if line.is_empty() && !saw_delimiter {
-                break;
+                return Ok(None);
             }
 
-            if read_count < self.skip_count {
-                read_count += 1;
+            if self.to_skip > 0 {
+                self.to_skip -= 1;
                 continue;
             }
 
-            if self.remove_delimiter && line.ends_with(&[delimiter]) {
+            if self.remove_delimiter && line.ends_with(&[self.delimiter]) {
                 line.pop();
             }
 
@@ -211,12 +313,8 @@ impl MapFileCommand {
             }
 
             // Bytes that are not UTF-8 are kept (see `rawbytes`).
-            let line_str = brush_core::rawbytes::decode_vec(line);
-
-            entries.push((None, line_str));
+            return Ok(Some(brush_core::rawbytes::decode_vec(line)));
         }
-
-        Ok(variables::ArrayLiteral(entries))
     }
 }
 
