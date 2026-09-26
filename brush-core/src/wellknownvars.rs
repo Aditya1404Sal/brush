@@ -634,9 +634,18 @@ fn get_bash_lineno_value(shell: &dyn ShellState) -> variables::ShellValue {
 
     // BASH_LINENO[$i] contains the line number where FUNCNAME[$i] was called
     // This is extracted from the call_site of each frame. Outside functions it is empty, as in
-    // bash.
+    // bash, except in a sourced file, where its one entry is the line that sourced it (as
+    // BASH_SOURCE's one entry is the file).
     if stack.iter_function_calls().next().is_none() {
-        Vec::<String>::new().into()
+        stack
+            .iter()
+            .position(|frame| frame.frame_type.is_script())
+            .filter(|&index| stack[index].frame_type.is_sourced_script())
+            .and_then(|index| stack.iter().nth(index + 1))
+            .map_or_else(Vec::new, |caller| {
+                vec![caller.current_line().unwrap_or(DEFAULT_LINENO).to_string()]
+            })
+            .into()
     } else {
         stack
             .iter()
