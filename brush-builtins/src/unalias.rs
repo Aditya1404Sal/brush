@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
@@ -21,6 +22,15 @@ impl builtins::Command for UnaliasCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut exit_code = ExecutionResult::success();
+
+        // Nothing to remove is a usage error, which bash reports with its usage line alone.
+        if !self.remove_all && self.aliases.is_empty() {
+            writeln!(
+                context.stderr(),
+                "unalias: usage: unalias [-a] name [name ...]"
+            )?;
+            return Ok(ExecutionResult::new(2));
+        }
 
         if self.remove_all {
             context.shell.aliases_mut().clear();
