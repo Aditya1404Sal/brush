@@ -1567,9 +1567,42 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         ParameterState::DefinedEmptyString,
                     ) => Ok(expanded_parameter),
                     _ => {
+                        // `${a[@]:=w}` assigns an associative array's element `@` (or `*`), as in
+                        // bash; any other variable has no such element.
+                        let element;
+                        let parameter = match &parameter {
+                            brush_parser::word::Parameter::NamedWithAllIndices {
+                                name,
+                                concatenate,
+                            } => {
+                                let assoc = self.shell.env().get(name).is_some_and(|(_, var)| {
+                                    matches!(
+                                        var.value(),
+                                        ShellValue::AssociativeArray(_)
+                                            | ShellValue::Unset(
+                                                ShellValueUnsetType::AssociativeArray
+                                            )
+                                    )
+                                });
+                                if !assoc {
+                                    return Err(error::Error::from(
+                                        error::ErrorKind::ArrayIndexOutOfRange(diagnostic_name(
+                                            &parameter,
+                                        )),
+                                    )
+                                    .into_fatal());
+                                }
+                                element = brush_parser::word::Parameter::NamedWithIndex {
+                                    name: name.clone(),
+                                    index: if *concatenate { "\\*" } else { "\\@" }.to_owned(),
+                                };
+                                &element
+                            }
+                            parameter => parameter,
+                        };
                         let expanded_default = self.expand_parameter_word(default_value).await?;
                         let expanded_default_value = self.fields_to_string(expanded_default);
-                        self.assign_to_parameter(&parameter, expanded_default_value.clone())
+                        self.assign_to_parameter(parameter, expanded_default_value.clone())
                             .await?;
                         Ok(Expansion::from(expanded_default_value))
                     }
