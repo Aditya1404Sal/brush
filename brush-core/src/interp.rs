@@ -3576,7 +3576,7 @@ async fn apply_assignment_unchecked(
             .get(variable_name)
             .is_some_and(|(_, existing)| existing.is_treated_as_integer())
     {
-        arithmetic::eval_integer_literal(shell, new_value)
+        arithmetic::eval_integer_literal(shell, params, new_value)
             .map_err(|error| error::Error::from(error).into_fatal())?
     } else {
         new_value
@@ -3631,9 +3631,12 @@ async fn apply_assignment_unchecked(
                 true
             };
 
-        // An empty subscript names no element (`a[]=v`, or `m[""]=v` in an associative array).
+        // An empty subscript names no element (`a[]=v`, or `m[""]=v` in an associative array),
+        // nor does `@` or `*` in an indexed array's.
         if let ast::AssignmentName::ArrayElementName(_, written) = &assignment.name
-            && (written.is_empty() || (idx.is_empty() && !will_be_indexed_array))
+            && (written.is_empty()
+                || (idx.is_empty() && !will_be_indexed_array)
+                || (will_be_indexed_array && matches!(written.as_str(), "@" | "*")))
         {
             return Err(error::ErrorKind::ArrayIndexOutOfRange(written.clone()).into());
         }

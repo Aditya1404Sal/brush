@@ -762,7 +762,7 @@ impl DeclareCommand {
         };
         match value {
             Some(value) if becomes_integer => Ok(Some(
-                brush_core::arithmetic::eval_integer_literal(context.shell, value)
+                brush_core::arithmetic::eval_integer_literal(context.shell, &context.params, value)
                     .map_err(|error| brush_core::Error::from(error).into_fatal())?,
             )),
             value => Ok(value),

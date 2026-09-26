@@ -172,8 +172,18 @@ pub fn eval_reporting(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<i64, EvalError> {
+    reporting(shell, params, |shell| expr.eval(shell))
+}
+
+/// Runs `evaluate`, writing the diagnostics it reports without stopping (see `report`) to the
+/// standard error of `params`.
+fn reporting<SE: extensions::ShellExtensions, T>(
+    shell: &mut Shell<SE>,
+    params: &ExecutionParameters,
+    evaluate: impl FnOnce(&mut Shell<SE>) -> T,
+) -> T {
     let outer = shell.nameref_warnings.replace(String::new());
-    let result = expr.eval(shell);
+    let result = evaluate(shell);
     let warnings = std::mem::replace(&mut shell.nameref_warnings, outer).unwrap_or_default();
     if !warnings.is_empty() {
         use std::io::Write as _;
@@ -321,8 +331,16 @@ pub fn eval_integer_assignment(
 }
 
 /// Evaluates every value in an assignment to an integer variable (see
-/// [`eval_integer_assignment`]).
+/// [`eval_integer_assignment`]), writing what it reports to the standard error of `params`.
 pub fn eval_integer_literal(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    literal: crate::variables::ShellValueLiteral,
+) -> Result<crate::variables::ShellValueLiteral, EvalError> {
+    reporting(shell, params, |shell| integer_literal(shell, literal))
+}
+
+fn integer_literal(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     literal: crate::variables::ShellValueLiteral,
 ) -> Result<crate::variables::ShellValueLiteral, EvalError> {
@@ -493,17 +511,7 @@ fn deref_lvalue(
     let value_str: Cow<'_, str> = match lvalue {
         ast::ArithmeticTarget::Variable(name) => get_var_value(shell, name.as_str())?,
         ast::ArithmeticTarget::ArrayElement(name, index) => {
-            let index_str = element_key(shell, name, index, depth)?;
-
-            shell
-                .env()
-                .get(name)
-                .map_or_else(
-                    || Ok(None),
-                    |(_, v)| v.value().get_at(index_str.as_str(), shell),
-                )
-                .map_err(|_err| EvalError::FailedToAccessArray)?
-                .unwrap_or(Cow::Borrowed(""))
+            read_element(shell, name, index, depth)?.map_or(Cow::Borrowed(""), Cow::Owned)
         }
     };
 
@@ -702,23 +710,106 @@ fn assign(
                 .map_err(|error| assignment_error(&error))?;
         }
         ast::ArithmeticTarget::ArrayElement(name, index) => {
+            // Bash reports an element it cannot assign, and goes on.
+            if !is_associative(shell, name) && matches!(index.as_str(), "@" | "*") {
+                report(shell, &format!("{name}[{index}]: bad array subscript"));
+                return Ok(value);
+            }
             let index_str = element_key(shell, name, index, depth)?;
 
-            shell
-                .env_mut()
-                .update_or_add_array_element(
-                    name.as_str(),
-                    index_str,
-                    value.to_string(),
-                    |_| Ok(()),
-                    env::EnvironmentLookup::Anywhere,
-                    env::EnvironmentScope::Global,
-                )
-                .map_err(|error| assignment_error(&error))?;
+            let assigned = shell.env_mut().update_or_add_array_element(
+                name.as_str(),
+                index_str.clone(),
+                value.to_string(),
+                |_| Ok(()),
+                env::EnvironmentLookup::Anywhere,
+                env::EnvironmentScope::Global,
+            );
+            match assigned {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        crate::error::ErrorKind::ArrayIndexOutOfRange(_)
+                    ) =>
+                {
+                    report(shell, &format!("{name}[{index_str}]: bad array subscript"));
+                }
+                assigned => assigned.map_err(|error| assignment_error(&error))?,
+            }
         }
     }
 
     Ok(value)
+}
+
+/// Writes a diagnostic that does not stop the evaluation, as `Shell::note_circular_nameref`
+/// does: to the standard error of the command evaluating it (see `eval_reporting`).
+fn report(shell: &mut Shell<impl extensions::ShellExtensions>, message: &str) {
+    let text = format!("{}{message}\n", shell.diagnostic_prefix());
+    if let Some(warnings) = &mut shell.nameref_warnings {
+        warnings.push_str(&text);
+    } else {
+        use std::io::Write as _;
+        let _ = shell.stderr().write_all(text.as_bytes());
+    }
+}
+
+/// Whether `name` is an associative array, whose subscripts are keys as written.
+fn is_associative(shell: &Shell<impl extensions::ShellExtensions>, name: &str) -> bool {
+    shell.env().get(name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            variables::ShellValue::AssociativeArray(_)
+                | variables::ShellValue::Unset(variables::ShellValueUnsetType::AssociativeArray)
+        )
+    })
+}
+
+/// The value of `name[index]`, or `None` when it has none. As in bash, `@`, `*` and a negative
+/// subscript past the first element are reported, and read as nothing.
+fn read_element(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    name: &str,
+    index: &str,
+    depth: u32,
+) -> Result<Option<String>, EvalError> {
+    let associative = is_associative(shell, name);
+    if !associative && matches!(index, "@" | "*") {
+        report(shell, &format!("{name}[{index}]: bad array subscript"));
+        return Ok(None);
+    }
+    let index_str = element_key(shell, name, index, depth)?;
+    // A negative subscript counts back from one past the highest index: of none for an unset
+    // variable, and of one for a scalar.
+    let out_of_range = !associative
+        && index_str.parse::<i64>().is_ok_and(|index| {
+            #[expect(clippy::cast_possible_wrap)]
+            let end = match shell.env().get(name).map(|(_, var)| var.value()) {
+                None | Some(variables::ShellValue::Unset(_)) => 0,
+                Some(variables::ShellValue::IndexedArray(values)) => {
+                    values.keys().next_back().map_or(0, |max| *max as i64 + 1)
+                }
+                Some(_) => 1,
+            };
+            index < 0 && end + index < 0
+        });
+    let element = if out_of_range {
+        None
+    } else {
+        shell.env().get(name).map(|(_, var)| {
+            var.value()
+                .get_at(index_str.as_str(), shell)
+                .map(|value| value.map(|value| value.into_owned()))
+        })
+    };
+    match element {
+        Some(Ok(value)) => Ok(value),
+        None if !out_of_range => Ok(None),
+        _ => {
+            report(shell, &format!("{name}: bad array subscript"));
+            Ok(None)
+        }
+    }
 }
 
 /// The key of `name[index]`: an associative array's subscript is its key as written, and an
@@ -729,14 +820,7 @@ fn element_key(
     index: &str,
     depth: u32,
 ) -> Result<String, EvalError> {
-    let associative = shell.env().get(name).is_some_and(|(_, var)| {
-        matches!(
-            var.value(),
-            variables::ShellValue::AssociativeArray(_)
-                | variables::ShellValue::Unset(variables::ShellValueUnsetType::AssociativeArray)
-        )
-    });
-    if associative {
+    if is_associative(shell, name) {
         return Ok(index.to_owned());
     }
     // An error in the subscript ends the shell, as bash's does.
