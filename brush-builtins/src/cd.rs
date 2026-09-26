@@ -81,6 +81,11 @@ impl builtins::Command for CdCommand {
                 // A directory found through a non-empty CDPATH entry is printed, as in bash.
                 should_print = found.1;
                 found.0
+            } else if let Some(dir) = cdable_variable(&context, target_dir) {
+                // With `cdable_vars`, a name that is no directory names a variable holding one;
+                // bash prints where it went.
+                should_print = true;
+                dir
             } else {
                 PathBuf::from(target_dir)
             }
@@ -100,15 +105,37 @@ impl builtins::Command for CdCommand {
                 .options()
                 .do_not_resolve_symlinks_when_changing_dir
         {
-            // -e is only relevant in physical mode.
-            if self.exit_on_failed_cwd_resolution {
-                return error::unimp("cd -e");
-            }
+            // -e fails when the new directory's path cannot be found, which this shell always
+            // knows once it has resolved the path.
+            let _ = self.exit_on_failed_cwd_resolution;
 
-            target_dir = context.shell.absolute_path(target_dir).canonicalize()?;
+            target_dir = match context.shell.absolute_path(&target_dir).canonicalize() {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let shown = self
+                        .target_dir
+                        .clone()
+                        .unwrap_or_else(|| target_dir.to_string_lossy().to_string());
+                    context.report(format_args!("{shown}: {}", error::io_message(&error)))?;
+                    return Ok(ExecutionResult::general_error());
+                }
+            };
         }
 
         if let Err(error) = context.shell.set_working_dir(&target_dir) {
+            // A readonly PWD or OLDPWD does not stop the change; bash reports the variable, not
+            // `cd`.
+            if matches!(error.kind(), error::ErrorKind::ReadonlyVariableNamed(_)) {
+                if should_print {
+                    writeln!(
+                        context.stdout(),
+                        "{}",
+                        context.shell.working_dir().display()
+                    )?;
+                }
+                context.shell.display_error(&mut context.stderr(), &error)?;
+                return Ok(ExecutionResult::general_error());
+            }
             // As bash words it: the operand as given, then the reason.
             let shown = self
                 .target_dir
@@ -133,6 +160,20 @@ impl builtins::Command for CdCommand {
 
         Ok(ExecutionResult::success())
     }
+}
+
+/// With `shopt -s cdable_vars`, the directory held by the variable `target` names, when `target`
+/// is no directory itself, as bash looks it up.
+fn cdable_variable(
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    target: &str,
+) -> Option<PathBuf> {
+    if !context.shell.options().cdable_vars || context.shell.absolute_path(target).is_dir() {
+        return None;
+    }
+    let value = context.shell.env_str(target)?;
+    let dir = PathBuf::from(value.as_ref());
+    context.shell.absolute_path(&dir).is_dir().then_some(dir)
 }
 
 /// The directory `target` names through CDPATH, as bash searches it: only for a relative name

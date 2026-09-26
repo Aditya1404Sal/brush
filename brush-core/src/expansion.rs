@@ -1227,6 +1227,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 .shell
                 .env_str("GLOBSORT")
                 .map(|value| value.to_string()),
+            dot_entries: !self.shell.options().glob_skip_dots,
         };
         let keep = |path: &std::path::Path| {
             let name = path.file_name().map(|name| name.to_string_lossy());

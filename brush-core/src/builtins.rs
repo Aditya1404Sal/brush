@@ -552,20 +552,73 @@ fn report_usage_error(
         let _ = writeln!(context.stderr(), "{name}: usage: {synopsis}");
         return results::ExecutionExitCode::InvalidUsage.into();
     }
-    // An option given no argument: `NAME: -X: option requires an argument`, and the usage line.
-    if let Some(synopsis) = bash_synopsis(name)
-        && error.kind() == ErrorKind::InvalidValue
-        && matches!(error.get(ContextKind::InvalidValue), Some(ContextValue::String(value)) if value.is_empty())
-        && let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg)
-        && let Some(option) = argument.split_whitespace().next()
-        && option.starts_with('-')
-    {
-        let _ = context.report(format_args!("{option}: option requires an argument"));
-        let _ = writeln!(context.stderr(), "{name}: usage: {synopsis}");
-        return results::ExecutionExitCode::InvalidUsage.into();
+    if let Some(result) = report_value_error(context, error) {
+        return result;
     }
     let _ = writeln!(context.stderr(), "{error}");
     results::ExecutionExitCode::InvalidUsage.into()
+}
+
+/// Reports, as bash words it, an option's missing or unusable value and options that cannot be
+/// combined: bash checks these in the builtin itself, so each has its own wording and status.
+fn report_value_error(
+    context: &commands::ExecutionContext<'_, impl extensions::ShellExtensions>,
+    error: &clap::Error,
+) -> Option<results::ExecutionResult> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let name = context.command_name.as_str();
+    let string = |kind| match error.get(kind) {
+        Some(ContextValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    // clap names an argument as its usage shows it (`-t <SECONDS>`, `[N]`); bash names options
+    // by their letter and operands by their value.
+    let argument = string(ContextKind::InvalidArg)?;
+    let option = argument
+        .split([' ', '='])
+        .next()
+        .filter(|option| option.starts_with('-'));
+    match error.kind() {
+        ErrorKind::InvalidValue if string(ContextKind::InvalidValue) == Some("") => {
+            let option = option?;
+            let synopsis = bash_synopsis(name)?;
+            let _ = context.report(format_args!("{option}: option requires an argument"));
+            let _ = writeln!(context.stderr(), "{name}: usage: {synopsis}");
+            Some(results::ExecutionExitCode::InvalidUsage.into())
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+            let value = string(ContextKind::InvalidValue)?;
+            let (message, status, usage) = match (name, option) {
+                ("read", Some("-t")) => ("invalid timeout specification", 1, false),
+                ("read" | "mapfile" | "readarray", Some("-u")) => {
+                    ("invalid file descriptor specification", 1, false)
+                }
+                ("mapfile" | "readarray", Some("-n")) => ("invalid line count", 1, false),
+                ("mapfile" | "readarray", Some("-c")) => ("invalid callback quantum", 1, false),
+                ("shift", None) => ("numeric argument required", 2, false),
+                ("caller", None) => ("invalid number", 2, true),
+                ("compgen" | "complete", Some("-A")) => ("invalid action name", 2, false),
+                ("compgen" | "complete" | "compopt", Some("-o")) => {
+                    ("invalid option name", 2, false)
+                }
+                _ => return None,
+            };
+            let _ = context.report(format_args!("{value}: {message}"));
+            if usage && let Some(synopsis) = bash_synopsis(name) {
+                let _ = writeln!(context.stderr(), "{name}: usage: {synopsis}");
+            }
+            Some(results::ExecutionResult::new(status))
+        }
+        ErrorKind::ArgumentConflict => {
+            let message = match name {
+                "unset" => "cannot simultaneously unset a function and a variable",
+                _ => return None,
+            };
+            let _ = context.report(message);
+            Some(results::ExecutionResult::new(1))
+        }
+        _ => None,
+    }
 }
 
 /// Bash's synopsis of its builtin `name` (`help -s`), as its usage messages show it.

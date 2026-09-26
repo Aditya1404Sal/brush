@@ -95,13 +95,6 @@ impl builtins::Command for ReadCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        if self.use_readline {
-            return error::unimp("read -e");
-        }
-        if self.initial_text.is_some() {
-            return error::unimp("read -i");
-        }
-
         // A count that is not a number fails, in bash's words.
         for count in [
             &self.return_after_n_chars,
@@ -139,6 +132,12 @@ impl builtins::Command for ReadCommand {
             return Ok(brush_core::ExecutionResult::general_error());
         };
 
+        // Bash reads with readline (-e, and its -i text) only from a terminal; otherwise both
+        // options change nothing.
+        if self.use_readline && input_stream.is_terminal() {
+            return error::unimp("read -e from a terminal");
+        }
+
         // Retrieve effective value of IFS for splitting.
         // We convert to owned String to release the borrow before the mutable borrow
         // needed for variable assignment.
@@ -147,7 +146,7 @@ impl builtins::Command for ReadCommand {
         // Convert timeout to Duration.
         let timeout = self.timeout_in_seconds.map(Duration::from_secs_f64);
 
-        let read_result = self
+        let read_result = match self
             .read_line(
                 input_stream,
                 context.stderr(),
@@ -155,7 +154,22 @@ impl builtins::Command for ReadCommand {
                 #[cfg(target_arch = "wasm32")]
                 context.shell.execution_services(),
             )
-            .await?;
+            .await
+        {
+            Ok(read_result) => read_result,
+            // Bash names the descriptor it could not read, and why (`0: read error: Is a
+            // directory`).
+            Err(error) => {
+                let Some(io) = error.as_io_error() else {
+                    return Err(error);
+                };
+                context.report(format_args!(
+                    "{fd_num}: read error: {}",
+                    brush_core::error::io_message(io)
+                ))?;
+                return Ok(brush_core::ExecutionResult::general_error());
+            }
+        };
 
         // Determine whether to skip IFS splitting (for -N option).
         let skip_ifs_splitting = self.return_after_n_chars_no_delimiter.is_some();

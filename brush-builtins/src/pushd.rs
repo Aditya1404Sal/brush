@@ -50,6 +50,17 @@ impl builtins::Command for PushdCommand {
                     context.report(format_args!("{dir}: directory stack index out of range"))?;
                     return Ok(ExecutionResult::general_error());
                 }
+                // `+x` or `-x` (but not `-`) is no number, as bash reports it.
+                crate::dirs::StackPosition::NotAnIndex
+                    if dir.len() > 1 && dir.starts_with(['+', '-']) =>
+                {
+                    return crate::dirs::report_bad_operand(
+                        &context,
+                        dir,
+                        "invalid argument",
+                        "pushd: usage: pushd [-n] [+N | -N | dir]",
+                    );
+                }
                 crate::dirs::StackPosition::NotAnIndex => None,
             },
         };
@@ -58,11 +69,15 @@ impl builtins::Command for PushdCommand {
             if !self.no_directory_change
                 && let Err(error) = context.shell.set_working_dir(&rotated[0])
             {
-                context.report(format_args!(
-                    "{}: {}",
-                    rotated[0].display(),
-                    error.path_reason()
-                ))?;
+                if crate::dirs::is_readonly_pwd(&error) {
+                    context.shell.display_error(&mut context.stderr(), &error)?;
+                } else {
+                    context.report(format_args!(
+                        "{}: {}",
+                        rotated[0].display(),
+                        error.path_reason()
+                    ))?;
+                }
                 return Ok(ExecutionResult::general_error());
             }
             crate::dirs::set_stack(context.shell, &rotated[1..]);
@@ -75,7 +90,11 @@ impl builtins::Command for PushdCommand {
             } else {
                 let prev_working_dir = context.shell.working_dir().to_path_buf();
                 if let Err(error) = context.shell.set_working_dir(std::path::Path::new(dir)) {
-                    context.report(format_args!("{dir}: {}", error.path_reason()))?;
+                    if crate::dirs::is_readonly_pwd(&error) {
+                        context.shell.display_error(&mut context.stderr(), &error)?;
+                    } else {
+                        context.report(format_args!("{dir}: {}", error.path_reason()))?;
+                    }
                     return Ok(ExecutionResult::general_error());
                 }
                 context.shell.directory_stack_mut().push(prev_working_dir);

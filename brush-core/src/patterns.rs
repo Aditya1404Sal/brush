@@ -34,6 +34,8 @@ pub(crate) struct FilenameExpansionOptions {
     pub globstar: bool,
     /// `GLOBSORT`: how the results are ordered.
     pub sort: Option<String>,
+    /// `shopt -u globskipdots`: `.` and `..` match a component that starts with a dot.
+    pub dot_entries: bool,
 }
 
 /// Orders `results`, relative to `working_dir` and already sorted by name, as bash's `GLOBSORT`
@@ -427,6 +429,16 @@ impl Pattern {
                     .filter(matches_dotfile_policy)
                     .map(|entry| entry.path())
                     .collect();
+
+                // Directory listings leave out `.` and `..`; without `globskipdots`, bash matches
+                // them against a component that starts with a dot.
+                if options.dot_entries && subpattern_starts_with_dot {
+                    for name in [".", ".."] {
+                        if regex.is_match(name).unwrap_or(false) {
+                            matching_paths_in_dir.push(current_path.join(name));
+                        }
+                    }
+                }
 
                 matching_paths_in_dir.sort();
 

@@ -70,6 +70,35 @@ pub(crate) fn stack_position(operand: &str, len: usize) -> StackPosition {
     }
 }
 
+/// Reports an operand of `dirs`, `pushd` or `popd` that is no `+N` or `-N` as bash does: one
+/// that starts like them but has no number is an invalid number; any other is `other` ("invalid
+/// option" for `dirs`, "invalid argument" for `popd`). Either way the usage line follows and the
+/// status is 2.
+pub(crate) fn report_bad_operand(
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    operand: &str,
+    other: &str,
+    usage: &str,
+) -> Result<ExecutionResult, brush_core::Error> {
+    let problem = if operand.starts_with(['+', '-']) {
+        "invalid number"
+    } else {
+        other
+    };
+    context.report(format_args!("{operand}: {problem}"))?;
+    writeln!(context.stderr(), "{usage}")?;
+    Ok(ExecutionResult::new(2))
+}
+
+/// Whether changing directory failed only to set a readonly PWD or OLDPWD: the directory did
+/// change, and bash reports the variable rather than the builtin.
+pub(crate) const fn is_readonly_pwd(error: &brush_core::Error) -> bool {
+    matches!(
+        error.kind(),
+        brush_core::ErrorKind::ReadonlyVariableNamed(_)
+    )
+}
+
 /// Makes the stack hold `dirs` after the current directory (listed newest first).
 pub(crate) fn set_stack(
     shell: &mut brush_core::Shell<impl brush_core::ShellExtensions>,
@@ -87,15 +116,18 @@ impl builtins::Command for DirsCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        // As in bash: an operand that is not `+N` or `-N` is an invalid option.
+        // As in bash: an operand that is not `+N` or `-N` is a usage error.
         if let Some(entry) =
             self.entry.iter().chain(&self.extra).find(|entry| {
                 matches!(stack_position(entry, usize::MAX), StackPosition::NotAnIndex)
             })
         {
-            context.report(format_args!("{entry}: invalid option"))?;
-            writeln!(context.stderr(), "dirs: usage: dirs [-clpv] [+N] [-N]")?;
-            return Ok(ExecutionResult::new(2));
+            return report_bad_operand(
+                &context,
+                entry,
+                "invalid option",
+                "dirs: usage: dirs [-clpv] [+N] [-N]",
+            );
         }
         if self.clear {
             context.shell.directory_stack_mut().clear();

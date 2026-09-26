@@ -97,6 +97,37 @@ async fn evaluate_subscript(
     Ok(format!("{name}[{index}]"))
 }
 
+/// A file-type test of a path that names one of the command's descriptors (`[ -f /dev/stdin ]`),
+/// answered from what the descriptor is open on, as bash's `stat` of it does: a redirection
+/// decides, not the shell's own original streams. `None` when the test or the descriptor does not
+/// say.
+fn descriptor_type_test(
+    op: &ast::UnaryPredicate,
+    operand: &str,
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Option<bool> {
+    use crate::openfiles::DescriptorType as T;
+    let kind = || shell.open_file_named(params, operand)?.test_type();
+    Some(match op {
+        ast::UnaryPredicate::FileExists => kind().map(|_| true)?,
+        ast::UnaryPredicate::FileExistsAndIsRegularFile => {
+            matches!(kind()?, T::File(metadata) if metadata.is_file())
+        }
+        ast::UnaryPredicate::FileExistsAndIsDir => {
+            matches!(kind()?, T::File(metadata) if metadata.is_dir())
+        }
+        ast::UnaryPredicate::FileExistsAndIsCharSpecialFile => {
+            matches!(kind()?, T::CharacterDevice)
+        }
+        ast::UnaryPredicate::FileExistsAndIsFifo => matches!(kind()?, T::Fifo),
+        ast::UnaryPredicate::FileExistsAndIsNotZeroLength => {
+            matches!(kind()?, T::File(metadata) if metadata.len() > 0)
+        }
+        _ => return None,
+    })
+}
+
 #[expect(clippy::too_many_lines)]
 pub(crate) fn apply_unary_predicate_to_str(
     op: &ast::UnaryPredicate,
@@ -104,6 +135,9 @@ pub(crate) fn apply_unary_predicate_to_str(
     shell: &Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
+    if let Some(answer) = descriptor_type_test(op, operand, shell, params) {
+        return Ok(answer);
+    }
     match op {
         ast::UnaryPredicate::StringHasNonZeroLength => Ok(!operand.is_empty()),
         ast::UnaryPredicate::StringHasZeroLength => Ok(operand.is_empty()),

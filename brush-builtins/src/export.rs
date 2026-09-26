@@ -101,7 +101,7 @@ impl ExportCommand {
                         }
                     } else {
                         context.report(format_args!("{s}: not a function"))?;
-                        return Ok(ExecutionExitCode::InvalidUsage.into());
+                        return Ok(ExecutionExitCode::GeneralError.into());
                     }
                 }
                 // Try to find the variable already present; if we find it, then mark it

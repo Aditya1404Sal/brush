@@ -14,6 +14,10 @@ pub(crate) struct TrapCommand {
     #[arg(short = 'p')]
     print_trap_commands: bool,
 
+    /// Print only the action of each named signal's trap (bash 5.3).
+    #[arg(short = 'P')]
+    print_actions: bool,
+
     args: Vec<String>,
 }
 
@@ -50,6 +54,22 @@ impl TrapCommand {
         if self.list_signals {
             brush_core::traps::format_signals(&mut *stdout, TrapSignal::iterator())
                 .map(|()| ExecutionResult::success())
+        } else if self.print_actions {
+            if self.print_trap_commands {
+                context.report("cannot specify both -p and -P")?;
+                return Ok(ExecutionResult::new(2));
+            }
+            if self.args.is_empty() {
+                context.report("-P requires at least one signal name")?;
+                return Ok(ExecutionResult::new(2));
+            }
+            let (signals, result) = Self::parse_signals(&context, &self.args)?;
+            for signal in signals {
+                if let Some(handler) = context.shell.traps().get_handler(signal) {
+                    writeln!(stdout, "{}", handler.command)?;
+                }
+            }
+            Ok(result)
         } else if self.print_trap_commands || self.args.is_empty() {
             if !self.args.is_empty() {
                 let (signals, result) = Self::parse_signals(&context, &self.args)?;

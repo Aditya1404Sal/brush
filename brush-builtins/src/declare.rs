@@ -295,8 +295,14 @@ impl DeclareCommand {
             brush_core::CommandArg::Assignment(_) => None,
         };
 
-        // As with display, bash reports failure without printing an error message here.
+        // As with display, bash reports failure without printing an error message here, except
+        // for `readonly -f`, which names the missing function.
         let Some(func) = func else {
+            if matches!(verb, DeclareVerb::Readonly)
+                && let brush_core::CommandArg::String(name) = declaration
+            {
+                let _ = context.report(format_args!("{name}: not a function"));
+            }
             return false;
         };
 
@@ -647,7 +653,11 @@ impl DeclareCommand {
         // enclosing scope instead of starting unset; `+=` appends to the
         // inherited value. With no same-name variable anywhere, fall through
         // to ordinary creation.
-        if self.locals_inherit_from_prev_scope && create_var_local {
+        // `shopt -s localvar_inherit` makes every new local do the same.
+        if (self.locals_inherit_from_prev_scope
+            || context.shell.options().local_vars_inherit_value_and_attrs)
+            && create_var_local
+        {
             let inherited = context
                 .shell
                 .env()
@@ -1056,8 +1066,9 @@ impl DeclareCommand {
             .filter(|pair| filters.iter().all(|f| f(*pair)))
             .sorted_by_key(|v| v.0)
         {
-            // With attributes to match, bash lists the variables as `declare -p` does.
-            if self.print || self.attribute_given() {
+            // With attributes to match, bash lists the variables as `declare -p` does, and
+            // `local` as `local -p` does; `declare` alone lists `name=value`.
+            if self.print || self.attribute_given() || matches!(verb, DeclareVerb::Local) {
                 let mut cs = variable.attribute_flags(context.shell);
                 if cs.is_empty() {
                     cs.push('-');

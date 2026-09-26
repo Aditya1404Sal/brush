@@ -89,6 +89,9 @@ fn accessible(path: &std::path::Path, _mode: AccessMode) -> bool {
 /// The device and inode (WASI's metadata hash) of `path`, following links, as `-ef` compares.
 #[cfg(target_os = "wasi")]
 fn device_and_inode(path: &std::path::Path) -> Result<(u64, u64), crate::error::Error> {
+    // WASI's `stat` follows a link to its target's type but numbers it as the link itself, so a
+    // final symbolic link is followed here first.
+    let path = followed(path);
     let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     // SAFETY: an all-zero `stat` is a valid value of this plain C struct.
@@ -98,6 +101,22 @@ fn device_and_inode(path: &std::path::Path) -> Result<(u64, u64), crate::error::
         return Err(std::io::Error::last_os_error().into());
     }
     Ok((stat.st_dev, stat.st_ino))
+}
+
+/// `path` with its last component followed while it is a symbolic link (at most 40 times, as
+/// Linux follows links).
+#[cfg(target_os = "wasi")]
+fn followed(path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        path = path
+            .parent()
+            .map_or_else(|| target.clone(), |parent| parent.join(&target));
+    }
+    path
 }
 
 #[cfg(not(target_os = "wasi"))]

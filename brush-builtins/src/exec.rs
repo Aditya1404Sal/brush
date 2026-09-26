@@ -21,8 +21,9 @@ pub(crate) struct ExecCommand {
     #[arg(short = 'l')]
     exec_as_login: bool,
 
-    /// Command and args.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    /// Command and args. An option before the command that is none of the above is an invalid
+    /// one, as in bash.
+    #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
