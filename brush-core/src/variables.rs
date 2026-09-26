@@ -717,12 +717,6 @@ impl ShellVariable {
         if value.is_associative_array() {
             result.push('A');
         }
-        if matches!(
-            self.get_update_transform(),
-            ShellVariableUpdateTransform::Capitalize
-        ) {
-            result.push('c');
-        }
         if self.is_treated_as_integer() {
             result.push('i');
         }
@@ -732,23 +726,18 @@ impl ShellVariable {
         if self.is_readonly() {
             result.push('r');
         }
-        if matches!(
-            self.get_update_transform(),
-            ShellVariableUpdateTransform::Lowercase
-        ) {
-            result.push('l');
-        }
         if self.is_trace_enabled() {
             result.push('t');
         }
-        if matches!(
-            self.get_update_transform(),
-            ShellVariableUpdateTransform::Uppercase
-        ) {
-            result.push('u');
-        }
         if self.is_exported() {
             result.push('x');
+        }
+        // Bash lists the case attributes last.
+        match self.get_update_transform() {
+            ShellVariableUpdateTransform::Capitalize => result.push('c'),
+            ShellVariableUpdateTransform::Lowercase => result.push('l'),
+            ShellVariableUpdateTransform::Uppercase => result.push('u'),
+            ShellVariableUpdateTransform::None => {}
         }
 
         result

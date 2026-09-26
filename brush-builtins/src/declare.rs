@@ -894,6 +894,24 @@ impl DeclareCommand {
         Ok((name, assigned_index, initial_value, name_is_array, append))
     }
 
+    /// Whether an attribute option was given, `-x` or `+x`.
+    fn attribute_given(&self) -> bool {
+        [
+            self.make_indexed_array.to_bool(),
+            self.make_associative_array.to_bool(),
+            self.capitalize_value_on_assignment.to_bool(),
+            self.make_integer.to_bool(),
+            self.lowercase_value_on_assignment.to_bool(),
+            self.make_nameref.to_bool(),
+            self.make_readonly.to_bool(),
+            self.make_traced.to_bool(),
+            self.uppercase_value_on_assignment.to_bool(),
+            self.make_exported.to_bool(),
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
+
     fn display_matching_env_declarations(
         &self,
         context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
@@ -949,7 +967,7 @@ impl DeclareCommand {
         if let Some(value) = self.make_readonly.to_bool() {
             filters.push(Box::new(move |(_, v)| v.is_readonly() == value));
         }
-        if let Some(value) = self.make_readonly.to_bool() {
+        if let Some(value) = self.make_traced.to_bool() {
             filters.push(Box::new(move |(_, v)| v.is_trace_enabled() == value));
         }
         if let Some(value) = self.uppercase_value_on_assignment.to_bool() {
@@ -979,7 +997,8 @@ impl DeclareCommand {
             .filter(|pair| filters.iter().all(|f| f(*pair)))
             .sorted_by_key(|v| v.0)
         {
-            if self.print {
+            // With attributes to match, bash lists the variables as `declare -p` does.
+            if self.print || self.attribute_given() {
                 let mut cs = variable.attribute_flags(context.shell);
                 if cs.is_empty() {
                     cs.push('-');
