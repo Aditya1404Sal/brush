@@ -2489,12 +2489,28 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             };
             return Ok(Expansion::from(target));
         }
-        let expansion = self
-            .expand_parameter_without_indirect(parameter, allow_unset_vars)
-            .await?;
         if !indirect {
-            Ok(expansion)
-        } else if expansion.fields.is_empty()
+            return self
+                .expand_parameter_without_indirect(parameter, allow_unset_vars)
+                .await;
+        }
+        // The variable holding the name may be unset only when it is a positional parameter
+        // (`${!1}` is empty); otherwise bash reports it, `set -u` or not.
+        let expansion = self
+            .expand_parameter_without_indirect(parameter, true)
+            .await?;
+        if expansion.undefined
+            && matches!(
+                parameter,
+                brush_parser::word::Parameter::Named(_)
+                    | brush_parser::word::Parameter::NamedWithIndex { .. }
+            )
+        {
+            return Err(
+                error::ErrorKind::InvalidIndirectExpansion(diagnostic_name(parameter)).into(),
+            );
+        }
+        if expansion.fields.is_empty()
             && matches!(
                 parameter,
                 brush_parser::word::Parameter::Special(
@@ -2505,11 +2521,29 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             // `${!@}` and `${!*}` with no positional parameters expand to nothing, as in bash.
             Ok(expansion)
         } else {
+            let unset_is_error =
+                !allow_unset_vars && self.shell.options().treat_unset_variables_as_error;
+            let unset = || {
+                if unset_is_error {
+                    // Bash names the parameter as written: `!r: unbound variable`.
+                    Err(error::Error::from(error::ErrorKind::ExpandingUnsetVariable(
+                        parameter_error_name(parameter, true),
+                    ))
+                    .into_fatal())
+                } else {
+                    Ok(Expansion::undefined())
+                }
+            };
+            if expansion.undefined {
+                return unset();
+            }
             let parameter_str: String = self.fields_to_string(expansion);
             let inner_parameter = self.parse_indirect_parameter(parameter_str)?;
 
-            self.expand_parameter_without_indirect(&inner_parameter, allow_unset_vars)
-                .await
+            let inner = self
+                .expand_parameter_without_indirect(&inner_parameter, true)
+                .await?;
+            if inner.undefined { unset() } else { Ok(inner) }
         }
     }
 
