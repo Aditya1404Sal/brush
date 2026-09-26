@@ -38,6 +38,12 @@ impl builtins::Command for HashCommand {
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut result = ExecutionResult::success();
 
+        // With `set +h`, bash's `hash` does nothing but say so.
+        if !context.shell.options().remember_command_locations {
+            context.report("hashing disabled")?;
+            return Ok(ExecutionResult::general_error());
+        }
+
         if self.remove_all {
             context.shell.program_location_cache_mut().reset();
         } else if self.remove {
@@ -96,7 +102,16 @@ impl builtins::Command for HashCommand {
             // With no names, bash lists the table. Its hit counts start at zero here: commands
             // hashed without being run from a path have none.
             let cache = context.shell.program_location_cache();
-            if cache.is_empty() {
+            if self.display_as_usable_input {
+                // `hash -l` lists the table as commands that would rebuild it.
+                for (name, path) in cache.entries() {
+                    writeln!(
+                        context.stdout(),
+                        "builtin hash -p {} {name}",
+                        path.display()
+                    )?;
+                }
+            } else if cache.is_empty() {
                 writeln!(context.stdout(), "hash: hash table empty")?;
             } else {
                 writeln!(context.stdout(), "hits\tcommand")?;
