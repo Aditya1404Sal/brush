@@ -305,6 +305,7 @@ impl CompleteCommand {
             if let Some(target_spec) = target_spec {
                 let mut new_spec = Some(self.common_args.create_spec(extended_globbing));
                 std::mem::swap(&mut new_spec, target_spec);
+                context.shell.completion_config_mut().note_spec_defined();
             } else {
                 return error::unimp("set unspecified spec");
             }
@@ -458,7 +459,9 @@ impl CompleteCommand {
         if self.print {
             return Self::try_display_spec_for_command(context, name);
         } else if self.remove {
-            let result = context.shell.completion_config_mut().remove(name);
+            // Until a spec is defined, bash has no table, and removing one is no error.
+            let config = context.shell.completion_config_mut();
+            let result = config.remove(name) || !config.table_made();
             if !result {
                 context.report(format_args!("{name}: no completion specification"))?;
             }
@@ -524,6 +527,10 @@ impl builtins::Command for CompGenCommand {
             && spec.word_list.is_none()
             && spec.function_name.is_none()
             && spec.command.is_none()
+            && !spec.options.dir_names
+            && !spec.options.default
+            && !spec.options.bash_default
+            && !spec.options.plus_dirs
         {
             return Ok(ExecutionResult::success());
         }

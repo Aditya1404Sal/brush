@@ -172,6 +172,11 @@ pub enum CompleteOption {
 pub struct Config {
     commands: HashMap<String, Spec>,
 
+    /// Whether a spec was ever defined: bash makes its table of specs with the first one, and
+    /// until then removing a spec that is not there is no error.
+    #[cfg_attr(feature = "serde", serde(default))]
+    table_made: bool,
+
     /// Optionally, a completion spec to be used as a default, when earlier
     /// matches yield no candidates.
     pub default: Option<Spec>,
@@ -995,6 +1000,17 @@ impl Config {
         }
     }
 
+    /// Whether a spec was ever defined (see [`Self::note_spec_defined`]).
+    pub const fn table_made(&self) -> bool {
+        self.table_made
+    }
+
+    /// Notes that a spec was defined, as the default, empty-line and initial-word specs are by
+    /// assigning them directly.
+    pub const fn note_spec_defined(&mut self) {
+        self.table_made = true;
+    }
+
     /// Returns an iterator over the completion specs.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Spec)> {
         self.commands.iter()
@@ -1022,6 +1038,7 @@ impl Config {
     /// * `name` - The name of the command.
     /// * `spec` - The completion spec to associate with the command.
     pub fn set(&mut self, name: &str, spec: Spec) {
+        self.table_made = true;
         match name {
             EMPTY_COMMAND => {
                 self.empty_line = Some(spec);
