@@ -389,7 +389,7 @@ peg::parser! {
             }
 
         pub(crate) rule case_item_ns() -> ast::CaseItem =
-            s:specific_operator("(")? p:pattern() specific_operator(")") c:compound_list() {
+            s:case_item_open() p:pattern() specific_operator(")") c:compound_list() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = c.location();
 
@@ -397,7 +397,7 @@ peg::parser! {
 
                 ast::CaseItem { patterns: p, cmd: Some(c), post_action: ast::CaseItemPostAction::ExitCase, loc }
             } /
-            s:specific_operator("(")? p:pattern() e:specific_operator(")") linebreak() {
+            s:case_item_open() p:pattern() e:specific_operator(")") linebreak() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(e.location());
 
@@ -406,18 +406,23 @@ peg::parser! {
             }
 
         pub(crate) rule case_item() -> ast::CaseItem =
-            s:specific_operator("(")? p:pattern() specific_operator(")") linebreak() post_action:case_item_post_action() linebreak() {
+            s:case_item_open() p:pattern() specific_operator(")") linebreak() post_action:case_item_post_action() linebreak() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(post_action.1);
                 let loc = maybe_location(start, end);
                 ast::CaseItem { patterns: p, cmd: None, post_action: post_action.0, loc }
             } /
-            s:specific_operator("(")? p:pattern() specific_operator(")") c:compound_list() post_action:case_item_post_action() linebreak() {
+            s:case_item_open() p:pattern() specific_operator(")") c:compound_list() post_action:case_item_post_action() linebreak() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(post_action.1);
                 let loc = maybe_location(start, end);
                 ast::CaseItem { patterns: p, cmd: Some(c), post_action: post_action.0, loc }
             }
+
+        // A case item's `(`, if it has one; without it, `esac` ends the case, as in bash.
+        rule case_item_open() -> Option<&'input Token> =
+            o:specific_operator("(") { Some(o) } /
+            !specific_word("esac") { None }
 
         rule case_item_post_action() -> (ast::CaseItemPostAction, &'input SourceSpan)  =
             s:specific_operator(";;") {
