@@ -552,6 +552,18 @@ fn report_usage_error(
         let _ = writeln!(context.stderr(), "{name}: usage: {synopsis}");
         return results::ExecutionExitCode::InvalidUsage.into();
     }
+    // An option given no argument: `NAME: -X: option requires an argument`, and the usage line.
+    if let Some(synopsis) = bash_synopsis(name)
+        && error.kind() == ErrorKind::InvalidValue
+        && matches!(error.get(ContextKind::InvalidValue), Some(ContextValue::String(value)) if value.is_empty())
+        && let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg)
+        && let Some(option) = argument.split_whitespace().next()
+        && option.starts_with('-')
+    {
+        let _ = context.report(format_args!("{option}: option requires an argument"));
+        let _ = writeln!(context.stderr(), "{name}: usage: {synopsis}");
+        return results::ExecutionExitCode::InvalidUsage.into();
+    }
     let _ = writeln!(context.stderr(), "{error}");
     results::ExecutionExitCode::InvalidUsage.into()
 }

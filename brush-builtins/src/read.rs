@@ -191,6 +191,22 @@ impl builtins::Command for ReadCommand {
             }
         }
 
+        // An associative array cannot take the fields, as bash reports once it has read them.
+        if let Some(array) = self.array_variable.as_deref()
+            && context.shell.env().get(array).is_some_and(|(_, var)| {
+                matches!(
+                    var.value(),
+                    variables::ShellValue::AssociativeArray(_)
+                        | variables::ShellValue::Unset(
+                            variables::ShellValueUnsetType::AssociativeArray
+                        )
+                )
+            })
+        {
+            context.report(format_args!("{array}: not an indexed array"))?;
+            return Ok(brush_core::ExecutionResult::general_error());
+        }
+
         // Assign input to variables based on options. A name that is not a variable is reported
         // where bash reaches it, after the names before it are assigned.
         if let Some(invalid) = assign_input_to_variables(
