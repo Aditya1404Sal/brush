@@ -52,25 +52,25 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         };
 
         let pwd = cleaned_path.to_string_lossy().to_string();
+        let oldpwd = std::mem::replace(self.working_dir_mut(), cleaned_path);
 
-        self.env.update_or_add(
+        // The directory changes even when PWD or OLDPWD is readonly, as in bash, which then
+        // reports the variable it could not set (see [`error::ErrorKind::ReadonlyVariableNamed`]).
+        let pwd_result = self.env.update_or_add(
             "PWD",
             variables::ShellValueLiteral::Scalar(pwd),
             |_| Ok(()),
             EnvironmentLookup::Anywhere,
             EnvironmentScope::Global,
-        )?;
-        let oldpwd = std::mem::replace(self.working_dir_mut(), cleaned_path);
-
-        self.env.update_or_add(
+        );
+        let oldpwd_result = self.env.update_or_add(
             "OLDPWD",
             variables::ShellValueLiteral::Scalar(oldpwd.to_string_lossy().to_string()),
             |_| Ok(()),
             EnvironmentLookup::Anywhere,
             EnvironmentScope::Global,
-        )?;
-
-        Ok(())
+        );
+        pwd_result.and(oldpwd_result)
     }
 
     /// Tilde-shortens the given string, replacing the user's home directory with a tilde.

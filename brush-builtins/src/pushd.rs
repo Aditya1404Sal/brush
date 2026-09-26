@@ -69,11 +69,15 @@ impl builtins::Command for PushdCommand {
             if !self.no_directory_change
                 && let Err(error) = context.shell.set_working_dir(&rotated[0])
             {
-                context.report(format_args!(
-                    "{}: {}",
-                    rotated[0].display(),
-                    error.path_reason()
-                ))?;
+                if crate::dirs::is_readonly_pwd(&error) {
+                    context.shell.display_error(&mut context.stderr(), &error)?;
+                } else {
+                    context.report(format_args!(
+                        "{}: {}",
+                        rotated[0].display(),
+                        error.path_reason()
+                    ))?;
+                }
                 return Ok(ExecutionResult::general_error());
             }
             crate::dirs::set_stack(context.shell, &rotated[1..]);
@@ -86,7 +90,11 @@ impl builtins::Command for PushdCommand {
             } else {
                 let prev_working_dir = context.shell.working_dir().to_path_buf();
                 if let Err(error) = context.shell.set_working_dir(std::path::Path::new(dir)) {
-                    context.report(format_args!("{dir}: {}", error.path_reason()))?;
+                    if crate::dirs::is_readonly_pwd(&error) {
+                        context.shell.display_error(&mut context.stderr(), &error)?;
+                    } else {
+                        context.report(format_args!("{dir}: {}", error.path_reason()))?;
+                    }
                     return Ok(ExecutionResult::general_error());
                 }
                 context.shell.directory_stack_mut().push(prev_working_dir);
