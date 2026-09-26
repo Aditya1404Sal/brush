@@ -78,17 +78,21 @@ impl Regex {
         self
     }
 
+    /// The pattern as bash's regex library gets it: quoted text escaped.
+    pub(crate) fn pattern(&self) -> String {
+        self.pieces
+            .iter()
+            .map(|piece| piece.to_regex_str())
+            .collect()
+    }
+
     /// Computes if the regular expression matches the given string.
     ///
     /// # Arguments
     ///
     /// * `value` - The string to check for a match.
     pub fn matches(&self, value: &str) -> Result<Option<Vec<Option<String>>>, error::Error> {
-        let regex_pattern: String = self
-            .pieces
-            .iter()
-            .map(|piece| piece.to_regex_str())
-            .collect();
+        let regex_pattern = self.pattern();
 
         // A pattern bash's regex library refuses is refused here too, whether or not this engine
         // would take it. That library reads the bytes the pattern stands for, in UTF-8.

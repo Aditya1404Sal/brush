@@ -355,15 +355,20 @@ async fn apply_binary_predicate(
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
     match op {
-        ast::BinaryPredicate::StringMatchesRegex => {
+        // A pattern that starts quoted is a regular expression too, its quoted text matched
+        // literally, as in bash.
+        ast::BinaryPredicate::StringMatchesRegex
+        | ast::BinaryPredicate::StringContainsSubstring => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
             let regex = expansion::basic_expand_regex(shell, params, right)
                 .await?
                 .set_multiline(true);
 
             if shell.options().print_commands_and_arguments {
+                // As the regex library gets it: expanded, with quoted text escaped.
+                let pattern = regex.pattern();
                 shell
-                    .trace_command(params, std::format!("[[ {s} {op} {right} ]]"))
+                    .trace_command(params, std::format!("[[ {s} {op} {pattern} ]]"))
                     .await;
             }
 
@@ -419,18 +424,6 @@ async fn apply_binary_predicate(
             }
 
             Ok(left != right)
-        }
-        ast::BinaryPredicate::StringContainsSubstring => {
-            let s = expansion::basic_expand_word(shell, params, left).await?;
-            let substring = expansion::basic_expand_word(shell, params, right).await?;
-
-            if shell.options().print_commands_and_arguments {
-                shell
-                    .trace_command(params, std::format!("[[ {s} {op} {substring} ]]"))
-                    .await;
-            }
-
-            Ok(s.contains(substring.as_str()))
         }
         ast::BinaryPredicate::FilesReferToSameDeviceAndInodeNumbers => {
             let left = expansion::basic_expand_word(shell, params, left).await?;
