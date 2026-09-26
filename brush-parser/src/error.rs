@@ -266,6 +266,7 @@ fn conditional_diagnostic(
                 cond_token: CondToken::Error,
                 failed: CondToken::Error,
                 messages: vec![],
+                ended: false,
             };
             match conditional.command(token.location().start.line) {
                 Ok(next) => {
@@ -324,6 +325,9 @@ struct Conditional<'a> {
     /// The token read last when the error was found.
     failed: CondToken,
     messages: Vec<String>,
+    /// Whether the messages are complete: bash read to the end of the input inside a regular
+    /// expression's parentheses, and says nothing of the command itself.
+    ended: bool,
 }
 
 impl Conditional<'_> {
@@ -348,6 +352,9 @@ impl Conditional<'_> {
             }
         }
         let mut diagnostic = std::mem::take(&mut self.messages);
+        if self.ended {
+            return Err(diagnostic);
+        }
         if let CondToken::At(i) = self.failed {
             diagnostic.extend(self.near(i));
         } else {
@@ -464,8 +471,17 @@ impl Conditional<'_> {
         let argument = self.read();
         match argument {
             CondToken::At(k) if self.is_operand(k) || (regex && self.is_operator(k, "(")) => {
-                if regex {
-                    self.skip_regex(k);
+                if regex && let Some(open_line) = self.skip_regex(k) {
+                    // Bash reads parentheses in a regular expression as a matched pair, here
+                    // to the end of the input.
+                    self.messages.push(std::format!(
+                        "line {open_line}: unexpected EOF while looking for matching `)'"
+                    ));
+                    self.ended = true;
+                    return self.fail(
+                        CondToken::End,
+                        "unexpected argument to conditional binary operator",
+                    );
                 }
                 self.cond_token = self.skip_newlines();
             }
@@ -480,24 +496,30 @@ impl Conditional<'_> {
     }
 
     /// Reads the rest of a regular expression that starts with the token at `first`: the tokens
-    /// that follow it with no blank between, and anything inside parentheses.
-    fn skip_regex(&mut self, first: usize) {
+    /// that follow it with no blank between, and anything inside parentheses. Returns the line of
+    /// the `(` whose pair the input ended in, if it did.
+    fn skip_regex(&mut self, first: usize) -> Option<usize> {
         let depth_change = |token: &crate::Token| match token {
             crate::Token::Operator(o, _) if o == "(" => 1,
             crate::Token::Operator(o, _) if o == ")" => -1,
             _ => 0,
         };
         let mut depth = depth_change(&self.tokens[first]);
+        let mut open_line = self.tokens[first].location().start.line;
         let mut last = first;
         while let Some(token) = self.tokens.get(self.next) {
             let adjacent = token.location().start.index == self.tokens[last].location().end.index;
             if depth <= 0 && (!adjacent || token.to_str() == "\n") {
-                break;
+                return None;
+            }
+            if depth <= 0 {
+                open_line = token.location().start.line;
             }
             depth += depth_change(token);
             last = self.next;
             self.next += 1;
         }
+        (depth > 0).then_some(open_line)
     }
 
     const fn read(&mut self) -> CondToken {
@@ -1182,6 +1204,35 @@ mod tests {
 
     #[test]
     fn words_conditional_command_errors_as_bash() {
+        // Parentheses in a regular expression are a matched pair, which may take in `]]`.
+        for (source, lines) in [
+            ("[[ a =~ ( ]]", (1, 2)),
+            ("[[ '(' =~ [(] ]] && echo t", (1, 2)),
+            ("echo y\n[[ a =~ x( ]]; echo x", (2, 3)),
+        ] {
+            assert_eq!(
+                diagnose(source),
+                [
+                    std::format!(
+                        "line {}: unexpected EOF while looking for matching `)'",
+                        lines.0
+                    ),
+                    std::format!(
+                        "line {}: unexpected argument to conditional binary operator",
+                        lines.1
+                    ),
+                ],
+                "{source:?}"
+            );
+        }
+        assert!(
+            crate::Parser::new(
+                &mut std::io::BufReader::new(&b"[[ a =~ (b ]] ) ]] && echo m"[..]),
+                &crate::ParserOptions::default()
+            )
+            .parse_program()
+            .is_ok()
+        );
         assert_eq!(
             diagnose("echo x; [[ ( a\n&& b ) ]]"),
             [
