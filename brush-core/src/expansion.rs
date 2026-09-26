@@ -1597,20 +1597,28 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         ParameterState::DefinedEmptyString,
                     ) => Ok(expanded_parameter),
                     _ => {
-                        let result = self.basic_expand_to_str(error_message).await?;
-                        // As bash words it: `NAME: message`, with a default message.
-                        let message = if !result.is_empty() {
-                            result
-                        } else if null_counts {
-                            "parameter null or not set".to_owned()
+                        // As bash words it: `NAME: message`, with a default message when there
+                        // is no word. Bash expands the word as if unquoted, splits what its
+                        // expansions give, and joins the fields with spaces.
+                        let message = if error_message.is_empty() {
+                            if null_counts {
+                                "parameter null or not set".to_owned()
+                            } else {
+                                "parameter not set".to_owned()
+                            }
                         } else {
-                            "parameter not set".to_owned()
+                            let previously_in_double_quotes =
+                                std::mem::replace(&mut self.in_double_quotes, false);
+                            let expansion = self.basic_expand(error_message).await;
+                            self.in_double_quotes = previously_in_double_quotes;
+                            fieldsplit::split_fields(&self.shell.ifs(), expansion?)
+                                .into_iter()
+                                .map(String::from)
+                                .join(" ")
                         };
-                        // Bash names a positional parameter here by its number alone.
-                        let name = match &parameter {
-                            brush_parser::word::Parameter::Positional(n) => n.to_string(),
-                            parameter => diagnostic_name(parameter),
-                        };
+                        // Bash names a positional or special parameter here by itself (`1`,
+                        // `@`), and an indirect one with its `!`.
+                        let name = parameter_error_name(&parameter, indirect);
                         let err: error::Error =
                             error::ErrorKind::CheckedExpansionError(format!("{name}: {message}"))
                                 .into();
@@ -3079,6 +3087,18 @@ fn may_contain_braces_to_expand(s: &str) -> bool {
 }
 
 /// A parameter as bash names it in a diagnostic: `x`, `a[1]`, `$1`, `$@`.
+/// How bash names `parameter` in an error of its expansion, `${x?}` or `set -u`'s: a positional or
+/// special parameter by itself (`1`, `@`), and an indirect one with its `!`.
+fn parameter_error_name(parameter: &brush_parser::word::Parameter, indirect: bool) -> String {
+    use brush_parser::word::Parameter;
+    let name = match parameter {
+        Parameter::Positional(n) => n.to_string(),
+        Parameter::Special(special) => special.to_string(),
+        parameter => diagnostic_name(parameter),
+    };
+    if indirect { format!("!{name}") } else { name }
+}
+
 fn diagnostic_name(parameter: &brush_parser::word::Parameter) -> String {
     use brush_parser::word::Parameter;
     match parameter {
