@@ -262,6 +262,17 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         Ok(options.open(path_to_open)?.into())
     }
 
+    /// The descriptor `path` names (`/dev/stdin`, `/dev/fd/N`) when it is open for the command
+    /// these parameters are for.
+    pub(crate) fn open_file_named(
+        &self,
+        params: &ExecutionParameters,
+        path: &str,
+    ) -> Option<openfiles::OpenFile> {
+        shell_fd_path_to_fd(&self.absolute_path(Path::new(path)))
+            .and_then(|fd| params.try_fd(self, fd))
+    }
+
     /// Whether `path` names one of the shell's descriptors (`/dev/fd/N`, `/dev/stdin`) that is not
     /// open for the command these parameters are for.
     #[cfg(target_arch = "wasm32")]

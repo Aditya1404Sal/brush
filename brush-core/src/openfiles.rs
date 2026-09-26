@@ -72,6 +72,31 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
     fn target_id(&self) -> Option<usize> {
         None
     }
+
+    /// The kind of file a descriptor open on this stream is, as `test` sees it through
+    /// `/dev/stdin` or `/dev/fd/N`. `None` when the stream cannot say.
+    fn file_kind(&self) -> Option<StreamKind> {
+        None
+    }
+}
+
+/// The kind of file a stream stands for (see [`Stream::file_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKind {
+    /// A character device, as `/dev/null` is.
+    CharacterDevice,
+    /// A pipe.
+    Fifo,
+}
+
+/// What `test` sees of a file a descriptor is open on (see [`OpenFile::test_type`]).
+pub(crate) enum DescriptorType {
+    /// A file with this metadata.
+    File(std::fs::Metadata),
+    /// A character device.
+    CharacterDevice,
+    /// A pipe.
+    Fifo,
 }
 
 /// Represents a file open in a shell context.
@@ -173,6 +198,9 @@ pub fn null_sink() -> OpenFile {
     impl Stream for Null {
         fn input_ready(&self) -> Option<bool> {
             Some(true)
+        }
+        fn file_kind(&self) -> Option<StreamKind> {
+            Some(StreamKind::CharacterDevice)
         }
         fn clone_box(&self) -> Box<dyn Stream> {
             Box::new(Self)
@@ -491,6 +519,21 @@ impl OpenFile {
             Self::Stderr(f) => f.is_terminal(),
             Self::File(f) => f.is_terminal(),
             Self::PipeReader(_) | Self::PipeWriter(_) | Self::Stream(_) => false,
+        }
+    }
+
+    /// What `test` sees of the file this descriptor is open on, as bash sees it through
+    /// `/dev/stdin` or `/dev/fd/N`: `None` for the shell's own original streams and a stream
+    /// that cannot say, whose path answers instead.
+    pub(crate) fn test_type(&self) -> Option<DescriptorType> {
+        match self {
+            Self::File(file) => file.metadata().ok().map(DescriptorType::File),
+            Self::PipeReader(_) | Self::PipeWriter(_) => Some(DescriptorType::Fifo),
+            Self::Stream(stream) => stream.file_kind().map(|kind| match kind {
+                StreamKind::CharacterDevice => DescriptorType::CharacterDevice,
+                StreamKind::Fifo => DescriptorType::Fifo,
+            }),
+            Self::Stdin(_) | Self::Stdout(_) | Self::Stderr(_) => None,
         }
     }
 }
@@ -878,6 +921,10 @@ mod mem_pipe {
     }
 
     impl super::Stream for MemPipeWriter {
+        fn file_kind(&self) -> Option<super::StreamKind> {
+            Some(super::StreamKind::Fifo)
+        }
+
         fn poll_write(
             &mut self,
             cx: &mut std::task::Context<'_>,
@@ -1005,6 +1052,10 @@ mod mem_pipe {
     }
 
     impl super::Stream for MemPipeReader {
+        fn file_kind(&self) -> Option<super::StreamKind> {
+            Some(super::StreamKind::Fifo)
+        }
+
         fn poll_read(
             &mut self,
             cx: &mut std::task::Context<'_>,
