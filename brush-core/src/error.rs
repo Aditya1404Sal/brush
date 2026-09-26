@@ -615,7 +615,23 @@ impl Error {
         self,
         shell: &Shell<impl extensions::ShellExtensions>,
     ) -> results::ExecutionResult {
-        let next_control_flow = self.to_control_flow(shell);
+        let mut next_control_flow = self.to_control_flow(shell);
+        // A fatal error among the EXIT trap's own commands ends the trap but not with the error's
+        // status: the shell keeps the status it had as the trap began, as in bash (only `exit`
+        // or errexit in the trap sets it).
+        if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
+            && matches!(
+                shell
+                    .call_stack()
+                    .current_frame()
+                    .map(|frame| &frame.frame_type),
+                Some(crate::callstack::FrameType::TrapHandler(
+                    crate::traps::TrapSignal::Exit
+                ))
+            )
+        {
+            next_control_flow = results::ExecutionControlFlow::Normal;
+        }
         // An unset variable (`set -u`, `${x?}`) ends `bash -c` with 127, as in bash; a script
         // read from a file or standard input, `set -e`, or a subshell ended by it gives 1.
         let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
