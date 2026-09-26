@@ -128,9 +128,21 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             return Ok(ExecutionResult::success());
         }
 
-        let Some(handler) = self.traps.get_effective_handler(signal).cloned() else {
+        let Some(mut handler) = self.traps.get_effective_handler(signal).cloned() else {
             return Ok(ExecutionResult::success());
         };
+
+        // Bash numbers the lines of a DEBUG, ERR or RETURN trap's action on from the command that
+        // sets it off, and every other trap's from 1.
+        let first_line = match signal {
+            TrapSignal::Debug | TrapSignal::Err | TrapSignal::Return => self.line_number(),
+            TrapSignal::Exit | TrapSignal::Signal(_) => 1,
+        };
+        handler.source_info.start = Some(std::sync::Arc::new(crate::SourcePosition {
+            index: 0,
+            line: first_line,
+            column: 1,
+        }));
 
         let mut params = params.clone();
         params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
