@@ -1382,6 +1382,8 @@ peg::parser! {
 
         rule arithmetic_text_piece_with_source() -> Option<WordPieceWithSource> =
             "\"" { None } /
+            // Bash drops the `$` of `$'...'` and `$"..."` here, and keeps the quotes as text.
+            "$" &['\'' | '"'] { None } /
             start_index:position!() piece:arithmetic_text_piece() end_index:position!() {
                 Some(WordPieceWithSource { piece, start_index, end_index })
             }
@@ -1392,7 +1394,7 @@ peg::parser! {
             command_substitution() /
             parameter_expansion() /
             double_quoted_escape_sequence() /
-            s:$((!double_quoted_escape_sequence() !dollar_sign_word_piece() [^'\"' | '`'])+) {
+            s:$((!double_quoted_escape_sequence() !dollar_sign_word_piece() !("$" ['\'' | '"']) [^'\"' | '`'])+) {
                 WordPiece::Text(s.to_owned())
             }
 

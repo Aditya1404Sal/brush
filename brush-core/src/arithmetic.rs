@@ -143,6 +143,15 @@ pub(crate) async fn expand_and_eval(
     eval_expanded(shell, params, expanded_self, trace_if_needed).await
 }
 
+/// Parses and evaluates an arithmetic expression that is already expanded.
+pub(crate) async fn eval_expanded_text(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    expanded: &str,
+) -> Result<i64, EvalError> {
+    eval_expanded(shell, params, expanded.to_owned(), false).await
+}
+
 /// Parses and evaluates an expanded arithmetic expression.
 async fn eval_expanded(
     shell: &mut Shell<impl extensions::ShellExtensions>,

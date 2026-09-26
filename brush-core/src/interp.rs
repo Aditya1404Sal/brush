@@ -3412,8 +3412,21 @@ async fn apply_assignment_unchecked(
             array_index = None;
             name
         }
+        // An indexed array's subscript is expanded as an arithmetic expression is (a single
+        // quote stays, for the evaluation to reject), an associative array's as a word.
         ast::AssignmentName::ArrayElementName(name, index) => {
-            let expanded = expansion::basic_expand_word(shell, params, index).await?;
+            let associative = shell.env().get(name).is_some_and(|(_, var)| {
+                matches!(
+                    var.value(),
+                    ShellValue::AssociativeArray(_)
+                        | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+                )
+            });
+            let expanded = if associative {
+                expansion::basic_expand_word(shell, params, index).await?
+            } else {
+                expansion::basic_expand_arithmetic_text(shell, params, index).await?
+            };
             array_index = Some(expanded);
             name
         }
@@ -3664,7 +3677,7 @@ async fn apply_assignment_unchecked(
 
         if will_be_indexed_array {
             array_index = Some(
-                arithmetic::expand_and_eval(shell, params, idx.as_str(), false)
+                arithmetic::eval_expanded_text(shell, params, idx.as_str())
                     .await
                     .map_err(arithmetic::EvalError::in_subscript)?
                     .to_string(),
