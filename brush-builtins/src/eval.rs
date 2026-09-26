@@ -4,8 +4,8 @@ use clap::Parser;
 /// Evaluate the given string as script.
 #[derive(Parser)]
 pub(crate) struct EvalCommand {
-    /// The script to evaluate.
-    #[clap(allow_hyphen_values = true)]
+    /// The script to evaluate. An option (there are none) is an invalid one, as in bash.
+    #[clap(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
