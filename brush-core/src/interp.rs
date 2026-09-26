@@ -2537,6 +2537,29 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
             .as_ref()
             .map(|won| CommandPrefixOrSuffixItem::Word(won.clone()));
 
+        // An alias whose body is more than words (`if ...; fi`, `a | b`) is read again with the
+        // rest of the command, as bash reads it in place of its name.
+        if self.prefix.is_none()
+            && let Some(name) = &self.word_or_name
+            && let Some(body) = compound_alias_body(&context.shell, &name.value)
+        {
+            let rest = self
+                .suffix
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let text = if rest.is_empty() || body.ends_with([' ', '\t']) {
+                format!("{body}{rest}")
+            } else {
+                format!("{body} {rest}")
+            };
+            let source_info = context.shell.call_stack().current_pos_as_source_info();
+            EXPANDING_ALIASES.with(|names| names.borrow_mut().push(name.value.clone()));
+            let result = context.shell.run_string(text, &source_info, &params).await;
+            EXPANDING_ALIASES.with(|names| names.borrow_mut().pop());
+            return Ok(result?.into());
+        }
+
         // `>(list)` substitutions among the arguments and redirects run once the command has
         // finished.
         #[cfg(target_arch = "wasm32")]
@@ -3222,6 +3245,47 @@ fn fd_variable_element(
         arithmetic::eval_subscript(shell, subscript)?.to_string()
     };
     Ok(Some((name.to_owned(), key)))
+}
+
+thread_local! {
+    /// The aliases whose bodies are being read again (see `compound_alias_body`), which bash does
+    /// not expand again within themselves.
+    static EXPANDING_ALIASES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// The body of the alias `name` names, when it is more than a sequence of words: an operator in
+/// it, or a reserved word first, needs it read as code.
+fn compound_alias_body(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    name: &str,
+) -> Option<String> {
+    if EXPANDING_ALIASES.with(|names| names.borrow().iter().any(|expanding| expanding == name)) {
+        return None;
+    }
+    let body = shell.alias_for_expansion(name)?;
+    let options = shell.parser_options().tokenizer_options();
+    let tokens = brush_parser::tokenize_str_with_options(body, &options).ok()?;
+    let reserved = |word: &str| {
+        matches!(
+            word,
+            "if" | "for"
+                | "while"
+                | "until"
+                | "case"
+                | "select"
+                | "{"
+                | "[["
+                | "!"
+                | "function"
+                | "time"
+                | "coproc"
+        )
+    };
+    let compound = tokens
+        .iter()
+        .any(|token| matches!(token, brush_parser::Token::Operator(..)))
+        || tokens.first().is_some_and(|token| reserved(token.to_str()));
+    compound.then(|| body.to_owned())
 }
 
 /// Tokenizes the body of an alias into the unexpanded words that should replace the aliased command
