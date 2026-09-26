@@ -586,7 +586,11 @@ impl DeclareCommand {
         // enclosing scope instead of starting unset; `+=` appends to the
         // inherited value. With no same-name variable anywhere, fall through
         // to ordinary creation.
-        if self.locals_inherit_from_prev_scope && create_var_local {
+        // `shopt -s localvar_inherit` makes every new local do the same.
+        if (self.locals_inherit_from_prev_scope
+            || context.shell.options().local_vars_inherit_value_and_attrs)
+            && create_var_local
+        {
             let inherited = context
                 .shell
                 .env()
