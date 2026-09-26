@@ -3196,6 +3196,34 @@ async fn execute_command<T: Into<String>>(
     cmd.execute().await
 }
 
+/// The array and key a redirection's fd variable names when it is an element (`{a[1]}`): an
+/// indexed array's subscript is evaluated arithmetically, an associative array's is the key as
+/// written.
+fn fd_variable_element(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    variable: &str,
+) -> Result<Option<(String, String)>, error::Error> {
+    let Some((name, subscript)) = variable
+        .strip_suffix(']')
+        .and_then(|rest| rest.split_once('['))
+    else {
+        return Ok(None);
+    };
+    let associative = shell.env().get(name).is_some_and(|(_, var)| {
+        matches!(
+            var.value(),
+            ShellValue::AssociativeArray(_)
+                | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+        )
+    });
+    let key = if associative {
+        subscript.to_owned()
+    } else {
+        arithmetic::eval_subscript(shell, subscript)?.to_string()
+    };
+    Ok(Some((name.to_owned(), key)))
+}
+
 /// Tokenizes the body of an alias into the unexpanded words that should replace the aliased command
 /// name.
 ///
@@ -3793,11 +3821,15 @@ pub(crate) async fn setup_redirect(
             // `{fd}>&-` closes the descriptor the variable holds; bash names the variable when it
             // holds none.
             if matches!(target, ast::IoFileRedirectTarget::Duplicate(word) if word.value == "-") {
-                let value = if variable.contains('[') {
-                    let word = ast::Word::from(format!("${{{variable}}}"));
-                    Some(Box::pin(expansion::basic_expand_word(shell, params, &word)).await?)
-                } else {
-                    shell.env_str(variable).map(|value| value.to_string())
+                let value = match fd_variable_element(shell, variable)? {
+                    Some((name, key)) => shell.env().get(&name).and_then(|(_, var)| {
+                        var.value()
+                            .get_at(&key, shell)
+                            .ok()
+                            .flatten()
+                            .map(|value| value.to_string())
+                    }),
+                    None => shell.env_str(variable).map(|value| value.to_string()),
                 };
                 let fd = value
                     .and_then(|value| value.parse::<ShellFd>().ok())
@@ -3813,13 +3845,23 @@ pub(crate) async fn setup_redirect(
             Box::pin(setup_redirect(shell, params, &redirect)).await?;
             // The variable may be an array element (`{a[1]}`). One that cannot be assigned is
             // reported, and so is the descriptor it did not take, as bash does.
-            let assigned = Box::pin(expansion::assign_to_named_parameter(
-                shell,
-                params,
-                variable,
-                fd.to_string(),
-            ))
-            .await;
+            let assigned = match fd_variable_element(shell, variable)? {
+                Some((name, key)) => shell.env_mut().update_or_add_array_element(
+                    name,
+                    key,
+                    fd.to_string(),
+                    |_| Ok(()),
+                    EnvironmentLookup::Anywhere,
+                    EnvironmentScope::Global,
+                ),
+                None => shell.env_mut().update_or_add(
+                    variable,
+                    ShellValueLiteral::Scalar(fd.to_string()),
+                    |_| Ok(()),
+                    EnvironmentLookup::Anywhere,
+                    EnvironmentScope::Global,
+                ),
+            };
             if let Err(error) = assigned {
                 if !matches!(
                     error.kind(),
