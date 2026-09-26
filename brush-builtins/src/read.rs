@@ -95,13 +95,6 @@ impl builtins::Command for ReadCommand {
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        if self.use_readline {
-            return error::unimp("read -e");
-        }
-        if self.initial_text.is_some() {
-            return error::unimp("read -i");
-        }
-
         // A count that is not a number fails, in bash's words.
         for count in [
             &self.return_after_n_chars,
@@ -138,6 +131,12 @@ impl builtins::Command for ReadCommand {
             context.report(format_args!("{fd_num}: {reason}: Bad file descriptor"))?;
             return Ok(brush_core::ExecutionResult::general_error());
         };
+
+        // Bash reads with readline (-e, and its -i text) only from a terminal; otherwise both
+        // options change nothing.
+        if self.use_readline && input_stream.is_terminal() {
+            return error::unimp("read -e from a terminal");
+        }
 
         // Retrieve effective value of IFS for splitting.
         // We convert to owned String to release the borrow before the mutable borrow
