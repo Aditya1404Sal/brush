@@ -491,6 +491,55 @@ impl DeclareCommand {
             }
             value => value,
         };
+
+        // What bash refuses to make a name reference, before it evaluates an integer's value.
+        if self.make_nameref.to_bool() == Some(true) && assigned_index.is_none() {
+            // With `-i`, bash makes nothing, and says nothing.
+            if self.make_integer.to_bool() == Some(true) {
+                return Ok(false);
+            }
+            // An array cannot be one: a new value is assigned as an indexed array's.
+            let existing_array = self
+                .existing_variable(context.shell, name.as_str(), current_lookup)
+                .is_some_and(|var| var.value().is_array());
+            if existing_array || matches!(initial_value, Some(ShellValueLiteral::Array(_))) {
+                context.report(format_args!(
+                    "{name}: reference variable cannot be an array"
+                ))?;
+                if let Some(value @ ShellValueLiteral::Array(_)) = initial_value {
+                    let scope = if create_var_local {
+                        EnvironmentScope::Local
+                    } else {
+                        EnvironmentScope::Global
+                    };
+                    context.shell.env_mut().update_or_add(
+                        name.as_str(),
+                        value,
+                        |_| Ok(()),
+                        current_lookup,
+                        scope,
+                    )?;
+                }
+                return Ok(false);
+            }
+            // Nor can it refer to no name; a new local is still declared, plainly.
+            if matches!(&initial_value, Some(ShellValueLiteral::Scalar(target)) if target.is_empty())
+            {
+                context.report("`': not a valid identifier")?;
+                if create_var_local
+                    && self
+                        .existing_variable(context.shell, name.as_str(), current_lookup)
+                        .is_none()
+                {
+                    let var = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
+                    context
+                        .shell
+                        .env_mut()
+                        .add(name, var, EnvironmentScope::Local)?;
+                }
+                return Ok(false);
+            }
+        }
         let initial_value = self.evaluate_if_integer(context, &name, initial_value)?;
 
         // Special-case: `local -` saves the `set` options, to restore when the function returns.

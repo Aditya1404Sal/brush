@@ -73,6 +73,16 @@ impl builtins::Command for UnsetCommand {
                     let (base, outcome) = match parameter {
                         brush_parser::word::Parameter::Positional(_)
                         | brush_parser::word::Parameter::Special(_) => continue,
+                        // A name reference to an array element unsets the element.
+                        brush_parser::word::Parameter::Named(name)
+                            if let Some((base, index)) =
+                                context.shell.env().resolve_nameref_element(&name) =>
+                        {
+                            let outcome =
+                                unset_array_index(context.shell, &context.params, &base, &index)
+                                    .await;
+                            (base, outcome)
+                        }
                         brush_parser::word::Parameter::Named(name) => {
                             // Bash looks the name up twice; a circular name reference warns.
                             context.shell.warn_circular_nameref(

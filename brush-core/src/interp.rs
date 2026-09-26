@@ -3364,11 +3364,20 @@ async fn apply_assignment(
     )
     .await
     .map_err(|error| match error.kind() {
-        // Reported here, where LINENO names the assignment, even inside a function.
+        // Reported here, where LINENO names the assignment, even inside a function. Bash names
+        // the variable a name reference refers to.
         error::ErrorKind::ReadonlyVariable => {
-            let error = error::Error::from(error::ErrorKind::ReadonlyVariableNamed(
-                assignment.name.base_name().to_owned(),
-            ));
+            let resolved = shell.env().resolve_nameref(assignment.name.base_name());
+            let name = resolved
+                .split_once('[')
+                .map_or(resolved.as_ref(), |(base, _)| base);
+            let name = if name.is_empty() {
+                assignment.name.base_name()
+            } else {
+                name
+            };
+            let error =
+                error::Error::from(error::ErrorKind::ReadonlyVariableNamed(name.to_owned()));
             let _ = shell.display_error(&mut params.stderr(shell), &error);
             error.into_reported()
         }
