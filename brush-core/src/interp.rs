@@ -1761,33 +1761,34 @@ impl Execute for ast::CompoundCommand {
             Self::ArithmeticForClause(a) => a.execute(shell, params).await,
             Self::Coprocess(c) => c.execute(shell, params).await,
             Self::ExtendedTest(e) => {
-                let result =
-                    match extendedtests::eval_extended_test_expr(&e.expr, shell, params).await {
-                        Ok(true) => 0,
-                        Ok(false) => 1,
-                        // A regular expression that does not compile, or a descriptor that is no
-                        // number (`-t x`), fails the test with status 2.
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                error::ErrorKind::InvalidRegex(..)
-                                    | error::ErrorKind::IntegerExpressionExpected(..)
-                            ) =>
-                        {
-                            writeln!(
-                                params.stderr(shell),
-                                "{}[[: {error}",
-                                shell.diagnostic_prefix()
-                            )?;
-                            return Ok(ExecutionResult::new(2));
-                        }
-                        Err(error) => {
-                            return match error.into_eval_error() {
-                                Ok(error) => arithmetic_command_error(shell, params, "[[", &error),
-                                Err(error) => Err(error),
-                            };
-                        }
-                    };
+                let result = match extendedtests::eval_extended_test_expr(&e.expr, shell, params)
+                    .await
+                {
+                    Ok(true) => 0,
+                    Ok(false) => 1,
+                    // A regular expression that does not compile, or a descriptor that is no
+                    // number (`-t x`), fails the test with status 2.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            error::ErrorKind::InvalidRegex(..)
+                                | error::ErrorKind::IntegerExpressionExpected(..)
+                        ) =>
+                    {
+                        // A pattern or value in the message holds the bytes it stands for.
+                        let message = std::format!("{}[[: {error}\n", shell.diagnostic_prefix());
+                        params
+                            .stderr(shell)
+                            .write_all(&crate::rawbytes::encode(&message))?;
+                        return Ok(ExecutionResult::new(2));
+                    }
+                    Err(error) => {
+                        return match error.into_eval_error() {
+                            Ok(error) => arithmetic_command_error(shell, params, "[[", &error),
+                            Err(error) => Err(error),
+                        };
+                    }
+                };
                 Ok(ExecutionResult::new(result))
             }
         }

@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-use crate::error;
+use crate::{error, rawbytes};
 use cached::Cached;
 
 /// Cache mapping a (pattern, case-insensitive, multiline) key to a compiled regex.
@@ -91,40 +91,108 @@ impl Regex {
             .collect();
 
         // A pattern bash's regex library refuses is refused here too, whether or not this engine
-        // would take it.
-        if let Some(reason) = invalid_regex_reason(&regex_pattern) {
-            return Err(error::ErrorKind::InvalidRegex(regex_pattern, reason).into());
+        // would take it. That library reads the bytes the pattern stands for, in UTF-8.
+        let invalid = |reason| {
+            error::Error::from(error::ErrorKind::InvalidRegex(
+                regex_pattern.clone(),
+                reason,
+            ))
+        };
+        if let Some(reason) = invalid_regex_reason(&rawbytes::encode(&regex_pattern)) {
+            return Err(invalid(reason));
         }
-        let re = compile_regex(regex_pattern.clone(), self.case_insensitive, self.multiline)
-            .map_err(|_error| {
-                error::Error::from(error::ErrorKind::InvalidRegex(
-                    regex_pattern,
-                    "Invalid regular expression",
-                ))
-            })?;
+        let Ok(pattern) = String::from_utf8(rawbytes::encode(&regex_pattern).into_owned()) else {
+            return Err(invalid(INVALID_REGEXP));
+        };
+        let back_references = has_back_reference(&pattern);
+        let re = compile_regex(pattern, self.case_insensitive, self.multiline)
+            .map_err(|_error| invalid("Invalid regular expression"))?;
 
-        Ok(re.captures(value)?.map(|captures| {
-            captures
-                .iter()
-                .map(|c| c.map(|m| m.as_str().to_owned()))
-                .collect()
-        }))
+        if back_references {
+            // musl matches a back-reference by backtracking, which reads a byte that is no
+            // character as it reads any other.
+            return Ok(re
+                .captures(value)?
+                .map(|captures| shell_values(captures.iter().map(|c| c.map(|m| m.as_str())))));
+        }
+        // musl's other matcher reads the value one character at a time, one past the character
+        // it matches, until no match can go further; reaching a byte that is not UTF-8 ends it
+        // with no match. So a match lies before the first such byte, and ends at least two
+        // characters before it.
+        let bytes = rawbytes::encode(value);
+        let text = bytes.utf8_chunks().next().map_or("", |chunk| chunk.valid());
+        let reaches_cut = |end: usize| {
+            text.len() < bytes.len()
+                && text
+                    .get(end..)
+                    .is_none_or(|rest| rest.chars().nth(1).is_none())
+        };
+        Ok(re
+            .captures(text)?
+            .filter(|captures| !captures.get(0).is_some_and(|m| reaches_cut(m.end())))
+            .map(|captures| shell_values(captures.iter().map(|c| c.map(|m| m.as_str())))))
     }
+}
+
+/// Captured text as shell strings (see `rawbytes`).
+fn shell_values<'a>(captures: impl Iterator<Item = Option<&'a str>>) -> Vec<Option<String>> {
+    captures
+        .map(|c| c.map(|text| rawbytes::decode(text.as_bytes()).into_owned()))
+        .collect()
+}
+
+/// musl's reason for a pattern that holds a byte that is not UTF-8.
+const INVALID_REGEXP: &str = "Invalid regexp";
+
+/// Whether `pattern` refers back to a group (`\1`).
+fn has_back_reference(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.next().is_some_and(|c| matches!(c, '1'..='9')) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Why `pattern` is not a valid POSIX extended regular expression, as the C library bash uses
 /// (musl) words it, or `None` when this check finds nothing wrong.
-fn invalid_regex_reason(pattern: &str) -> Option<&'static str> {
+fn invalid_regex_reason(pattern: &[u8]) -> Option<&'static str> {
     const CLASSES: [&str; 12] = [
         "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
         "upper", "xdigit",
     ];
-    let mut chars = pattern.chars().peekable();
+    // The pattern's characters, `None` for a byte that is not UTF-8. musl refuses such a byte
+    // where it reads one as a character; inside a bound or a class name it reads bytes, so there
+    // it is just not a digit, or not part of any class's name.
+    let mut chars = pattern
+        .utf8_chunks()
+        .flat_map(|chunk| {
+            chunk
+                .valid()
+                .chars()
+                .map(Some)
+                .chain(chunk.invalid().iter().map(|_| None))
+        })
+        .peekable();
+    let text = |chars: Vec<Option<char>>| -> String {
+        chars
+            .into_iter()
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
+    };
     let mut depth = 0usize;
     let mut first = true;
     while let Some(c) = chars.next() {
+        let Some(c) = c else {
+            return Some(INVALID_REGEXP);
+        };
         match c {
-            '\\' if chars.next().is_none() => return Some("Trailing backslash"),
+            '\\' => match chars.next() {
+                None => return Some("Trailing backslash"),
+                Some(None) => return Some(INVALID_REGEXP),
+                Some(Some(_)) => (),
+            },
             '*' | '+' | '?' if first => {
                 return Some("Repetition not preceded by valid expression");
             }
@@ -132,7 +200,7 @@ fn invalid_regex_reason(pattern: &str) -> Option<&'static str> {
             ')' => depth = depth.saturating_sub(1),
             '{' => {
                 // `{m}`, `{m,}` or `{m,n}`.
-                let bound: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                let bound = text(chars.by_ref().take_while(|c| *c != Some('}')).collect());
                 let (low, high) = bound.split_once(',').unwrap_or((&bound, "0"));
                 let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
                 if !digits(low) || !(high.is_empty() || digits(high)) {
@@ -141,20 +209,22 @@ fn invalid_regex_reason(pattern: &str) -> Option<&'static str> {
             }
             '[' => {
                 // A `]` right after `[` or `[^` is part of the set.
-                chars.next_if_eq(&'^');
-                chars.next_if_eq(&']');
+                chars.next_if_eq(&Some('^'));
+                chars.next_if_eq(&Some(']'));
                 loop {
                     match chars.next() {
                         None => return Some("Missing ']'"),
-                        Some(']') => break,
-                        Some('[') if chars.next_if_eq(&':').is_some() => {
-                            let class: String = chars.by_ref().take_while(|c| *c != ':').collect();
+                        Some(None) => return Some(INVALID_REGEXP),
+                        Some(Some(']')) => break,
+                        Some(Some('[')) if chars.next_if_eq(&Some(':')).is_some() => {
+                            let class =
+                                text(chars.by_ref().take_while(|c| *c != Some(':')).collect());
                             if !CLASSES.contains(&class.as_str()) {
                                 return Some("Unknown character class name");
                             }
-                            chars.next_if_eq(&']');
+                            chars.next_if_eq(&Some(']'));
                         }
-                        Some(_) => (),
+                        Some(Some(_)) => (),
                     }
                 }
             }
@@ -378,6 +448,55 @@ mod tests {
         // A class in a pattern keeps its case where case does not otherwise count.
         assert!(!matches("^(?-i:[[:upper:]])$", "q", true));
         assert!(matches("^[[:upper:]]$", "q", true));
+    }
+
+    #[test]
+    fn a_byte_that_is_no_character_ends_the_match_where_musl_reads_it() {
+        let matched = |pattern: &str, bytes: &[u8]| {
+            Regex::from(vec![RegexPiece::Pattern(pattern.to_owned())])
+                .set_multiline(true)
+                .matches(&rawbytes::decode(bytes))
+                .unwrap()
+                .map(|captures| captures[0].clone().unwrap_or_default())
+        };
+        assert_eq!(matched("^a.b$", b"a\xffb"), None);
+        assert_eq!(matched("[^a]", b"a\xffb"), None);
+        assert_eq!(matched("ab", b"\xffab"), None);
+        assert_eq!(matched("a.*", b"abc\xff"), None);
+        // The matcher reads one character past the match.
+        assert_eq!(matched("a", b"ab\xff"), None);
+        assert_eq!(matched("a", b"abc\xff"), Some("a".to_owned()));
+        assert_eq!(matched("^$", b"\xff"), None);
+        // A back-reference is matched by backtracking, which reads such a byte as any other.
+        assert_eq!(matched(r"(a)\1", b"\xffaa"), Some("aa".to_owned()));
+        // Valid UTF-8 for a character in the range that stands for bytes is that character.
+        let private = "\u{10FF80}".as_bytes();
+        assert_eq!(
+            matched("^.$", private),
+            Some(rawbytes::decode(private).into_owned())
+        );
+    }
+
+    #[test]
+    fn a_pattern_byte_that_is_no_character_is_an_invalid_regexp() {
+        assert_eq!(invalid_regex_reason(b"a\xffb"), Some(INVALID_REGEXP));
+        assert_eq!(invalid_regex_reason(b"[\xff]"), Some(INVALID_REGEXP));
+        assert_eq!(invalid_regex_reason(b"\\\xff"), Some(INVALID_REGEXP));
+        assert_eq!(invalid_regex_reason(b"(\xff"), Some(INVALID_REGEXP));
+        // An error found before it, or where musl reads bytes, keeps its own words.
+        assert_eq!(
+            invalid_regex_reason(b"*\xff"),
+            Some("Repetition not preceded by valid expression")
+        );
+        assert_eq!(
+            invalid_regex_reason(b"a{x}\xff"),
+            Some("Invalid contents of {}")
+        );
+        assert_eq!(
+            invalid_regex_reason(b"[[:al\xff:]]"),
+            Some("Unknown character class name")
+        );
+        assert_eq!(invalid_regex_reason("^\u{10FF80}$".as_bytes()), None);
     }
 
     #[test]
