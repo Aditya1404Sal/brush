@@ -139,6 +139,14 @@ impl builtins::Command for DeclareCommand {
         }
 
         let mut result = ExecutionResult::success();
+        // A variable cannot be both an indexed and an associative array; bash refuses `-a`.
+        if !self.declarations.is_empty()
+            && self.make_indexed_array.to_bool() == Some(true)
+            && self.make_associative_array.to_bool() == Some(true)
+        {
+            context.report("-a: invalid option")?;
+            return Ok(ExecutionResult::new(2));
+        }
         if !self.declarations.is_empty() {
             for declaration in &self.declarations {
                 if self.print && !matches!(verb, DeclareVerb::Readonly) {
