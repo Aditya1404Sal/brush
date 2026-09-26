@@ -3793,8 +3793,13 @@ pub(crate) async fn setup_redirect(
             // `{fd}>&-` closes the descriptor the variable holds; bash names the variable when it
             // holds none.
             if matches!(target, ast::IoFileRedirectTarget::Duplicate(word) if word.value == "-") {
-                let fd = shell
-                    .env_str(variable)
+                let value = if variable.contains('[') {
+                    let word = ast::Word::from(format!("${{{variable}}}"));
+                    Some(Box::pin(expansion::basic_expand_word(shell, params, &word)).await?)
+                } else {
+                    shell.env_str(variable).map(|value| value.to_string())
+                };
+                let fd = value
                     .and_then(|value| value.parse::<ShellFd>().ok())
                     .ok_or_else(|| error::ErrorKind::AmbiguousRedirect(variable.clone()))?;
                 params.open_files.remove_fd(fd);
@@ -3806,13 +3811,33 @@ pub(crate) async fn setup_redirect(
                 .ok_or(error::ErrorKind::InvalidRedirection)?;
             let redirect = ast::IoRedirect::File(Some(fd), kind.clone(), target.clone());
             Box::pin(setup_redirect(shell, params, &redirect)).await?;
-            shell.env_mut().update_or_add(
+            // The variable may be an array element (`{a[1]}`). One that cannot be assigned is
+            // reported, and so is the descriptor it did not take, as bash does.
+            let assigned = Box::pin(expansion::assign_to_named_parameter(
+                shell,
+                params,
                 variable,
-                ShellValueLiteral::Scalar(fd.to_string()),
-                |_| Ok(()),
-                EnvironmentLookup::Anywhere,
-                EnvironmentScope::Global,
-            )?;
+                fd.to_string(),
+            ))
+            .await;
+            if let Err(error) = assigned {
+                if !matches!(
+                    error.kind(),
+                    error::ErrorKind::ReadonlyVariable | error::ErrorKind::ReadonlyVariableNamed(_)
+                ) {
+                    return Err(error);
+                }
+                writeln!(
+                    params.stderr(shell),
+                    "{}{variable}: readonly variable",
+                    shell.diagnostic_prefix()
+                )?;
+                return Err(error::ErrorKind::RedirectionFailure(
+                    variable.clone(),
+                    "cannot assign fd to variable".to_owned(),
+                )
+                .into());
+            }
         }
 
         ast::IoRedirect::File(specified_fd_num, kind, target) => {
@@ -3959,13 +3984,13 @@ pub(crate) async fn setup_redirect(
                     if expanded.is_empty() {
                         // Nothing to do
                     } else if expanded.chars().all(|c: char| c.is_ascii_digit()) {
-                        let source_fd_num = expanded
-                            .parse::<ShellFd>()
-                            .map_err(|_| error::ErrorKind::InvalidRedirection)?;
-
                         // Reference the same open file as the source fd (shared handle; no OS-level duplication).
-                        // Bash names a descriptor that is not open as the script wrote it (`$fd`).
-                        let Some(target_file) = params.try_fd(shell, source_fd_num) else {
+                        // Bash names a descriptor that is not open as the script wrote it (`$fd`),
+                        // as it does one too large to be any.
+                        let source_fd_num = expanded.parse::<ShellFd>().ok();
+                        let Some((source_fd_num, target_file)) = source_fd_num
+                            .and_then(|fd| params.try_fd(shell, fd).map(|file| (fd, file)))
+                        else {
                             return Err(error::ErrorKind::RedirectionFailure(
                                 word.value.trim_end_matches('-').to_owned(),
                                 "Bad file descriptor".to_owned(),

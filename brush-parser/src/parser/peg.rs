@@ -966,11 +966,17 @@ fn assignment_builtin(token: &Token) -> bool {
 
 /// The variable name in `{name}`: a letter or underscore, then letters, digits and underscores.
 fn braced_name(word: &str) -> Option<&str> {
-    let name = word.strip_prefix('{')?.strip_suffix('}')?;
+    let braced = word.strip_prefix('{')?.strip_suffix('}')?;
+    // A variable, or an element of an array (`{a[1]}`).
+    let name = match braced.split_once('[') {
+        Some((name, subscript)) if subscript.len() > 1 && subscript.ends_with(']') => name,
+        Some(_) => return None,
+        None => braced,
+    };
     let mut chars = name.chars();
     let valid = chars
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    valid.then_some(name)
+    valid.then_some(braced)
 }
