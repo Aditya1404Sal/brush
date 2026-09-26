@@ -204,16 +204,16 @@ pub(crate) fn apply_unary_predicate_to_str(
             }
         }
         ast::UnaryPredicate::FdIsOpenTerminal => {
-            // Trim whitespace before parsing, matching bash behavior.
-            if let Ok(fd) = operand.trim().parse::<ShellFd>() {
-                if let Some(open_file) = params.try_fd(shell, fd) {
-                    Ok(open_file.is_terminal())
-                } else {
-                    Ok(false)
-                }
-            } else {
-                Ok(false)
-            }
+            // Trim whitespace before parsing, matching bash behavior; what is not a number is an
+            // error, as bash reports it.
+            let number = operand
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| error::ErrorKind::IntegerExpressionExpected(operand.to_owned()))?;
+            Ok(ShellFd::try_from(number)
+                .ok()
+                .and_then(|fd| params.try_fd(shell, fd))
+                .is_some_and(|open_file| open_file.is_terminal()))
         }
         ast::UnaryPredicate::FileExistsAndIsSetuid => {
             let path = shell.absolute_path(Path::new(operand));
