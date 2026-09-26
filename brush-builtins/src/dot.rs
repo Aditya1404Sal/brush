@@ -65,6 +65,7 @@ impl builtins::Command for DotCommand {
         };
 
         // TODO(dot): Handle trap inheritance.
+        let written = script_path.clone();
         let script_path = Self::resolve_path(script_path, context.shell);
         let result = context
             .shell
@@ -74,7 +75,14 @@ impl builtins::Command for DotCommand {
             // Bash reports a script it cannot read without naming `source`, and carries on
             // (a POSIX-mode shell exits, as a failing special builtin ends it).
             Err(error) if matches!(error.kind(), brush_core::ErrorKind::FailedSourcingFile(..)) => {
-                context.shell.display_error(&mut context.stderr(), &error)?;
+                // Except a directory, which bash reports as the builtin's own error.
+                if let brush_core::ErrorKind::FailedSourcingFile(_, io) = error.kind()
+                    && io.kind() == std::io::ErrorKind::IsADirectory
+                {
+                    context.report(format_args!("{written}: is a directory"))?;
+                } else {
+                    context.shell.display_error(&mut context.stderr(), &error)?;
+                }
                 let mut result = brush_core::ExecutionResult::general_error();
                 if context.shell.options().posix_mode {
                     result.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
