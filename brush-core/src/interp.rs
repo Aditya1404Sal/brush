@@ -3398,7 +3398,7 @@ async fn apply_assignment(
             let resolved = shell.env().resolve_nameref(assignment.name.base_name());
             let name = resolved
                 .split_once('[')
-                .map_or(resolved.as_ref(), |(base, _)| base);
+                .map_or_else(|| resolved.as_ref(), |(base, _)| base);
             let name = if name.is_empty() {
                 assignment.name.base_name()
             } else {
