@@ -593,7 +593,7 @@ fn report_value_error(
                 ("read" | "mapfile" | "readarray", Some("-u")) => {
                     ("invalid file descriptor specification", 1, false)
                 }
-                ("mapfile" | "readarray", Some("-n")) => ("invalid line count", 1, false),
+                ("mapfile" | "readarray", Some("-n" | "-s")) => ("invalid line count", 1, false),
                 ("mapfile" | "readarray", Some("-c")) => ("invalid callback quantum", 1, false),
                 ("shift", None) => ("numeric argument required", 2, false),
                 ("caller", None) => ("invalid number", 2, true),

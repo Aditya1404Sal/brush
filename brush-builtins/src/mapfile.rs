@@ -12,8 +12,14 @@ pub(crate) struct MapFileCommand {
     #[arg(short = 'd')]
     delimiter: Option<String>,
 
-    /// Maximum number of entries to read (0 means no limit).
-    #[arg(short = 'n', default_value_t = 0)]
+    /// Maximum number of entries to read (0 means no limit). A negative count is a value, which
+    /// bash words as an invalid line count, not an option.
+    #[arg(
+        short = 'n',
+        default_value_t = 0,
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i64).range(0..)
+    )]
     max_count: i64,
 
     /// Index into array at which to start assignment.
@@ -21,7 +27,12 @@ pub(crate) struct MapFileCommand {
     origin: Option<String>,
 
     /// Number of initial entries to skip.
-    #[arg(short = 's', default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    #[arg(
+        short = 's',
+        default_value_t = 0,
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i64).range(0..)
+    )]
     skip_count: i64,
 
     /// Whether or not to remove the delimiter from each read line.
@@ -37,7 +48,12 @@ pub(crate) struct MapFileCommand {
     callback: Option<String>,
 
     /// Number of lines to pass the callback for each group.
-    #[arg(short = 'c', default_value_t = 5000, value_parser = clap::value_parser!(i64).range(1..))]
+    #[arg(
+        short = 'c',
+        default_value_t = 5000,
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i64).range(1..)
+    )]
     callback_group_size: i64,
 
     /// Name of array to read into.
