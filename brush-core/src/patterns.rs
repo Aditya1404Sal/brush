@@ -32,6 +32,8 @@ pub(crate) struct FilenameExpansionOptions {
     pub require_dot_in_pattern_to_match_dot_files: bool,
     /// `globstar`: a `**` component matches any depth of directories.
     pub globstar: bool,
+    /// `shopt -u globskipdots`: `.` and `..` match a component that starts with a dot.
+    pub dot_entries: bool,
 }
 
 /// Result of a pattern expansion, distinguishing "no glob metacharacters" from
@@ -353,6 +355,16 @@ impl Pattern {
                     .filter(matches_dotfile_policy)
                     .map(|entry| entry.path())
                     .collect();
+
+                // Directory listings leave out `.` and `..`; without `globskipdots`, bash matches
+                // them against a component that starts with a dot.
+                if options.dot_entries && subpattern_starts_with_dot {
+                    for name in [".", ".."] {
+                        if regex.is_match(name).unwrap_or(false) {
+                            matching_paths_in_dir.push(current_path.join(name));
+                        }
+                    }
+                }
 
                 matching_paths_in_dir.sort();
 
