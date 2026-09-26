@@ -45,8 +45,15 @@ impl builtins::Command for ShiftCommand {
 
         let args = context.shell.current_shell_args_mut();
 
-        // Shifting past the last parameter changes nothing and fails quietly, as in bash.
+        // Shifting past the last parameter changes nothing and fails, quietly unless
+        // `shift_verbose` is on, as in bash (which names the count only when one was given).
         if n > args.len() {
+            if context.shell.options().shift_verbose {
+                match self.n {
+                    Some(n) => context.report(format_args!("{n}: shift count out of range"))?,
+                    None => context.report("shift count out of range")?,
+                }
+            }
             return Ok(ExecutionResult::general_error());
         }
 
