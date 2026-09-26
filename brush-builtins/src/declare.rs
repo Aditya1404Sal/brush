@@ -981,7 +981,9 @@ impl DeclareCommand {
             .filter(|pair| filters.iter().all(|f| f(*pair)))
             .sorted_by_key(|v| v.0)
         {
-            if self.print {
+            // `local` lists as `local -p` does, in declare's form; `declare` alone lists
+            // `name=value`.
+            if self.print || matches!(verb, DeclareVerb::Local) {
                 let mut cs = variable.attribute_flags(context.shell);
                 if cs.is_empty() {
                     cs.push('-');
