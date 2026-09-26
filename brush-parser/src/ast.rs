@@ -2416,13 +2416,105 @@ impl Display for Word {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // A word's text is written as it is, newlines and all (see `Indented`), except that a
         // command or process substitution in it is written as bash keeps it: printed back
-        // from its parse (see `crate::print_comsub`).
+        // from its parse (see `crate::print_comsub`), and `$'...'` as the single-quoted text it
+        // stands for (see `set_ansi_c_decoder`).
         let _verbatim = Verbatim::enter();
-        match crate::comsub::reprint_word(&self.value, &crate::ParserOptions::default()) {
+        let value = ansi_c_as_single_quoted(&self.value);
+        match crate::comsub::reprint_word(&value, &crate::ParserOptions::default()) {
             Some(text) => write!(f, "{text}"),
-            None => write!(f, "{}", self.value),
+            None => write!(f, "{value}"),
         }
     }
+}
+
+/// Decodes the text of a `$'...'` (without its quotes), or gives `None` when it cannot be
+/// written back as text.
+pub type AnsiCDecoder = fn(&str) -> Option<String>;
+
+static ANSI_C_DECODER: std::sync::OnceLock<AnsiCDecoder> = std::sync::OnceLock::new();
+
+/// Sets how a word's `$'...'` is decoded when the word is written back: bash reads it into the
+/// single-quoted text it stands for, and prints that. Without a decoder it is written as it is.
+pub fn set_ansi_c_decoder(decoder: AnsiCDecoder) {
+    let _ = ANSI_C_DECODER.set(decoder);
+}
+
+/// `text` with each `$'...'` outside other quotes written as the single-quoted text it stands
+/// for, as bash prints a word it has read.
+fn ansi_c_as_single_quoted(text: &str) -> std::borrow::Cow<'_, str> {
+    let Some(decode) = ANSI_C_DECODER.get() else {
+        return text.into();
+    };
+    if !text.contains("$'") {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some((_, next)) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '\'' => {
+                out.push(c);
+                for (_, next) in chars.by_ref() {
+                    out.push(next);
+                    if next == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                out.push(c);
+                while let Some((_, next)) = chars.next() {
+                    out.push(next);
+                    match next {
+                        '\\' => {
+                            if let Some((_, escaped)) = chars.next() {
+                                out.push(escaped);
+                            }
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '$' if chars.peek().is_some_and(|(_, next)| *next == '\'') => {
+                // The text to the closing quote, a backslash escaping the character after it.
+                let start = at + 2;
+                let mut end = None;
+                let mut escaped = false;
+                for (index, next) in text.get(start..).unwrap_or_default().char_indices() {
+                    match next {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        '\'' => {
+                            end = Some(start + index);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let decoded = end
+                    .and_then(|end| text.get(start..end))
+                    .and_then(|inner| decode(inner).map(|decoded| (inner, decoded)));
+                match (end, decoded) {
+                    (Some(end), Some((_, decoded))) => {
+                        out.push('\'');
+                        out.push_str(&decoded.replace('\'', "'\\''"));
+                        out.push('\'');
+                        while chars.next_if(|(index, _)| *index <= end).is_some() {}
+                    }
+                    _ => out.push(c),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.into()
 }
 
 impl From<&tokenizer::Token> for Word {

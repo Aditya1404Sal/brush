@@ -20,6 +20,16 @@ impl<SE: extensions::ShellExtensions, S: shell_builder::IsComplete> ShellBuilder
         let profile = std::mem::take(&mut options.profile);
         let rc = std::mem::take(&mut options.rc);
 
+        // A word printed back writes `$'...'` as the text it stands for, as bash does.
+        brush_parser::ast::set_ansi_c_decoder(|text| {
+            let (bytes, _) = crate::escape::expand_backslash_escapes(
+                text,
+                crate::escape::EscapeExpansionMode::AnsiCQuotes,
+            )
+            .ok()?;
+            String::from_utf8(bytes).ok()
+        });
+
         // Construct the shell.
         let mut shell = Shell::new(options)?;
 
