@@ -1078,11 +1078,28 @@ pub(crate) async fn invoke_shell_function(
     // may still change the shell's persistent open files via builtins (e.g. `exec`).
     // `break` in a function body does not reach the caller's loops.
     let caller_loop_depth = std::mem::take(&mut context.shell.loop_depth);
-    let return_trap = context
+    // Unless functions inherit it (`set -T`), the caller's RETURN trap is put aside while the
+    // function runs, as in bash, and comes back when it returns if the function set none.
+    let return_trap = if context
         .shell
-        .traps()
-        .get_handler(traps::TrapSignal::Return)
-        .map(|handler| handler.command.clone());
+        .options()
+        .shell_functions_inherit_debug_and_return_traps
+    {
+        None
+    } else {
+        let saved = context
+            .shell
+            .traps()
+            .get_handler(traps::TrapSignal::Return)
+            .cloned();
+        if saved.is_some() {
+            context
+                .shell
+                .traps_mut()
+                .remove_handlers(traps::TrapSignal::Return);
+        }
+        saved
+    };
     // `local -` in the body saves the options, which come back when it returns.
     let option_saves = context.shell.local_option_saves.len();
     // The body expands the aliases in effect where the function was defined.
@@ -1113,19 +1130,17 @@ pub(crate) async fn invoke_shell_function(
 
     // The RETURN trap runs as the function returns when the function set it (or, with
     // functrace, inherited it), as in bash.
-    let now = context
-        .shell
-        .traps()
-        .get_handler(traps::TrapSignal::Return)
-        .map(|handler| handler.command.clone());
-    if now.is_some()
-        && (now != return_trap
-            || context
-                .shell
-                .options()
-                .shell_functions_inherit_debug_and_return_traps)
-    {
+    if context.shell.traps().handles(traps::TrapSignal::Return) {
         let _ = context.shell.run_return_trap(&context.params).await;
+    }
+    if let Some(saved) = return_trap
+        && !context.shell.traps().handles(traps::TrapSignal::Return)
+    {
+        context.shell.traps_mut().register_handler(
+            traps::TrapSignal::Return,
+            saved.command,
+            saved.source_info,
+        );
     }
     context.shell.status_before_return = None;
 
