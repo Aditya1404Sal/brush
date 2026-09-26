@@ -226,6 +226,9 @@ fn add_missing_escape_chars_to_regex(s: &str) -> Cow<'_, str> {
     // expression, not its terminator.
     let mut at_first_member = false;
     let mut insertion_positions = vec![];
+    // Character classes (`[:alpha:]`), each with its text's byte range and the members that
+    // replace it.
+    let mut classes = vec![];
 
     let mut peekable = s.char_indices().peekable();
     while let Some((byte_offset, c)) = peekable.next() {
@@ -234,6 +237,20 @@ fn add_missing_escape_chars_to_regex(s: &str) -> Cow<'_, str> {
         at_first_member = false;
 
         match c {
+            '[' if !in_escape && in_brackets && next_is_colon => {
+                // A class, read whole so its `]` does not end the expression.
+                if let Some(end) = s
+                    .get(byte_offset..)
+                    .and_then(|rest| rest.find(":]"))
+                    .map(|at| byte_offset + at + 2)
+                    && let Some(members) = s
+                        .get(byte_offset + 2..end - 2)
+                        .and_then(posix_class_members)
+                {
+                    classes.push((byte_offset, end, members));
+                    while peekable.next_if(|(at, _)| *at < end).is_some() {}
+                }
+            }
             '[' if !in_escape && !in_brackets => {
                 in_brackets = true;
                 // A '^' here negates the expression; it isn't a member itself, so the
@@ -261,16 +278,58 @@ fn add_missing_escape_chars_to_regex(s: &str) -> Cow<'_, str> {
         in_escape = !in_escape && c == '\\';
     }
 
-    if insertion_positions.is_empty() {
+    if insertion_positions.is_empty() && classes.is_empty() {
         return s.into();
     }
 
+    let mut edits: Vec<(usize, usize, &str)> = insertion_positions
+        .iter()
+        .map(|pos| (*pos, *pos, "\\"))
+        .chain(
+            classes
+                .iter()
+                .map(|(start, end, members)| (*start, *end, *members)),
+        )
+        .collect();
+    edits.sort_by_key(|(start, _, _)| *start);
     let mut updated = s.to_owned();
-    for pos in insertion_positions.iter().rev() {
-        updated.insert(*pos, '\\');
+    for (start, end, text) in edits.iter().rev() {
+        updated.replace_range(*start..*end, text);
     }
 
     updated.into()
+}
+
+/// The members of a bracket expression that make up the POSIX character class `name` in the
+/// C.UTF-8 locale bash runs in (musl's `iswalpha` and the rest): letters of every script, but
+/// only ASCII digits. `None` when there is no such class.
+pub(crate) fn posix_class_members(name: &str) -> Option<&'static str> {
+    // musl's `iswspace`, and the characters neither printable nor graphic.
+    macro_rules! space {
+        () => {
+            r"\t\n\x0B\x0C\r \x{85}\x{2000}-\x{2006}\x{2008}-\x{200A}\x{2028}\x{2029}\x{205F}\x{3000}"
+        };
+    }
+    macro_rules! control {
+        () => {
+            r"\p{Cc}\x{2028}\x{2029}"
+        };
+    }
+    Some(match name {
+        "alpha" => r"\p{Alphabetic}",
+        "alnum" => r"\p{Alphabetic}0-9",
+        "upper" => r"\p{Uppercase}",
+        "lower" => r"\p{Lowercase}",
+        "digit" => "0-9",
+        "xdigit" => "0-9A-Fa-f",
+        "blank" => r" \t",
+        "space" => space!(),
+        "cntrl" => control!(),
+        "print" => concat!("[^", control!(), "]"),
+        "graph" => concat!("[^", control!(), space!(), "]"),
+        "punct" => concat!(r"[^\p{Alphabetic}0-9", control!(), space!(), "]"),
+        _ => return None,
+    })
 }
 
 fn escape_literal_regex_piece(s: &str) -> Cow<'_, str> {
@@ -299,6 +358,27 @@ pub(crate) const fn regex_char_is_special(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_classes_are_unicode() {
+        let matches = |pattern: &str, value: &str, case_insensitive: bool| {
+            compile_regex(pattern.to_owned(), case_insensitive, false)
+                .unwrap()
+                .is_match(value)
+                .unwrap()
+        };
+        assert!(matches("^[[:alpha:]]$", "é", false));
+        assert!(matches("^[[:upper:]]$", "É", false));
+        assert!(!matches("^[[:alpha:]]$", "1", false));
+        assert!(matches("^[[:punct:]]$", "€", false));
+        assert!(matches("^[[:punct:]]$", "\u{a0}", false));
+        assert!(!matches("^[[:space:]]$", "\u{a0}", false));
+        assert!(matches("^[^[:space:][:digit:]]$", "x", false));
+        assert!(!matches("^[^[:space:][:digit:]]$", "7", false));
+        // A class in a pattern keeps its case where case does not otherwise count.
+        assert!(!matches("^(?-i:[[:upper:]])$", "q", true));
+        assert!(matches("^[[:upper:]]$", "q", true));
+    }
 
     #[test]
     fn test_add_missing_escape_chars_to_regex() {

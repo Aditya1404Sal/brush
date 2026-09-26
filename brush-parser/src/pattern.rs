@@ -69,11 +69,31 @@ peg::parser! {
 
         rule bracket_expression() -> String =
             "[" invert:(invert_char()?) leading:(leading_bracket_member()?) members:bracket_member()* "]" {
-                let mut members = leading
+                let (classes, members): (Vec<_>, Vec<_>) = leading
                     .into_iter()
-                    .chain(members)
                     .flatten()
-                    .collect::<Vec<_>>();
+                    .map(|member| (member, false))
+                    .chain(members.into_iter().flatten())
+                    .partition(|(_, class)| *class);
+                let mut members: Vec<String> =
+                    members.into_iter().map(|(member, _)| member).collect();
+
+                // A character class matches its own characters even where case does not
+                // otherwise count (`nocaseglob`, `nocasematch`), as in bash.
+                if !classes.is_empty() {
+                    let classes: String = classes.into_iter().map(|(class, _)| class).collect();
+                    let classes = std::format!("(?-i:[{classes}])");
+                    let any = if members.is_empty() {
+                        classes
+                    } else {
+                        std::format!("(?:[{}]|{classes})", members.join(""))
+                    };
+                    return if invert.is_some() {
+                        std::format!("(?:(?!{any})(?s:.))")
+                    } else {
+                        any
+                    };
+                }
 
                 // If we completed the parse but ended up with no valid members
                 // of the bracket expression, then return a regex that matches nothing.
@@ -108,12 +128,13 @@ peg::parser! {
         rule invert_char() -> bool =
             ['!' | '^'] { true }
 
-        rule bracket_member() -> Option<String> =
-            e:char_class_expression() { Some(e) } /
-            r:char_range() { r } /
+        // A member, and whether it is a character class.
+        rule bracket_member() -> Option<(String, bool)> =
+            e:char_class_expression() { Some((e, true)) } /
+            r:char_range() { r.map(|r| (r, false)) } /
             m:single_char_bracket_member() {
                 let (char_str, _) = m;
-                Some(char_str)
+                Some((char_str, false))
             }
 
         rule char_class_expression() -> String =
@@ -298,7 +319,14 @@ mod tests {
         assert_eq!(pattern_to_regex_str("[abc]", true)?, "[abc]");
         assert_eq!(pattern_to_regex_str(r"[\(]", true)?, r"[\(]");
         assert_eq!(pattern_to_regex_str(r"[(]", true)?, "[(]");
-        assert_eq!(pattern_to_regex_str("[[:digit:]]", true)?, "[[:digit:]]");
+        assert_eq!(
+            pattern_to_regex_str("[[:digit:]]", true)?,
+            "(?-i:[[:digit:]])"
+        );
+        assert_eq!(
+            pattern_to_regex_str("[![:upper:]x-z]", true)?,
+            "(?:(?!(?:[x-z]|(?-i:[[:upper:]])))(?s:.))"
+        );
         assert_eq!(pattern_to_regex_str(r"[-(),!]*", true)?, r"[\-(),!].*");
         assert_eq!(
             pattern_to_regex_str(r"[-\(\),\!]*", true)?,
