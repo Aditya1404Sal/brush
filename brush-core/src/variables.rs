@@ -1203,8 +1203,12 @@ impl ShellValue {
                 result.push('(');
 
                 for (key, value) in values {
-                    let formatted_key =
-                        escape::quote_if_needed(key.as_str(), escape::QuoteMode::DoubleQuote);
+                    // Bash also quotes a key that would read as all the elements.
+                    let formatted_key = if matches!(key.as_str(), "@" | "*") {
+                        escape::force_quote(key.as_str(), escape::QuoteMode::DoubleQuote).into()
+                    } else {
+                        escape::quote_if_needed(key.as_str(), escape::QuoteMode::DoubleQuote)
+                    };
                     let formatted_value =
                         escape::force_quote(value.as_str(), escape::QuoteMode::DoubleQuote);
 

@@ -3553,6 +3553,18 @@ async fn apply_assignment_unchecked(
                     ),
                     None => None,
                 };
+                // An associative array has no element with an empty key; bash names the element
+                // as written, and abandons the command.
+                if associative
+                    && key.as_deref() == Some("")
+                    && let Some(unexpanded_key) = unexpanded_key
+                {
+                    return Err(error::ErrorKind::BadArrayElement(format!(
+                        "[{}]={}",
+                        unexpanded_key.value, unexpanded_value.value
+                    ))
+                    .into());
+                }
 
                 if key.is_some() {
                     let value =

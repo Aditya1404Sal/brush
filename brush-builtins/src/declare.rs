@@ -427,6 +427,16 @@ impl DeclareCommand {
         } else {
             Some(ShellValueLiteral::Array(ArrayLiteral(vec![])))
         };
+        // An associative array has no element with an empty key: bash names the element with
+        // its key and value quoted, and abandons the command.
+        if associative
+            && assigned_index.is_none()
+            && let Some(ShellValueLiteral::Array(ArrayLiteral(elements))) = &initial_value
+            && let Some((_, value)) = elements.iter().find(|(key, _)| key.as_deref() == Some(""))
+        {
+            let value = value.replace('\'', "'\\''");
+            return Err(ErrorKind::BadArrayElement(std::format!("['']='{value}'")).into());
+        }
         let initial_value = match initial_value {
             Some(ShellValueLiteral::Array(_))
                 if associative && assigned_index.as_deref() == Some("") =>

@@ -1754,13 +1754,21 @@ peg::parser! {
                 (name, append.is_some())
             }
 
+        // A subscript ends at a `]` that is not quoted or inside a bracket of its own.
         pub(crate) rule literal_array_element() -> (Option<String>, String) =
-            "[" inner:$((!"]" [_])*) "]=" value:$([_]*) {
+            "[" inner:$(subscript_piece()*) "]=" value:$([_]*) {
                 (Some(inner.to_owned()), value.to_owned())
             } /
             value:$([_]+) {
                 (None, value.to_owned())
             }
+
+        rule subscript_piece() =
+            "'" (!"'" [_])* "'" /
+            "\"" ("\\" [_] / !"\"" [_])* "\"" /
+            "\\" [_] /
+            "[" subscript_piece()* "]" /
+            !"]" [_]
 
         rule assignment_name() -> ast::AssignmentName =
             aen:array_element_name() {
