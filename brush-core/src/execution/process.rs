@@ -34,6 +34,8 @@ pub mod signals {
     pub const PIPE: u8 = 13;
     /// Termination request.
     pub const TERM: u8 = 15;
+    /// A child process ended.
+    pub const CHLD: u8 = 17;
     /// Continue a stopped process.
     pub const CONT: u8 = 18;
     /// Uncatchable stop.
@@ -193,6 +195,8 @@ pub(super) struct ProcessState {
     handling: Cell<bool>,
     waker: RefCell<Option<Waker>>,
     children: RefCell<Vec<Weak<Self>>>,
+    /// The process that started this one, told with CHLD when this one ends.
+    parent: Weak<Self>,
     /// Tasks waiting for this numbered process to end (see [`process_exited`]).
     exit_waiters: RefCell<Vec<Waker>>,
 }
@@ -214,6 +218,7 @@ impl ProcessState {
             handling: Cell::new(false),
             waker: RefCell::new(None),
             children: RefCell::new(Vec::new()),
+            parent: parent.map_or_else(Weak::new, Rc::downgrade),
             exit_waiters: RefCell::new(Vec::new()),
         });
         if let Some(parent) = parent {
@@ -251,7 +256,8 @@ impl ProcessState {
                         return;
                     }
                     let mut pending = self.pending.borrow_mut();
-                    if !pending.contains(&signal) {
+                    // Bash runs the CHLD trap once for each child that ended.
+                    if signal == signals::CHLD || !pending.contains(&signal) {
                         pending.push(signal);
                     }
                 }
@@ -359,17 +365,35 @@ pub fn record_broken_pipe() {
     }
 }
 
-/// Takes the oldest caught signal waiting for a trap safe point.
-pub(crate) fn take_pending_trap() -> Option<u8> {
+/// Takes the oldest caught signal waiting for a trap safe point, passing over those `busy` says
+/// cannot run yet (their own handler is running: they run when it returns, as a blocked signal).
+pub(crate) fn take_pending_trap(busy: impl Fn(u8) -> bool) -> Option<u8> {
     current().and_then(|state| {
         let mut pending = state.pending.borrow_mut();
-        (!pending.is_empty()).then(|| pending.remove(0))
+        let index = pending.iter().position(|&signal| !busy(signal))?;
+        Some(pending.remove(index))
     })
 }
 
 /// The oldest caught signal waiting for a trap safe point in the running process, left pending.
+/// A child's end (CHLD) is not one: bash's `wait` goes on waiting through it.
 pub fn pending_trapped_signal() -> Option<u8> {
-    current().and_then(|state| state.pending.borrow().first().copied())
+    current().and_then(|state| {
+        state
+            .pending
+            .borrow()
+            .iter()
+            .copied()
+            .find(|&signal| signal != signals::CHLD)
+    })
+}
+
+/// Tells the running process that a child it ran has ended: a program run as a command. A
+/// numbered process tells its parent itself.
+pub fn child_exited() {
+    if let Some(state) = current() {
+        state.deliver(signals::CHLD);
+    }
 }
 
 /// Resolves with [`pending_trapped_signal`] once there is one. `wait` returns early with it, and
@@ -560,6 +584,10 @@ impl NumberedProcess {
         body: impl Future<Output = Result<ExecutionResult, Error>>,
     ) -> Result<ExecutionResult, Error> {
         let result = run_state(self.state.clone(), body).await;
+        // Its parent hears of it, as with SIGCHLD.
+        if let Some(parent) = self.state.parent.upgrade() {
+            parent.deliver(signals::CHLD);
+        }
         // Only this process's own termination is a signal death; a normal exit that merely
         // returns a killed child's status (143) is an ordinary exit, as for a bash subshell.
         let status = match (self.state.terminated.get(), &result) {
@@ -778,13 +806,13 @@ mod tests {
                     let _ = writer.write(b"x");
                     let _ = writer.write(b"x");
                     assert_eq!(
-                        take_pending_trap() == Some(signals::PIPE),
+                        take_pending_trap(|_| false) == Some(signals::PIPE),
                         disposition == PipeDisposition::Caught
                     );
-                    assert_eq!(take_pending_trap(), None);
+                    assert_eq!(take_pending_trap(|_| false), None);
                     let _handling = handling_pipe();
                     let _ = writer.write(b"x");
-                    assert_eq!(take_pending_trap(), None);
+                    assert_eq!(take_pending_trap(|_| false), None);
                     Ok(ExecutionResult::new(1))
                 })
                 .await
@@ -966,7 +994,7 @@ mod tests {
                 }),
                 run_numbered_process(&table, caught_pid, caught(true), async {
                     loop {
-                        if take_pending_trap() == Some(signals::TERM) {
+                        if take_pending_trap(|_| false) == Some(signals::TERM) {
                             return Ok(ExecutionResult::new(3));
                         }
                         tokio::task::yield_now().await;
@@ -997,7 +1025,7 @@ mod tests {
                     assert_eq!(pending_trapped_signal(), None);
                     let signal = trapped_signal().await;
                     assert_eq!(pending_trapped_signal(), Some(signal));
-                    assert_eq!(take_pending_trap(), Some(signals::TERM));
+                    assert_eq!(take_pending_trap(|_| false), Some(signals::TERM));
                     Ok(ExecutionResult::new(signal))
                 }),
                 async {
@@ -1006,6 +1034,64 @@ mod tests {
                 }
             );
             assert_eq!(u8::from(result.unwrap().exit_code), signals::TERM);
+        });
+    }
+
+    #[test]
+    fn each_child_that_ends_tells_its_parent_with_chld() {
+        run(async {
+            let table = ProcessTable::new(10, 11);
+            let parent = table.allocate(10, "parent".into());
+            let result = run_numbered_process(
+                &table,
+                parent,
+                with(&[(signals::CHLD, PipeDisposition::Caught)]),
+                async {
+                    for name in ["first", "second"] {
+                        let pid = table.allocate(parent, name.into());
+                        run_numbered_process(&table, pid, Dispositions::default(), async {
+                            Ok(ExecutionResult::success())
+                        })
+                        .await?;
+                    }
+                    child_exited();
+                    // Not a signal that ends a wait, but one trap for each child that ended.
+                    assert_eq!(pending_trapped_signal(), None);
+                    for _ in 0..3 {
+                        assert_eq!(take_pending_trap(|_| false), Some(signals::CHLD));
+                    }
+                    assert_eq!(take_pending_trap(|_| false), None);
+                    Ok(ExecutionResult::success())
+                },
+            )
+            .await;
+            assert!(result.unwrap().is_success());
+        });
+    }
+
+    #[test]
+    fn a_signal_whose_trap_runs_waits_for_it() {
+        run(async {
+            let table = ProcessTable::new(10, 11);
+            let pid = table.allocate(10, "trapping".into());
+            let dispositions = with(&[
+                (signals::TERM, PipeDisposition::Caught),
+                (signals::HUP, PipeDisposition::Caught),
+            ]);
+            let result = run_numbered_process(&table, pid, dispositions, async {
+                assert!(signal_process(&table, pid, signals::TERM));
+                assert!(signal_process(&table, pid, signals::HUP));
+                // TERM's handler is running: HUP goes first, TERM once it may.
+                assert_eq!(
+                    take_pending_trap(|signal| signal == signals::TERM),
+                    Some(signals::HUP)
+                );
+                assert_eq!(take_pending_trap(|signal| signal == signals::TERM), None);
+                assert_eq!(take_pending_trap(|_| false), Some(signals::TERM));
+                Ok(ExecutionResult::success())
+            })
+            .await;
+            assert!(result.unwrap().is_success());
         });
     }
 

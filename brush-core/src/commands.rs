@@ -893,6 +893,9 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
         if let Some(outcome) = deliver_pending_traps(shell, &params, triggering_status).await? {
             return Ok(outcome);
         }
+        // A program is a child of the shell that ran it. Its CHLD trap runs once the command
+        // is done, with its redirections undone, as in bash.
+        process::child_exited();
         result
     } else {
         process::apply_trap_dispositions(context.shell.traps());
@@ -1012,15 +1015,23 @@ fn special_builtin_failed(name: &str, result: &ExecutionResult) -> bool {
 }
 
 /// Runs handlers for caught signals that arrived while the current command ran. Returns the
-/// handler's result when it changes control flow (for example `exit`).
+/// handler's result when it changes control flow (for example `exit`). A signal whose own
+/// handler is running waits for it to return.
 #[cfg(target_arch = "wasm32")]
-async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
+pub(crate) async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
     shell: &mut Shell<SE>,
     params: &ExecutionParameters,
     triggering_status: u8,
 ) -> Result<Option<ExecutionResult>, error::Error> {
     use crate::execution::process::{self, signals};
-    while let Some(signal_number) = process::take_pending_trap() {
+    loop {
+        let busy = |signal: u8| {
+            crate::traps::TrapSignal::try_from(i32::from(signal))
+                .is_ok_and(|signal| shell.call_stack().is_trap_signal_active(signal))
+        };
+        let Some(signal_number) = process::take_pending_trap(busy) else {
+            break;
+        };
         shell.set_last_exit_status(triggering_status);
         let _handling = (signal_number == signals::PIPE).then(process::handling_pipe);
         let signal: crate::traps::TrapSignal = i32::from(signal_number).try_into()?;

@@ -648,6 +648,20 @@ async fn execute_list(
 
                 // Update status
                 shell.set_last_exit_status(result.exit_code.into());
+
+                // Traps for signals that arrived meanwhile run after each command, as in bash:
+                // a CHLD from a subshell or substitution it ran, for one.
+                #[cfg(target_arch = "wasm32")]
+                if result.is_normal_flow()
+                    && let Some(outcome) = crate::commands::deliver_pending_traps(
+                        shell,
+                        params,
+                        u8::from(result.exit_code),
+                    )
+                    .await?
+                {
+                    result = outcome;
+                }
             }
 
             if !result.is_normal_flow() {
