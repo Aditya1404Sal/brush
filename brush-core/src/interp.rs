@@ -3511,6 +3511,19 @@ async fn apply_assignment_unchecked(
         && global_only.is_none()
         && let Some((array, index)) = shell.env().resolve_nameref_element(variable_name.as_str())
     {
+        // The reference's subscript is expanded as the assignment's own would be.
+        let associative = shell.env().get(&array).is_some_and(|(_, var)| {
+            matches!(
+                var.value(),
+                ShellValue::AssociativeArray(_)
+                    | ShellValue::Unset(ShellValueUnsetType::AssociativeArray)
+            )
+        });
+        let index = if associative {
+            expansion::basic_expand_word(shell, params, &index).await?
+        } else {
+            expansion::basic_expand_arithmetic_text(shell, params, &index).await?
+        };
         resolved_name = array;
         array_index = Some(index);
     }
