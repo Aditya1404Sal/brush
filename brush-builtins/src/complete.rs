@@ -262,8 +262,36 @@ impl CompleteCommand {
                     return error::unimp("special spec not found");
                 }
             } else {
-                for (command_name, spec) in context.shell.completion_config().iter() {
-                    Self::display_spec(context, None, Some(command_name.as_str()), spec)?;
+                // Bash keeps the default (-D), empty-line (-E) and initial-word (-I) specs in its
+                // table of commands' specs under internal names, and lists them all in the
+                // table's order.
+                let config = context.shell.completion_config();
+                let mut listed: Vec<(&str, Option<&str>, Option<&str>, &Spec)> = config
+                    .iter()
+                    .map(|(name, spec)| (name.as_str(), None, Some(name.as_str()), spec))
+                    .collect();
+                for (key, option, spec) in [
+                    ("_DefaultCmD_", "-D", &config.default),
+                    ("_EmptycmD_", "-E", &config.empty_line),
+                    ("_InitialWorD_", "-I", &config.initial_word),
+                ] {
+                    if let Some(spec) = spec {
+                        listed.push((key, Some(option), None, spec));
+                    }
+                }
+                listed.sort_by_key(|(key, ..)| (bash_table_bucket(key), *key));
+                let listed: Vec<_> = listed
+                    .into_iter()
+                    .map(|(_, option, name, spec)| {
+                        (
+                            option.map(str::to_owned),
+                            name.map(str::to_owned),
+                            spec.clone(),
+                        )
+                    })
+                    .collect();
+                for (option, name, spec) in listed {
+                    Self::display_spec(context, option.as_deref(), name.as_deref(), &spec)?;
                 }
             }
         } else if self.remove {
@@ -293,7 +321,7 @@ impl CompleteCommand {
             Self::display_spec(context, None, Some(name), spec)?;
             Ok(true)
         } else {
-            writeln!(context.stderr(), "no completion found for command")?;
+            context.report(format_args!("{name}: no completion specification"))?;
             Ok(false)
         }
     }
@@ -306,11 +334,6 @@ impl CompleteCommand {
         spec: &Spec,
     ) -> Result<(), brush_core::Error> {
         let mut s = String::from("complete");
-
-        if let Some(special_name) = special_name {
-            s.push(' ');
-            s.push_str(special_name);
-        }
 
         for action in &spec.actions {
             s.push(' ');
@@ -416,9 +439,10 @@ impl CompleteCommand {
             )?;
         }
 
-        if let Some(command_name) = command_name {
+        // Bash names the special spec (`-D`, `-E`, `-I`) where a command's name goes, last.
+        if let Some(name) = special_name.or(command_name) {
             s.push(' ');
-            s.push_str(command_name);
+            s.push_str(name);
         }
 
         writeln!(context.stdout(), "{s}")?;
@@ -434,18 +458,10 @@ impl CompleteCommand {
         if self.print {
             return Self::try_display_spec_for_command(context, name);
         } else if self.remove {
-            let mut result = context.shell.completion_config_mut().remove(name);
-
+            let result = context.shell.completion_config_mut().remove(name);
             if !result {
-                if context.shell.options().interactive {
-                    writeln!(context.stderr(), "complete: {name}: not found")?;
-                } else {
-                    // For some reason, this is not supposed to be treated as a failure
-                    // in non-interactive execution.
-                    result = true;
-                }
+                context.report(format_args!("{name}: no completion specification"))?;
             }
-
             return Ok(result);
         }
 
@@ -459,11 +475,27 @@ impl CompleteCommand {
     }
 }
 
+/// The bucket of bash's completion table (512 buckets, FNV-1 hashing, as bash's `hashlib.c`)
+/// that holds `name`: `complete -p` lists specs in bucket order.
+fn bash_table_bucket(name: &str) -> u32 {
+    const BUCKETS: u32 = 512;
+    let mut hash: u32 = 2_166_136_261;
+    for byte in name.bytes() {
+        hash = hash.wrapping_mul(16_777_619);
+        hash ^= u32::from(byte);
+    }
+    hash & (BUCKETS - 1)
+}
+
 /// Generate command completions.
 #[derive(Parser)]
 pub(crate) struct CompGenCommand {
     #[clap(flatten)]
     common_args: CommonCompleteCommandArgs,
+
+    /// Store the completions in this indexed array instead of printing them (bash 5.3).
+    #[arg(short = 'V', value_name = "VARNAME")]
+    variable: Option<String>,
 
     // N.B. The word can only start with a hyphen if it's after a --.
     word: Option<String>,
@@ -480,6 +512,21 @@ impl builtins::Command for CompGenCommand {
             .common_args
             .create_spec(context.shell.options().extended_globbing);
         spec.options.no_sort = true;
+
+        // Bash warns that a function run outside completion sees no completion variables.
+        if spec.function_name.is_some() {
+            context.report("warning: -F option may not work as you expect")?;
+        }
+
+        // With nothing to generate from, bash generates nothing and succeeds.
+        if spec.actions.is_empty()
+            && spec.glob_pattern.is_none()
+            && spec.word_list.is_none()
+            && spec.function_name.is_none()
+            && spec.command.is_none()
+        {
+            return Ok(ExecutionResult::success());
+        }
 
         let token_to_complete = self.word.as_deref().unwrap_or_default();
 
@@ -506,14 +553,28 @@ impl builtins::Command for CompGenCommand {
 
         match result {
             completion::Answer::Candidates(candidates, _options) => {
+                let found = !candidates.is_empty();
+                if let Some(name) = &self.variable {
+                    // -V replaces the array with the completions, even with none.
+                    let elements = candidates.into_iter().map(|candidate| (None, candidate));
+                    context.shell.env_mut().update_or_add(
+                        name,
+                        brush_core::variables::ShellValueLiteral::Array(
+                            brush_core::variables::ArrayLiteral(elements.collect()),
+                        ),
+                        |_| Ok(()),
+                        brush_core::env::EnvironmentLookup::Anywhere,
+                        brush_core::env::EnvironmentScope::Global,
+                    )?;
+                } else {
+                    for candidate in candidates {
+                        writeln!(context.stdout(), "{candidate}")?;
+                    }
+                }
                 // We are expected to return 1 if there are no candidates, even if no errors
                 // occurred along the way.
-                if candidates.is_empty() {
+                if !found {
                     return Ok(ExecutionResult::general_error());
-                }
-
-                for candidate in candidates {
-                    writeln!(context.stdout(), "{candidate}")?;
                 }
             }
             completion::Answer::RestartCompletionProcess => {
