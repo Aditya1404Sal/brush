@@ -1008,7 +1008,12 @@ fn rejected_token(tokens: &[crate::Token]) -> Option<usize> {
 fn unclosed_command(tokens: &[crate::Token]) -> Option<(String, usize)> {
     let mut open: Vec<(&str, usize)> = Vec::new();
     let mut command_start = true;
+    // The tokens an arithmetic command `(( ))` takes up to its end.
+    let mut arithmetic_end = 0;
     for (index, token) in tokens.iter().enumerate() {
+        if index < arithmetic_end {
+            continue;
+        }
         let text = token.to_str();
         let line = token.location().start.line;
         let close = |open: &mut Vec<(&str, usize)>, openers: &[&str]| {
@@ -1022,17 +1027,23 @@ fn unclosed_command(tokens: &[crate::Token]) -> Option<(String, usize)> {
         match token {
             crate::Token::Operator(..) => {
                 match text {
-                    // `((` starts an arithmetic command, `(( ))`.
-                    "(" if command_start
-                        && tokens.get(index + 1).is_some_and(|next| {
-                            next.to_str() == "("
-                                && next.location().start.index == token.location().end.index
-                        }) =>
-                    {
-                        open.push(("((", line));
+                    // `((` at a command's start begins an arithmetic command, read to the `)`
+                    // that closes its first `(`: bash reports an end of input before it there.
+                    // When that `)` is followed by another, the command ends; otherwise bash
+                    // reads the text as nested subshells.
+                    "(" if command_start && adjacent(token, tokens.get(index + 1), "(") => {
+                        match arithmetic_command_end(tokens, index + 2) {
+                            None => return Some(("((".to_owned(), line)),
+                            Some(close) if adjacent(&tokens[close], tokens.get(close + 1), ")") => {
+                                arithmetic_end = close + 2;
+                                command_start = false;
+                                continue;
+                            }
+                            Some(_) => open.push(("(", line)),
+                        }
                     }
                     "(" if command_start => open.push(("(", line)),
-                    ")" => close(&mut open, &["(", "(("]),
+                    ")" => close(&mut open, &["("]),
                     _ => {}
                 }
                 command_start = matches!(
@@ -1059,11 +1070,37 @@ fn unclosed_command(tokens: &[crate::Token]) -> Option<(String, usize)> {
             crate::Token::Word(..) => command_start = false,
         }
     }
-    // Everything after an open `((` is its expression.
-    open.iter()
-        .find(|(keyword, _)| *keyword == "((")
-        .or_else(|| open.last())
+    open.last()
         .map(|(keyword, line)| ((*keyword).to_owned(), *line))
+}
+
+/// Whether `next` is the operator `text` right after `token`, with nothing between them.
+fn adjacent(token: &crate::Token, next: Option<&crate::Token>, text: &str) -> bool {
+    next.is_some_and(|next| {
+        matches!(next, crate::Token::Operator(..))
+            && next.to_str() == text
+            && next.location().start.index == token.location().end.index
+    })
+}
+
+/// The index of the `)` that closes the `(` before `tokens[start]`, if one does.
+fn arithmetic_command_end(tokens: &[crate::Token], start: usize) -> Option<usize> {
+    let mut depth = 1_usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if matches!(token, crate::Token::Operator(..)) {
+            match token.to_str() {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn convert_peg_parse_error(
@@ -1407,6 +1444,16 @@ mod tests {
         assert_eq!(
             diagnose(":\n( (\n"),
             ["line 3: syntax error: unexpected end of file from `(' command on line 2"]
+        );
+        // A `((` whose first `)` is not followed by another is read as nested subshells, with
+        // one `(` more than bash's reading closes.
+        assert_eq!(
+            diagnose("(( (1 + 2 )); echo x"),
+            ["line 2: syntax error: unexpected end of file from `(' command on line 1"]
+        );
+        assert_eq!(
+            diagnose("((1)); (( (1 + 2\n"),
+            ["line 1: unexpected EOF while looking for matching `)'"]
         );
     }
 }
