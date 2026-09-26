@@ -1094,14 +1094,20 @@ pub(crate) async fn invoke_shell_function(
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
-        let result = body.execute(frame.shell(), &context.params).await;
+        let result = match debug_trap_on_entry(frame.shell(), &context.params).await {
+            Ok(()) => body.execute(frame.shell(), &context.params).await,
+            Err(error) => Err(error),
+        };
         let result = report_in_function(frame.shell(), &context.params, result);
         frame.finish()?;
         result
     };
     #[cfg(not(any(target_arch = "wasm32", test)))]
     let result = {
-        let result = body.execute(context.shell, &context.params).await;
+        let result = match debug_trap_on_entry(context.shell, &context.params).await {
+            Ok(()) => body.execute(context.shell, &context.params).await,
+            Err(error) => Err(error),
+        };
         let result = report_in_function(context.shell, &context.params, result);
         context.shell.leave_function()?;
         result
@@ -1477,6 +1483,20 @@ async fn run_substitution_command_in(
         .await;
     shell.exec_last = None;
     result
+}
+
+/// Runs the DEBUG trap as a function starts, as bash does when the function inherits it
+/// (`set -T`): `BASH_COMMAND` still names the command that called it.
+async fn debug_trap_on_entry(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Result<(), error::Error> {
+    if shell.traps().handles(traps::TrapSignal::Debug) {
+        shell
+            .invoke_trap_handler(traps::TrapSignal::Debug, params)
+            .await?;
+    }
+    Ok(())
 }
 
 // Detects a subshell command that consists solely of a single input redirection
