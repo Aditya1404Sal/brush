@@ -32,6 +32,80 @@ pub(crate) struct FilenameExpansionOptions {
     pub require_dot_in_pattern_to_match_dot_files: bool,
     /// `globstar`: a `**` component matches any depth of directories.
     pub globstar: bool,
+    /// `GLOBSORT`: how the results are ordered.
+    pub sort: Option<String>,
+}
+
+/// Orders `results`, relative to `working_dir` and already sorted by name, as bash's `GLOBSORT`
+/// asks: by `name` (the default, and what an unknown key means), `size`, `blocks`, `mtime`,
+/// `atime`, `ctime` or `numeric` value, or `nosort`; a leading `-` reverses it (a `+` does
+/// not), ties included. Where a file has no block count or change time (WASI), its size in
+/// 512-byte blocks and its modification time stand in.
+fn globsort(results: &mut [String], working_dir: &Path, sort: Option<&str>) {
+    let Some(sort) = sort else {
+        return;
+    };
+    let (reverse, key) = match sort.strip_prefix('-') {
+        Some(key) => (true, key),
+        None => (false, sort.strip_prefix('+').unwrap_or(sort)),
+    };
+    if key == "nosort" {
+        return;
+    }
+    let metadata = |path: &String| working_dir.join(path).symlink_metadata().ok();
+    let time = |time: Option<std::time::SystemTime>| {
+        time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .unwrap_or_default()
+    };
+    let mut keyed = |value: &dyn Fn(&std::fs::Metadata) -> u128| {
+        results.sort_by_cached_key(|path| metadata(path).map_or(0, |m| value(&m)));
+    };
+    match key {
+        "size" => keyed(&|m| u128::from(m.len())),
+        "blocks" => keyed(&|m| u128::from(file_blocks(m))),
+        "mtime" => keyed(&|m| time(m.modified().ok()).as_nanos()),
+        "atime" => keyed(&|m| time(m.accessed().ok()).as_nanos()),
+        "ctime" => keyed(&|m| change_time(m)),
+        // Names that are numbers first, in numeric order.
+        "numeric" => results.sort_by_cached_key(|name| {
+            name.parse::<i64>()
+                .map_or((1, i64::MAX), |number| (0, number))
+        }),
+        _ => {}
+    }
+    if reverse {
+        results.reverse();
+    }
+}
+
+#[cfg(unix)]
+fn file_blocks(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::blocks(metadata)
+}
+
+#[cfg(not(unix))]
+fn file_blocks(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len().div_ceil(512)
+}
+
+#[cfg(unix)]
+fn change_time(metadata: &std::fs::Metadata) -> u128 {
+    use std::os::unix::fs::MetadataExt;
+    #[expect(clippy::cast_sign_loss)]
+    let seconds = metadata.ctime().max(0) as u128;
+    #[expect(clippy::cast_sign_loss)]
+    let nanos = metadata.ctime_nsec().max(0) as u128;
+    seconds * 1_000_000_000 + nanos
+}
+
+#[cfg(not(unix))]
+fn change_time(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 /// Result of a pattern expansion, distinguishing "no glob metacharacters" from
@@ -396,6 +470,7 @@ impl Pattern {
 
         // Bash sorts all the results together, not directory by directory.
         results.sort();
+        globsort(&mut results, working_dir, options.sort.as_deref());
 
         tracing::debug!(target: trace_categories::PATTERN, "  => results: {results:?}");
 

@@ -1223,6 +1223,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             require_dot_in_pattern_to_match_dot_files: !self.shell.options().glob_matches_dotfiles
                 && ignored.is_empty(),
             globstar: self.shell.options().enable_star_star_glob,
+            sort: self
+                .shell
+                .env_str("GLOBSORT")
+                .map(|value| value.to_string()),
         };
         let keep = |path: &std::path::Path| {
             let name = path.file_name().map(|name| name.to_string_lossy());
