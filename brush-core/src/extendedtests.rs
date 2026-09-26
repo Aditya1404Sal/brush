@@ -290,7 +290,18 @@ pub(crate) fn apply_unary_predicate_to_str(
 /// key; `@` and `*` ask whether the array has any element.
 fn variable_is_set(shell: &Shell<impl extensions::ShellExtensions>, operand: &str) -> bool {
     let Some((name, index)) = operand.strip_suffix(']').and_then(|r| r.split_once('[')) else {
-        return shell.env().is_set(operand);
+        // A number names a positional parameter; an array's name, its element 0.
+        if !operand.is_empty() && operand.chars().all(|c| c.is_ascii_digit()) {
+            return operand
+                .parse::<usize>()
+                .is_ok_and(|n| n == 0 || n <= shell.current_shell_args().len());
+        }
+        return match shell.env().get(operand) {
+            Some((_, var)) if var.value().is_array() => {
+                var.value().get_at("0", shell).is_ok_and(|v| v.is_some())
+            }
+            _ => shell.env().is_set(operand),
+        };
     };
     match shell.env().get(name) {
         None => false,
