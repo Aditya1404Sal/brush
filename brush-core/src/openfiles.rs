@@ -177,6 +177,46 @@ pub fn null() -> Result<OpenFile, error::Error> {
     }
 }
 
+/// How a descriptor's regular file is opened again by a name for it.
+///
+/// A name such as `/dev/stdout` or `/dev/fd/N` opens the same file with a position of its own,
+/// as Linux opens `/proc/self/fd/N`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reopen {
+    /// For reading, from the start.
+    Read,
+    /// For writing: from the start, emptied first when `truncate`, or at the end when `append`.
+    Write {
+        /// Empty the file first (`>`).
+        truncate: bool,
+        /// Write at its end (`>>`).
+        append: bool,
+    },
+}
+
+/// Opens a file again as [`Reopen`] says; set by an embedder that can (see [`set_reopener`]).
+pub type Reopener = fn(Arc<std::fs::File>, Reopen) -> std::io::Result<std::fs::File>;
+
+static REOPENER: std::sync::OnceLock<Reopener> = std::sync::OnceLock::new();
+
+/// Sets how a redirection to a descriptor's name opens its regular file again.
+///
+/// Without one, such a redirection shares the descriptor itself, position and all. Only the first
+/// call takes effect.
+pub fn set_reopener(reopener: Reopener) {
+    let _ = REOPENER.set(reopener);
+}
+
+/// The file `file` stands for, opened again as `mode` says, when it is a regular file and an
+/// embedder has said how.
+pub(crate) fn reopened(file: &OpenFile, mode: Reopen) -> Option<std::io::Result<OpenFile>> {
+    let OpenFile::File(file) = file else {
+        return None;
+    };
+    let reopener = REOPENER.get()?;
+    Some(reopener(Arc::clone(file), mode).map(OpenFile::from))
+}
+
 /// The null device as a stream: reads see end-of-file and writes vanish, with nothing written
 /// anywhere. WASI has no device files.
 pub fn null_sink() -> OpenFile {

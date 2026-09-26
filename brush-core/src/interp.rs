@@ -4055,8 +4055,32 @@ pub(crate) async fn setup_redirect(
 
                     let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
 
+                    // A name for one of the shell's descriptors opens a regular file behind it
+                    // again, as Linux does: `> /dev/stdout` empties the file and writes from its
+                    // start.
+                    let reopen = match kind {
+                        ast::IoFileRedirectKind::Read | ast::IoFileRedirectKind::DuplicateInput => {
+                            openfiles::Reopen::Read
+                        }
+                        ast::IoFileRedirectKind::Write | ast::IoFileRedirectKind::Clobber => {
+                            openfiles::Reopen::Write {
+                                truncate: true,
+                                append: false,
+                            }
+                        }
+                        ast::IoFileRedirectKind::Append => openfiles::Reopen::Write {
+                            truncate: false,
+                            append: true,
+                        },
+                        ast::IoFileRedirectKind::ReadAndWrite
+                        | ast::IoFileRedirectKind::DuplicateOutput => openfiles::Reopen::Write {
+                            truncate: false,
+                            append: false,
+                        },
+                    };
                     let opened_file = shell
-                        .open_file(&options, &expanded_file_path, params)
+                        .reopen_named(params, &expanded_file_path, reopen)
+                        .unwrap_or_else(|| shell.open_file(&options, &expanded_file_path, params))
                         .map_err(|err| {
                             let message = if err.kind() == std::io::ErrorKind::AlreadyExists
                                 && shell

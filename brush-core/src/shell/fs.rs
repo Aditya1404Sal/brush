@@ -262,6 +262,19 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         Ok(options.open(path_to_open)?.into())
     }
 
+    /// The regular file behind the descriptor `path` names (`/dev/stdout`, `/dev/fd/N`), opened
+    /// again as `mode` says, as Linux opens `/proc/self/fd/N`; `None` when `path` names no open
+    /// descriptor, or one that is no regular file, or the embedder cannot reopen files.
+    pub(crate) fn reopen_named(
+        &self,
+        params: &ExecutionParameters,
+        path: &Path,
+        mode: openfiles::Reopen,
+    ) -> Option<Result<openfiles::OpenFile, std::io::Error>> {
+        let fd = shell_fd_path_to_fd(&self.absolute_path(path))?;
+        openfiles::reopened(&params.try_fd(self, fd)?, mode)
+    }
+
     /// The descriptor `path` names (`/dev/stdin`, `/dev/fd/N`) when it is open for the command
     /// these parameters are for.
     pub(crate) fn open_file_named(
