@@ -2312,6 +2312,13 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
                 .into())
             }
+            brush_parser::word::ParameterExpr::BadSubstitution {
+                text,
+                transform: true,
+            } if self.transformed_parameter_is_empty(&text).await? => {
+                // Bash checks the operator only when there is a value to transform.
+                Ok(Expansion::undefined())
+            }
             brush_parser::word::ParameterExpr::BadSubstitution { text, transform } => {
                 // As in bash, this ends a non-interactive shell; a transformation that does not
                 // exist ends `bash -c` with 127, as an unset variable does. The diagnostic
@@ -2354,6 +2361,29 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 Err(error::Error::from(kind).into_fatal())
             }
         }
+    }
+
+    /// Whether the parameter of `text`, a `${parameter@op}` whose operator does not exist, is
+    /// unset or has no elements, which bash expands to nothing without checking the operator.
+    async fn transformed_parameter_is_empty(&mut self, text: &str) -> Result<bool, error::Error> {
+        let inner = text
+            .strip_prefix("${")
+            .and_then(|t| t.strip_suffix('}'))
+            .unwrap_or_default();
+        let (indirect, rest) = match inner.strip_prefix('!') {
+            Some(rest) if !rest.starts_with('@') || rest.starts_with("@@") => (true, rest),
+            _ => (false, inner),
+        };
+        // The parameter is the shortest text before an `@` that is one.
+        let parameter = rest.match_indices('@').find_map(|(at, _)| {
+            let candidate = rest.get(..at).filter(|c| !c.is_empty())?;
+            brush_parser::word::parse_parameter(candidate, &self.parser_options).ok()
+        });
+        let Some(parameter) = parameter else {
+            return Ok(false);
+        };
+        let expansion = self.expand_parameter(&parameter, indirect).await?;
+        Ok(expansion.undefined || expansion.fields.is_empty())
     }
 
     async fn assign_to_parameter<T: Into<String>>(
