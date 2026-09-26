@@ -33,9 +33,12 @@ impl builtins::Command for PopdCommand {
                 crate::dirs::StackPosition::NotAnIndex
             )
         }) {
-            context.report(format_args!("{entry}: invalid argument"))?;
-            writeln!(context.stderr(), "popd: usage: popd [-n] [+N | -N]")?;
-            return Ok(ExecutionResult::new(2));
+            return crate::dirs::report_bad_operand(
+                &context,
+                entry,
+                "invalid argument",
+                "popd: usage: popd [-n] [+N | -N]",
+            );
         }
         let mut dirs = crate::dirs::listed_dirs(context.shell);
         if dirs.len() == 1 {
@@ -59,17 +62,18 @@ impl builtins::Command for PopdCommand {
             },
         };
 
-        // Removing the current directory changes to the next one, unless -n.
-        dirs.remove(position);
-        if position == 0 && !self.no_directory_change {
+        // Removing the current directory changes to the next one; with -n, bash removes that
+        // next one instead and stays where it is.
+        let removed = if position == 0 && self.no_directory_change {
+            1
+        } else {
+            position
+        };
+        dirs.remove(removed);
+        if removed == 0 {
             context.shell.set_working_dir(&dirs[0])?;
         }
-        let rest = if position == 0 && self.no_directory_change {
-            &dirs[..]
-        } else {
-            &dirs[1..]
-        };
-        crate::dirs::set_stack(context.shell, rest);
+        crate::dirs::set_stack(context.shell, &dirs[1..]);
 
         // Display dirs.
         let dirs_cmd = crate::dirs::DirsCommand::default();

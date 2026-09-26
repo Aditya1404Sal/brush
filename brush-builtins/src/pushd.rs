@@ -50,6 +50,17 @@ impl builtins::Command for PushdCommand {
                     context.report(format_args!("{dir}: directory stack index out of range"))?;
                     return Ok(ExecutionResult::general_error());
                 }
+                // `+x` or `-x` (but not `-`) is no number, as bash reports it.
+                crate::dirs::StackPosition::NotAnIndex
+                    if dir.len() > 1 && dir.starts_with(['+', '-']) =>
+                {
+                    return crate::dirs::report_bad_operand(
+                        &context,
+                        dir,
+                        "invalid argument",
+                        "pushd: usage: pushd [-n] [+N | -N | dir]",
+                    );
+                }
                 crate::dirs::StackPosition::NotAnIndex => None,
             },
         };
