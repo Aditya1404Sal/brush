@@ -1802,7 +1802,19 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 // A negative offset counts back from the end of the offset space: -1
                 // addresses the last character or position, or -- for an indexed array --
                 // the highest subscript.
-                let mut expanded_offset = offset.eval(self.shell, self.params, false).await?;
+                // Bash names the parameter in an error of the offset or the length.
+                let in_substring = |error: crate::arithmetic::EvalError| match error {
+                    // An error in a subscript is reported as itself.
+                    crate::arithmetic::EvalError::InSubscript(_) => error,
+                    error => crate::arithmetic::EvalError::InSubstring(
+                        parameter_error_name(&parameter, indirect),
+                        Box::new(error),
+                    ),
+                };
+                let mut expanded_offset = offset
+                    .eval(self.shell, self.params, false)
+                    .await
+                    .map_err(in_substring)?;
                 if expanded_offset < 0 {
                     expanded_offset += expanded_parameter.kind.offset_space(expanded_parameter_len);
                 }
@@ -1822,7 +1834,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_offset = expanded_parameter.kind.offset_to_position(expanded_offset);
 
                 let end_offset = if let Some(length) = length {
-                    let expanded_length = length.eval(self.shell, self.params, false).await?;
+                    let expanded_length = length
+                        .eval(self.shell, self.params, false)
+                        .await
+                        .map_err(in_substring)?;
 
                     if expanded_length < 0 {
                         // For a string, a negative length says where the slice *ends*,

@@ -74,6 +74,11 @@ pub enum EvalError {
     #[error("{0}")]
     InSubscript(Box<Self>),
 
+    /// An error in the offset or length of the substring expansion of the named parameter
+    /// (`${x:1+}`), worded as bash words it.
+    #[error("{0}: {1}")]
+    InSubstring(String, Box<Self>),
+
     /// An expression that nests deeper than the stack can hold.
     #[error(
         "arithmetic expression nesting level exceeded ({0}): deeper nesting is unsupported in bash-tool"
