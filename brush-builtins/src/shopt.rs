@@ -41,7 +41,7 @@ impl builtins::Command for ShoptCommand {
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.set && self.unset {
             context.report("cannot set and unset shell options simultaneously")?;
-            return Ok(ExecutionExitCode::InvalidUsage.into());
+            return Ok(ExecutionExitCode::GeneralError.into());
         }
 
         if self.options.is_empty() {

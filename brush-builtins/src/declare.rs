@@ -287,8 +287,14 @@ impl DeclareCommand {
             brush_core::CommandArg::Assignment(_) => None,
         };
 
-        // As with display, bash reports failure without printing an error message here.
+        // As with display, bash reports failure without printing an error message here, except
+        // for `readonly -f`, which names the missing function.
         let Some(func) = func else {
+            if matches!(verb, DeclareVerb::Readonly)
+                && let brush_core::CommandArg::String(name) = declaration
+            {
+                let _ = context.report(format_args!("{name}: not a function"));
+            }
             return false;
         };
 
