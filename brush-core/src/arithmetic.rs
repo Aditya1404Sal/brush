@@ -254,12 +254,17 @@ pub fn parse(text: &str) -> Result<ParsedExpression, EvalError> {
 /// token is the part of the expression where evaluation failed.
 fn in_expression_message(expr: &str, error: &EvalError) -> String {
     let token = match error {
-        EvalError::DivideByZero => expr
-            .rsplit_once(['/', '%'])
-            .map(|(_, rest)| rest.to_owned()),
+        // Bash names the text after a `/` or `%`, and after `/=` or `%=` the last token it read.
+        EvalError::DivideByZero => expr.rsplit_once(['/', '%']).map(|(_, rest)| {
+            if rest.starts_with('=') {
+                last_token(expr).to_owned()
+            } else {
+                rest.to_owned()
+            }
+        }),
         EvalError::NegativeExponent => expr
             .rsplit_once("**")
-            .map(|(_, rest)| rest.trim().trim_start_matches('-').to_owned()),
+            .map(|(_, rest)| rest.trim_start().trim_start_matches('-').to_owned()),
         EvalError::ParseError(_) => expr.trim_end().chars().last().map(String::from),
         EvalError::RecursionLimitExceeded => Some(expr.to_owned()),
         _ => None,
@@ -275,6 +280,25 @@ fn in_expression_message(expr: &str, error: &EvalError) -> String {
         ),
         (_, None) => format!("{expr}: {error}"),
     }
+}
+
+/// The last token of `expr` and the whitespace after it, where bash's reader stops at its end.
+fn last_token(expr: &str) -> &str {
+    let trimmed = expr.trim_end();
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | '@');
+    let mut start = trimmed.len();
+    for (at, c) in trimmed.char_indices().rev() {
+        if word(c) {
+            start = at;
+        } else {
+            // An operator is a token of its own.
+            if start == trimmed.len() {
+                start = at;
+            }
+            break;
+        }
+    }
+    expr.get(start..).unwrap_or(expr)
 }
 
 /// Evaluates a value assigned to an integer (`declare -i`) variable, as bash does: the already
