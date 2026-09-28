@@ -1,5 +1,12 @@
 //! Standard builtins.
 
+#![cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::future_not_send,
+        reason = "WASM commands use a single-threaded local executor"
+    )
+)]
 // `brush_core::builtins::Command::execute` is async by contract: the trait declares a desugared
 // `-> impl Future<...> + Send` so that `brush_core::builtins::exec_builtin` can box and dispatch
 // every builtin uniformly. Most builtins in this crate do purely synchronous work, so their
@@ -47,7 +54,7 @@ mod echo;
 mod enable;
 #[cfg(feature = "builtin.eval")]
 mod eval;
-#[cfg(all(feature = "builtin.exec", unix))]
+#[cfg(all(feature = "builtin.exec", any(unix, target_arch = "wasm32")))]
 mod exec;
 #[cfg(feature = "builtin.exit")]
 mod exit;

@@ -7,6 +7,29 @@ use itertools::Itertools as _;
 
 use crate::{error, sys};
 
+/// Effective disposition of a synthetic WASM SIGPIPE.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PipeDisposition {
+    /// Terminate the logical process on a failed pipe write.
+    #[default]
+    Default,
+    /// Leave the failed write to the command's ordinary error handling.
+    Ignored,
+    /// Deliver the configured shell handler at a command boundary.
+    Caught,
+}
+
+impl PipeDisposition {
+    /// Caught handlers reset at an exec boundary; ignored signals remain ignored.
+    #[must_use]
+    pub const fn for_exec(self) -> Self {
+        match self {
+            Self::Caught => Self::Default,
+            other => other,
+        }
+    }
+}
+
 /// Type of signal that can be trapped in the shell.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrapSignal {
@@ -178,9 +201,47 @@ pub struct TrapHandler {
 pub struct TrapHandlerConfig {
     /// Registered handlers for traps; maps signal type to command.
     handlers: HashMap<TrapSignal, TrapHandler>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    inherited_pipe_handler: bool,
 }
 
 impl TrapHandlerConfig {
+    /// Returns the handler that is actually delivered, excluding inert inherited metadata.
+    pub fn get_effective_handler(&self, signal: TrapSignal) -> Option<&TrapHandler> {
+        if self.inherited_pipe_handler && signal.as_str() == "SIGPIPE" {
+            None
+        } else {
+            self.handlers.get(&signal)
+        }
+    }
+
+    /// Effective PIPE disposition, independently of the handler shown by `trap -p`.
+    pub fn pipe_disposition(&self) -> PipeDisposition {
+        let Ok(signal) = "PIPE".parse() else {
+            return PipeDisposition::Default;
+        };
+        match self.get_effective_handler(signal) {
+            None => PipeDisposition::Default,
+            Some(handler) if handler.command.is_empty() => PipeDisposition::Ignored,
+            Some(_) => PipeDisposition::Caught,
+        }
+    }
+
+    /// Resets caught PIPE delivery in a WASM subshell while preserving `trap -p` metadata.
+    pub fn reset_pipe_for_subshell(&mut self) {
+        if self.pipe_disposition() == PipeDisposition::Caught {
+            self.inherited_pipe_handler = true;
+        }
+    }
+
+    fn prepare_mutation(&mut self) {
+        if self.inherited_pipe_handler {
+            if let Ok(signal) = "PIPE".parse() {
+                self.handlers.remove(&signal);
+            }
+            self.inherited_pipe_handler = false;
+        }
+    }
     /// Iterates over the registered handlers for trap signals.
     pub fn iter_handlers(&self) -> impl Iterator<Item = (TrapSignal, &TrapHandler)> {
         self.handlers
@@ -215,6 +276,7 @@ impl TrapHandlerConfig {
         command: String,
         source_info: crate::SourceInfo,
     ) {
+        self.prepare_mutation();
         let _ = self.handlers.insert(
             signal_type,
             TrapHandler {
@@ -230,6 +292,50 @@ impl TrapHandlerConfig {
     ///
     /// * `signal_type` - The type of signal to remove handlers for.
     pub fn remove_handlers(&mut self, signal_type: TrapSignal) {
+        self.prepare_mutation();
         self.handlers.remove(&signal_type);
+    }
+}
+
+#[cfg(test)]
+mod pipe_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn caught_child_handler_is_displayed_but_inert_until_mutation() {
+        let signal = "PIPE".parse().unwrap();
+        let mut parent = TrapHandlerConfig::default();
+        parent.register_handler(
+            signal,
+            "echo caught".into(),
+            crate::SourceInfo::from("test"),
+        );
+        let mut child = parent.clone();
+        child.reset_pipe_for_subshell();
+        assert_eq!(child.pipe_disposition(), PipeDisposition::Default);
+        assert_eq!(child.get_handler(signal).unwrap().command, "echo caught");
+        child.register_handler(
+            TrapSignal::Exit,
+            ":".into(),
+            crate::SourceInfo::from("test"),
+        );
+        assert!(child.get_handler(signal).is_none());
+        assert_eq!(parent.pipe_disposition(), PipeDisposition::Caught);
+    }
+
+    #[test]
+    fn ignored_child_signal_is_preserved_and_can_be_reset() {
+        let signal = "PIPE".parse().unwrap();
+        let mut traps = TrapHandlerConfig::default();
+        traps.register_handler(signal, String::new(), crate::SourceInfo::from("test"));
+        traps.reset_pipe_for_subshell();
+        assert_eq!(traps.pipe_disposition(), PipeDisposition::Ignored);
+        traps.remove_handlers(signal);
+        assert_eq!(traps.pipe_disposition(), PipeDisposition::Default);
+        assert_eq!(PipeDisposition::Caught.for_exec(), PipeDisposition::Default);
+        assert_eq!(
+            PipeDisposition::Ignored.for_exec(),
+            PipeDisposition::Ignored
+        );
     }
 }

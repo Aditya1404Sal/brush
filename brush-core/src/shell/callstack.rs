@@ -2,6 +2,58 @@
 
 use crate::{ExecutionParameters, callstack, env, error, functions, trace_categories};
 
+#[cfg(any(target_arch = "wasm32", test))]
+type FrameCleanup<SE> = fn(&mut crate::Shell<SE>) -> Result<(), error::Error>;
+
+/// Owns a borrowed shell frame across an await, including cancellation by a logical process.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) struct FrameGuard<'a, SE: crate::extensions::ShellExtensions> {
+    shell: &'a mut crate::Shell<SE>,
+    cleanup: Option<FrameCleanup<SE>>,
+    restore_status: Option<u8>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl<'a, SE: crate::extensions::ShellExtensions> FrameGuard<'a, SE> {
+    pub(crate) fn new(
+        shell: &'a mut crate::Shell<SE>,
+        cleanup: FrameCleanup<SE>,
+        restore_status: Option<u8>,
+    ) -> Self {
+        Self {
+            shell,
+            cleanup: Some(cleanup),
+            restore_status,
+        }
+    }
+
+    pub(crate) const fn shell(&mut self) -> &mut crate::Shell<SE> {
+        self.shell
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), error::Error> {
+        self.release()
+    }
+
+    fn release(&mut self) -> Result<(), error::Error> {
+        let result = self
+            .cleanup
+            .take()
+            .map_or(Ok(()), |cleanup| cleanup(self.shell));
+        if let Some(status) = self.restore_status.take() {
+            self.shell.last_exit_status = status;
+        }
+        result
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl<SE: crate::extensions::ShellExtensions> Drop for FrameGuard<'_, SE> {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// Returns whether or not the shell is actively executing in a sourced script.
     pub fn in_sourced_script(&self) -> bool {

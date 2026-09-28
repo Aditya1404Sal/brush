@@ -466,6 +466,7 @@ impl Error {
         results::ExecutionResult {
             next_control_flow,
             exit_code,
+            terminating_signal: None,
         }
     }
 }

@@ -1,6 +1,14 @@
 //! Core implementation of the brush shell. Implements the shell's abstraction, its interpreter, and
 //! various facilities used internally by the shell.
 
+#![cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::future_not_send,
+        reason = "WASM commands use a single-threaded local executor"
+    )
+)]
+
 pub mod arithmetic;
 mod braceexpansion;
 pub mod builtins;
@@ -10,6 +18,7 @@ pub mod completion;
 pub mod env;
 pub mod error;
 pub mod escape;
+pub mod execution;
 pub mod expansion;
 mod extendedtests;
 pub mod extensions;

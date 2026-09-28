@@ -144,13 +144,29 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
 
-        let result = self
-            .run_parsed_result(parse_result, source_info, params)
-            .await;
-
-        self.call_stack.pop();
-
-        result
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let mut frame = super::FrameGuard::new(
+                self,
+                |shell| {
+                    shell.call_stack.pop();
+                    Ok(())
+                },
+                None,
+            );
+            frame
+                .shell()
+                .run_parsed_result(parse_result, source_info, params)
+                .await
+        }
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        {
+            let result = self
+                .run_parsed_result(parse_result, source_info, params)
+                .await;
+            self.call_stack.pop();
+            result
+        }
     }
 
     /// Executes the given string as a shell program, returning the resulting exit status.
@@ -272,6 +288,14 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         program: brush_parser::ast::Program,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
+        #[cfg(target_arch = "wasm32")]
+        if !crate::execution::process::is_active() {
+            return crate::execution::process::run_process(
+                self.traps().pipe_disposition(),
+                program.execute(self, params),
+            )
+            .await;
+        }
         program.execute(self, params).await
     }
 

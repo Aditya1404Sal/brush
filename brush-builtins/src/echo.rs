@@ -1,4 +1,5 @@
 use clap::Parser;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins, escape};
@@ -73,8 +74,18 @@ impl builtins::Command for EchoCommand {
             s.push('\n');
         }
 
-        write!(context.stdout(), "{s}")?;
-        context.stdout().flush()?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            use futures::io::AsyncWriteExt;
+            let mut stdout = context.stdout();
+            stdout.async_io().write_all(s.as_bytes()).await?;
+            stdout.async_io().flush().await?;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            write!(context.stdout(), "{s}")?;
+            context.stdout().flush()?;
+        }
 
         Ok(ExecutionResult::success())
     }

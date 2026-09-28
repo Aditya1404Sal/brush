@@ -194,6 +194,10 @@ pub fn run() {
         std::process::exit(1);
     };
 
+    #[cfg(target_arch = "wasm32")]
+    let result =
+        runtime.block_on(tokio::task::LocalSet::new().run_until(run_async(&args, parsed_args)));
+    #[cfg(not(target_arch = "wasm32"))]
     let result = runtime.block_on(run_async(&args, parsed_args));
 
     let exit_code = match result {

@@ -1,7 +1,10 @@
 use clap::Parser;
+#[cfg(unix)]
 use std::{borrow::Cow, os::unix::process::CommandExt};
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
+#[cfg(unix)]
+use brush_core::{ErrorKind, ExecutionExitCode, commands};
+use brush_core::{ExecutionResult, builtins};
 
 /// Exec the provided command.
 #[derive(Parser)]
@@ -58,26 +61,37 @@ impl builtins::Command for ExecCommand {
             return cmd_cmd.execute(context).await;
         }
 
-        let mut argv0 = Cow::Borrowed(self.name_for_argv0.as_ref().unwrap_or(&self.args[0]));
-
-        if self.exec_as_login {
-            argv0 = Cow::Owned(std::format!("-{argv0}"));
+        // wasm32: there is no execve and no process image to replace. The redirection-only and
+        // subshell forms above need no process and work unchanged; replacing the shell with a
+        // command has no faithful equivalent on this platform, so it is reported, not emulated.
+        #[cfg(target_arch = "wasm32")]
+        {
+            brush_core::error::unimp("exec of a command is not supported on this platform")
         }
 
-        let mut cmd = commands::compose_std_command(
-            &context,
-            &self.args[0],
-            argv0.as_str(),
-            &self.args[1..],
-            self.empty_environment,
-        )?;
+        #[cfg(unix)]
+        {
+            let mut argv0 = Cow::Borrowed(self.name_for_argv0.as_ref().unwrap_or(&self.args[0]));
 
-        let exec_error = cmd.exec();
+            if self.exec_as_login {
+                argv0 = Cow::Owned(std::format!("-{argv0}"));
+            }
 
-        if exec_error.kind() == std::io::ErrorKind::NotFound {
-            Ok(ExecutionExitCode::NotFound.into())
-        } else {
-            Err(ErrorKind::from(exec_error).into())
+            let mut cmd = commands::compose_std_command(
+                &context,
+                &self.args[0],
+                argv0.as_str(),
+                &self.args[1..],
+                self.empty_environment,
+            )?;
+
+            let exec_error = cmd.exec();
+
+            if exec_error.kind() == std::io::ErrorKind::NotFound {
+                Ok(ExecutionExitCode::NotFound.into())
+            } else {
+                Err(ErrorKind::from(exec_error).into())
+            }
         }
     }
 }

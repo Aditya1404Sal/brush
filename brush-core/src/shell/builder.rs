@@ -144,6 +144,9 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
     /// are assigned *after* inherited or well-known variables are set (when applicable).
     #[builder(field)]
     pub vars: HashMap<String, ShellVariable>,
+    /// Single-threaded execution callbacks, installed before startup scripts run.
+    #[builder(default)]
+    pub execution_services: crate::execution::ExecutionServices,
     /// Error behavior implementation.
     #[builder(default)]
     pub error_formatter: SE::ErrorFormatter,
@@ -239,6 +242,7 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
 impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
     fn default() -> Self {
         Self {
+            execution_services: crate::execution::ExecutionServices::default(),
             error_formatter: SE::ErrorFormatter::default(),
             traps: traps::TrapHandlerConfig::default(),
             open_files: openfiles::OpenFiles::default(),

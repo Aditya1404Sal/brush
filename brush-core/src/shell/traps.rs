@@ -60,7 +60,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             return Ok(ExecutionResult::success());
         }
 
-        let Some(handler) = self.traps.get_handler(signal).cloned() else {
+        let Some(handler) = self.traps.get_effective_handler(signal).cloned() else {
             return Ok(ExecutionResult::success());
         };
 
@@ -71,20 +71,31 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         // clobber the status that triggered it.
         let orig_last_exit_status = self.last_exit_status;
 
-        // N.B. We use manual enter/leave rather than an RAII guard because a guard
-        // would need to hold `&mut Shell`, preventing the mutable borrow required by
-        // `run_string()`. This is safe because `result` is captured into a variable
-        // (never early-returned with `?`), so `leave_trap_handler()` always runs.
         self.enter_trap_handler(signal, Some(&handler));
-
-        let result = self
-            .run_string(&handler.command, &handler.source_info, &params)
-            .await;
-
-        self.leave_trap_handler();
-        self.last_exit_status = orig_last_exit_status;
-
-        result
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let mut frame = super::callstack::FrameGuard::new(
+                self,
+                |shell| {
+                    shell.leave_trap_handler();
+                    Ok(())
+                },
+                Some(orig_last_exit_status),
+            );
+            frame
+                .shell()
+                .run_string(&handler.command, &handler.source_info, &params)
+                .await
+        }
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        {
+            let result = self
+                .run_string(&handler.command, &handler.source_info, &params)
+                .await;
+            self.leave_trap_handler();
+            self.last_exit_status = orig_last_exit_status;
+            result
+        }
     }
 
     /// Returns whether the given trap signal is inherited in the current
@@ -101,5 +112,97 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             // subshells is managed separately via `Shell::clone`.)
             TrapSignal::Exit | TrapSignal::Signal(_) => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ExecutionResult, Shell, builtins, execution::process, traps::PipeDisposition};
+
+    #[test]
+    fn terminating_pipe_handler_releases_frame_before_shell_reuse() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tokio::task::LocalSet::new().run_until(async {
+                let mut shell: Shell = Shell::new(crate::CreateOptions::default()).unwrap();
+                shell.register_builtin(
+                    "reset-and-fail",
+                    builtins::Registration {
+                        execute_func: |context, _| {
+                            Box::pin(async move {
+                                if context.shell.in_function() {
+                                    context.shell.env_mut().add(
+                                        "local_marker",
+                                        crate::ShellVariable::new("must not leak"),
+                                        crate::env::EnvironmentScope::Local,
+                                    )?;
+                                }
+                                context.shell.traps_mut().remove_handlers("PIPE".parse()?);
+                                process::set_pipe_disposition(PipeDisposition::Default);
+                                let (reader, mut writer) = crate::openfiles::test_pipe(1);
+                                drop(reader);
+                                assert_eq!(
+                                    std::io::Write::write(&mut writer, b"x").unwrap_err().kind(),
+                                    std::io::ErrorKind::BrokenPipe,
+                                );
+                                futures::future::pending::<()>().await;
+                                Ok(ExecutionResult::success())
+                            })
+                        },
+                        content_func: |_, _, _| Ok(String::new()),
+                        disabled: false,
+                        special_builtin: false,
+                        declaration_builtin: false,
+                        execution_boundary: builtins::ExecutionBoundary::Caller,
+                    },
+                );
+                let signal = "PIPE".parse().unwrap();
+                shell.traps_mut().register_handler(
+                    signal,
+                    "reset-and-fail".to_owned(),
+                    "test".into(),
+                );
+                let params = shell.default_exec_params();
+                shell.set_last_exit_status(1);
+                let result = process::run_process(
+                    PipeDisposition::Caught,
+                    shell.invoke_trap_handler(signal, &params),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.terminating_signal, Some(13));
+                assert!(!shell.call_stack().is_trap_signal_active(signal));
+                assert!(shell.call_stack().is_empty());
+                assert_eq!(shell.last_exit_status(), 1);
+
+                // Reuse the same shell through a function boundary. Cancellation must also
+                // remove its local environment and positional arguments.
+                let result = process::run_process(
+                    PipeDisposition::Default,
+                    shell.run_string("f() { reset-and-fail; }; f nested", &"test".into(), &params),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.terminating_signal, Some(13));
+                assert!(!shell.in_function());
+                assert!(shell.env().get("local_marker").is_none());
+                assert!(shell.current_shell_args().is_empty());
+                assert!(shell.call_stack().is_empty());
+
+                let script = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(script.path(), b"reset-and-fail\n").unwrap();
+                let result = process::run_process(
+                    PipeDisposition::Default,
+                    shell.source_script(script.path(), std::iter::once("nested"), &params),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.terminating_signal, Some(13));
+                assert!(!shell.in_sourced_script());
+                assert!(shell.current_shell_args().is_empty());
+                assert!(shell.call_stack().is_empty());
+            }));
     }
 }
