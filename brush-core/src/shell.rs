@@ -150,6 +150,19 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
     /// History of commands executed in the shell.
     history: Option<crate::history::History>,
+
+    /// Synthetic process numbers shared with every clone of this shell.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    processes: crate::process_table::ProcessTable,
+
+    /// The numbered logical process this shell clone runs as; `None` is the main shell.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    own_pid: Option<crate::process_table::Pid>,
+
+    /// Registered processes for the stages of this background job's pipeline, in stage order.
+    #[cfg(target_arch = "wasm32")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pending_stage_processes: std::collections::VecDeque<crate::execution::process::NumberedProcess>,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -190,6 +203,10 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
             depth: self.depth + 1,
+            processes: self.processes.clone(),
+            own_pid: self.own_pid,
+            #[cfg(target_arch = "wasm32")]
+            pending_stage_processes: std::collections::VecDeque::new(),
         }
     }
 }
@@ -207,6 +224,33 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// This session's synthetic process numbers.
+    pub const fn processes(&self) -> &crate::process_table::ProcessTable {
+        &self.processes
+    }
+
+    /// Marks this shell clone as running as numbered process `pid`.
+    pub const fn set_own_pid(&mut self, pid: crate::process_table::Pid) {
+        self.own_pid = Some(pid);
+    }
+
+    /// Hands this background job the registered processes of its pipeline's stages.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn set_stage_processes(
+        &mut self,
+        processes: std::collections::VecDeque<crate::execution::process::NumberedProcess>,
+    ) {
+        self.pending_stage_processes = processes;
+    }
+
+    /// Takes the next stage's registered process, if this is a numbered background pipeline.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_stage_process(
+        &mut self,
+    ) -> Option<crate::execution::process::NumberedProcess> {
+        self.pending_stage_processes.pop_front()
+    }
+
     /// Returns this shell's execution services, inherited by cloned subshells.
     pub const fn execution_services(&self) -> crate::execution::ExecutionServices {
         self.execution_services
@@ -413,6 +457,11 @@ pub struct SavedCommandStatus {
 
 #[inherent::inherent]
 impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
+    /// Returns the number of the logical process this shell runs as (`$$` for the main shell).
+    pub fn own_pid(&self) -> crate::process_table::Pid {
+        self.own_pid.unwrap_or_else(|| self.processes.shell_pid())
+    }
+
     /// Returns whether or not this shell is a subshell.
     pub fn is_subshell(&self) -> bool {
         self.depth > 0

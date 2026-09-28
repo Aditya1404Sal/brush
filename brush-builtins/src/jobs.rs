@@ -39,6 +39,27 @@ impl builtins::Command for JobsCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.also_show_pids {
+            #[cfg(target_arch = "wasm32")]
+            {
+                for job in &context.shell.jobs().jobs {
+                    let pids = job
+                        .pids()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    writeln!(
+                        context.stdout(),
+                        "[{}]{} {}\t{}\t{}",
+                        job.id,
+                        job.annotation(),
+                        pids.join(" "),
+                        job.state,
+                        job.command_line
+                    )?;
+                }
+                return Ok(ExecutionResult::success());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             return error::unimp("jobs -l");
         }
         if self.list_changed_only {

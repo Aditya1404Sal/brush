@@ -40,6 +40,9 @@ pub trait ShellState {
     /// Returns a mutable reference to the shell's aliases.
     fn aliases_mut(&mut self) -> &mut HashMap<String, String>;
 
+    /// Returns the number of the logical process this shell runs as.
+    fn own_pid(&self) -> crate::process_table::Pid;
+
     /// Returns the shell's job manager.
     fn jobs(&self) -> &jobs::JobManager;
 

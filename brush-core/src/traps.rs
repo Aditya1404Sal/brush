@@ -202,24 +202,21 @@ pub struct TrapHandlerConfig {
     /// Registered handlers for traps; maps signal type to command.
     handlers: HashMap<TrapSignal, TrapHandler>,
     #[cfg_attr(feature = "serde", serde(default))]
-    inherited_pipe_handler: bool,
+    inherited_handlers: std::collections::HashSet<TrapSignal>,
 }
 
 impl TrapHandlerConfig {
     /// Returns the handler that is actually delivered, excluding inert inherited metadata.
     pub fn get_effective_handler(&self, signal: TrapSignal) -> Option<&TrapHandler> {
-        if self.inherited_pipe_handler && signal.as_str() == "SIGPIPE" {
+        if self.inherited_handlers.contains(&signal) {
             None
         } else {
             self.handlers.get(&signal)
         }
     }
 
-    /// Effective PIPE disposition, independently of the handler shown by `trap -p`.
-    pub fn pipe_disposition(&self) -> PipeDisposition {
-        let Ok(signal) = "PIPE".parse() else {
-            return PipeDisposition::Default;
-        };
+    /// Effective disposition of one signal, independently of the handler shown by `trap -p`.
+    pub fn signal_disposition(&self, signal: TrapSignal) -> PipeDisposition {
         match self.get_effective_handler(signal) {
             None => PipeDisposition::Default,
             Some(handler) if handler.command.is_empty() => PipeDisposition::Ignored,
@@ -227,21 +224,38 @@ impl TrapHandlerConfig {
         }
     }
 
+    /// Effective PIPE disposition, independently of the handler shown by `trap -p`.
+    pub fn pipe_disposition(&self) -> PipeDisposition {
+        "PIPE".parse().map_or(PipeDisposition::Default, |signal| {
+            self.signal_disposition(signal)
+        })
+    }
+
+    /// Resets every caught signal handler in a subshell while preserving `trap -p` metadata.
+    /// Ignored signals stay ignored, as in bash.
+    pub fn reset_caught_for_subshell(&mut self) {
+        let caught: Vec<TrapSignal> = self
+            .handlers
+            .iter()
+            .filter(|(signal, handler)| {
+                matches!(signal, TrapSignal::Signal(_)) && !handler.command.is_empty()
+            })
+            .map(|(signal, _)| *signal)
+            .collect();
+        self.inherited_handlers.extend(caught);
+    }
+
     /// Resets caught PIPE delivery in a WASM subshell while preserving `trap -p` metadata.
     pub fn reset_pipe_for_subshell(&mut self) {
-        if self.pipe_disposition() == PipeDisposition::Caught {
-            self.inherited_pipe_handler = true;
-        }
+        self.reset_caught_for_subshell();
     }
 
     fn prepare_mutation(&mut self) {
-        if self.inherited_pipe_handler {
-            if let Ok(signal) = "PIPE".parse() {
-                self.handlers.remove(&signal);
-            }
-            self.inherited_pipe_handler = false;
+        for signal in std::mem::take(&mut self.inherited_handlers) {
+            self.handlers.remove(&signal);
         }
     }
+
     /// Iterates over the registered handlers for trap signals.
     pub fn iter_handlers(&self) -> impl Iterator<Item = (TrapSignal, &TrapHandler)> {
         self.handlers
@@ -321,6 +335,36 @@ mod pipe_disposition_tests {
         );
         assert!(child.get_handler(signal).is_none());
         assert_eq!(parent.pipe_disposition(), PipeDisposition::Caught);
+    }
+
+    #[test]
+    fn subshell_reset_makes_every_caught_signal_inert() {
+        let term = "TERM".parse().unwrap();
+        let hup = "HUP".parse().unwrap();
+        let mut parent = TrapHandlerConfig::default();
+        parent.register_handler(term, "echo term".into(), crate::SourceInfo::from("test"));
+        parent.register_handler(hup, String::new(), crate::SourceInfo::from("test"));
+        let mut child = parent.clone();
+        child.reset_caught_for_subshell();
+        assert_eq!(child.signal_disposition(term), PipeDisposition::Default);
+        assert_eq!(child.signal_disposition(hup), PipeDisposition::Ignored);
+        assert_eq!(child.get_handler(term).unwrap().command, "echo term");
+        assert_eq!(parent.signal_disposition(term), PipeDisposition::Caught);
+    }
+
+    #[test]
+    fn any_mutation_drops_inherited_handlers() {
+        let term = "TERM".parse().unwrap();
+        let mut traps = TrapHandlerConfig::default();
+        traps.register_handler(term, "echo term".into(), crate::SourceInfo::from("test"));
+        traps.reset_caught_for_subshell();
+        traps.register_handler(
+            TrapSignal::Exit,
+            ":".into(),
+            crate::SourceInfo::from("test"),
+        );
+        assert!(traps.get_handler(term).is_none());
+        assert_eq!(traps.signal_disposition(term), PipeDisposition::Default);
     }
 
     #[test]

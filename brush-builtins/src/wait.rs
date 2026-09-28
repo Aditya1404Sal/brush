@@ -34,6 +34,23 @@ impl builtins::Command for WaitCommand {
             return error::unimp("wait -f");
         }
         if self.wait_for_first_or_next {
+            // Report exactly one finished job per call, oldest first, so simultaneous
+            // completions are not lost between successive `wait -n` calls.
+            #[cfg(target_arch = "wasm32")]
+            loop {
+                let jobs = &mut context.shell.jobs_mut().jobs;
+                if jobs.is_empty() {
+                    return Ok(ExecutionExitCode::from(127).into());
+                }
+                for index in 0..jobs.len() {
+                    if let Some(result) = jobs[index].poll_done()? {
+                        jobs.remove(index);
+                        return result;
+                    }
+                }
+                (context.shell.execution_services().yield_now)().await;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             return error::unimp("wait -n");
         }
         if self.variable_to_receive_id.is_some() {
@@ -47,7 +64,7 @@ impl builtins::Command for WaitCommand {
                 if id.starts_with('%') {
                     // It's a job spec.
                     if let Some(job) = context.shell.jobs_mut().resolve_job_spec(id) {
-                        job.wait().await?;
+                        result = job.wait().await?;
                     } else {
                         writeln!(
                             context.stderr(),
@@ -59,7 +76,29 @@ impl builtins::Command for WaitCommand {
                         result = ExecutionExitCode::GeneralError.into();
                     }
                 } else {
-                    // It's a process ID.
+                    // It's a process ID: a synthetic job number on WASM.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let pid: brush_core::process_table::Pid =
+                            brush_core::int_utils::parse(id.as_str(), 10)?;
+                        let job = context
+                            .shell
+                            .jobs_mut()
+                            .jobs
+                            .iter_mut()
+                            .find(|job| job.pids().contains(&pid) || job.leader() == Some(pid));
+                        if let Some(job) = job {
+                            result = job.wait().await?;
+                        } else {
+                            writeln!(
+                                context.stderr(),
+                                "{}: pid {pid} is not a child of this shell",
+                                context.command_name
+                            )?;
+                            result = ExecutionExitCode::from(127).into();
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
                     return error::unimp("wait with process IDs");
                 }
             }
