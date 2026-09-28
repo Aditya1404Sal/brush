@@ -202,10 +202,11 @@ fn reporting<SE: extensions::ShellExtensions, T>(
 }
 
 /// How deeply an expression may nest (see `syntax::nesting`): the parser and the evaluator
-/// recurse at each level, and a hundred levels fit in the stack left at the shell's deepest
-/// nesting. A chain of left-associative operators (`1+2+…`) does not nest, and may be as long as
-/// memory allows.
-const MAX_EXPRESSION_NESTING: usize = 100;
+/// recurse at each level, and fifty levels fit in the stack left at the shell's deepest nesting
+/// with room to spare on x86-64, whose frames are the largest (about seventy parenthesised levels
+/// fit there under Wasmtime's 512 KiB native stack, against over a hundred on arm64). A chain of
+/// left-associative operators (`1+2+…`) does not nest, and may be as long as memory allows.
+const MAX_EXPRESSION_NESTING: usize = 50;
 
 /// A parsed arithmetic expression. A long chain of operators (`1+2+…+5000`) makes a deep tree,
 /// so it is taken apart with a loop rather than dropped recursively.
