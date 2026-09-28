@@ -271,9 +271,13 @@ impl<'a, SE: brush_core::ShellExtensions> Highlighter<'a, SE> {
                 );
                 self.set_next_missing_kind(HighlightKind::CommandSubstitution);
             }
-            brush_parser::word::WordPiece::CommandSubstitution(command) => {
+            brush_parser::word::WordPiece::CommandSubstitution(command)
+            | brush_parser::word::WordPiece::ProcessSubstitution(_, command) => {
                 self.set_next_missing_kind(HighlightKind::CommandSubstitution);
-                self.highlight_program(command.as_str(), piece.start + 2 /* opening $( */);
+                self.highlight_program(
+                    command.as_str(),
+                    piece.start + 2, /* opening $( or <( */
+                );
                 self.set_next_missing_kind(HighlightKind::CommandSubstitution);
             }
             brush_parser::word::WordPiece::ArithmeticExpression(_) => {

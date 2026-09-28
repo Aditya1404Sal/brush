@@ -305,10 +305,15 @@ pub fn diff_dirs(
     // Look through all the files in the oracle directory
     for (filename, file_type) in &oracle_entries {
         if !test_entries.contains_key(filename) {
-            for left_only_file in walkdir::WalkDir::new(oracle_path.join(filename)) {
-                let entry = left_only_file?;
-                let left_only_path = entry.path();
-                entries.push(DirComparisonEntry::LeftOnly(left_only_path.to_owned()));
+            // Walk only directories: walking a broken symlink fails, and a link is one entry.
+            if file_type.is_dir() {
+                for left_only_file in walkdir::WalkDir::new(oracle_path.join(filename)) {
+                    let entry = left_only_file?;
+                    let left_only_path = entry.path();
+                    entries.push(DirComparisonEntry::LeftOnly(left_only_path.to_owned()));
+                }
+            } else {
+                entries.push(DirComparisonEntry::LeftOnly(oracle_path.join(filename)));
             }
 
             continue;

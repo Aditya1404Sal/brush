@@ -4,8 +4,8 @@ use clap::Parser;
 /// Evaluate the given string as script.
 #[derive(Parser)]
 pub(crate) struct EvalCommand {
-    /// The script to evaluate.
-    #[clap(allow_hyphen_values = true)]
+    /// The script to evaluate. An option (there are none) is an invalid one, as in bash.
+    #[clap(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
@@ -25,16 +25,24 @@ impl builtins::Command for EvalCommand {
             // providing the raw string being eval'd.
             // TODO(source-info): Provide the location of the specific tokens that make up
             // `self.args`.
-            let source_info = context.shell.call_stack().current_pos_as_source_info();
+            let source_info = brush_core::SourceInfo {
+                // Bash names eval'd text `eval` in its diagnostics.
+                source: "eval".to_owned(),
+                ..context.shell.call_stack().current_pos_as_source_info()
+            };
 
             // Return the direct result of running the string; we intentionally
             // pass through the result and honor its requested control flow. eval
             // executes in the current environment, so all control flow (return,
-            // exit, break, continue) should propagate.
-            context
+            // exit, break, continue) should propagate. Its lines are numbered on from the
+            // eval command's, as in bash.
+            let shift = context.shell.begin_nested_code();
+            let result = context
                 .shell
                 .run_string(args_concatenated, &source_info, &context.params)
-                .await
+                .await;
+            context.shell.end_nested_code(shift);
+            result
         } else {
             Ok(ExecutionResult::success())
         }

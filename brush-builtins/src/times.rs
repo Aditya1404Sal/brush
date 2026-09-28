@@ -5,7 +5,11 @@ use brush_core::{ExecutionResult, builtins, timing};
 
 /// Report on usage time.
 #[derive(Parser)]
-pub(crate) struct TimesCommand {}
+pub(crate) struct TimesCommand {
+    /// Operands, which bash ignores.
+    #[arg(trailing_var_arg = true, hide = true)]
+    _operands: Vec<String>,
+}
 
 impl builtins::Command for TimesCommand {
     type Error = brush_core::Error;

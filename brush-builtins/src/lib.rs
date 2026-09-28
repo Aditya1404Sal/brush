@@ -46,6 +46,8 @@ mod continue_;
 mod declare;
 #[cfg(feature = "builtin.dirs")]
 mod dirs;
+#[cfg(feature = "builtin.jobs")]
+mod disown;
 #[cfg(feature = "builtin.dot")]
 mod dot;
 #[cfg(feature = "builtin.echo")]
@@ -100,7 +102,7 @@ mod set;
 mod shift;
 #[cfg(feature = "builtin.shopt")]
 mod shopt;
-#[cfg(all(feature = "builtin.suspend", unix))]
+#[cfg(all(feature = "builtin.suspend", any(unix, target_arch = "wasm32")))]
 mod suspend;
 #[cfg(feature = "builtin.test")]
 mod test;
@@ -127,6 +129,7 @@ mod builder;
 mod factory;
 #[cfg(any(feature = "builtin.command", feature = "builtin.type"))]
 mod lookup;
+#[cfg(not(feature = "builtin.exit"))]
 mod unimp;
 
 pub use builder::ShellBuilderExt;

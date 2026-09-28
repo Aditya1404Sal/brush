@@ -203,14 +203,12 @@ cases:
       "e" 2>/dev/null || echo "quote-suppressed"
 
   - name: "Alias body containing a pipeline"
-    known_failure: true # Issue #57
     stdin: |
       shopt -s expand_aliases
       alias pl='echo hello | tr a-z A-Z'
       pl
 
   - name: "Alias body containing a redirection"
-    known_failure: true # Issue #57
     stdin: |
       shopt -s expand_aliases
       alias w='echo written > out.txt'
@@ -218,7 +216,6 @@ cases:
       cat out.txt
 
   - name: "Alias body containing a command separator"
-    known_failure: true # Issue #57
     stdin: |
       shopt -s expand_aliases
       alias two='echo one; echo two'

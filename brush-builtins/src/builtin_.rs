@@ -33,8 +33,10 @@ impl builtins::Command for BuiltinCommand {
 
         let builtin_name = args[0].to_string();
 
+        // A builtin that stands for a program bash has no builtin for (`cat`) is not one here.
         if let Some(builtin) = context.shell.builtins().get(&builtin_name)
             && !builtin.disabled
+            && !context.shell.is_file_program(&builtin_name)
         {
             context.command_name = builtin_name;
             (builtin.execute_func)(context, args).await

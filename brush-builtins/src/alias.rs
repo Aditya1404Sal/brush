@@ -1,6 +1,5 @@
 use clap::Parser;
 use itertools::Itertools;
-use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
@@ -37,18 +36,22 @@ impl builtins::Command for AliasCommand {
                 if let Some((name, unexpanded_value)) = alias.split_once('=')
                     && !name.is_empty()
                 {
+                    // Bash refuses a name holding a blank, a quote, `/`, `$` or an operator.
+                    if name.contains([
+                        ' ', '\t', '\n', '(', ')', '<', '>', ';', '&', '|', '"', '\'', '`', '\\',
+                        '$', '/',
+                    ]) {
+                        context.report(format_args!("`{name}': invalid alias name"))?;
+                        exit_code = ExecutionResult::general_error();
+                        continue;
+                    }
                     context
                         .shell
-                        .aliases_mut()
-                        .insert(name.to_owned(), unexpanded_value.to_owned());
+                        .define_alias(name.to_owned(), unexpanded_value.to_owned());
                 } else if let Some(value) = context.shell.aliases().get(alias) {
                     write_alias_definition(context.stdout(), alias, value)?;
                 } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {alias}: not found",
-                        context.command_name
-                    )?;
+                    context.report(format_args!("{alias}: not found"))?;
                     exit_code = ExecutionResult::general_error();
                 }
             }

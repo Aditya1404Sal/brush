@@ -1,4 +1,4 @@
-use brush_core::{ExecutionResult, builtins, callstack};
+use brush_core::{ExecutionResult, builtins};
 use clap::Parser;
 use std::io::Write;
 
@@ -12,43 +12,40 @@ pub(crate) struct CallerCommand {
 impl builtins::Command for CallerCommand {
     type Error = brush_core::Error;
 
+    /// As bash's `caller`: from `BASH_LINENO`, `BASH_SOURCE` and `FUNCNAME`, `LINE FILE` for the
+    /// current call (`NULL` for a file that is not known) or `LINE FUNCTION FILE` for frame N.
     async fn execute<SE: brush_core::ShellExtensions>(
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
-        let stack = context.shell.call_stack();
+        let element = |name: &str, index: usize| -> Option<String> {
+            let (_, var) = context.shell.env().get(name)?;
+            var.value()
+                .get_at(&index.to_string(), context.shell)
+                .ok()
+                .flatten()
+                .map(|value| value.into_owned())
+        };
 
-        // See how far back we need to look. Frame N represents the Nth caller
-        // (e.g., 0 = immediate caller, 1 = caller's caller, etc.).
-        let expr = self.expr.unwrap_or(0);
-
-        // Get all frames into a vector we can easily index into.
-        let frames: Vec<_> = stack
-            .iter()
-            .filter(|frame| frame.frame_type.is_function() || frame.frame_type.is_script())
-            .collect();
-
-        // Look for the last-known location in the parent of frame N.
-        let Some(calling_frame) = frames.get(expr + 1) else {
+        // Outside any function or sourced file there is no caller.
+        let (Some(line), Some(_)) = (element("BASH_LINENO", 0), element("BASH_SOURCE", 0)) else {
             return Ok(ExecutionResult::general_error());
         };
 
-        let line = calling_frame.current_line().unwrap_or(1);
-        let filename = &calling_frame.source_info.source;
+        let Some(frame) = self.expr else {
+            let file = element("BASH_SOURCE", 1).unwrap_or_else(|| "NULL".to_owned());
+            writeln!(context.stdout(), "{line} {file}")?;
+            return Ok(ExecutionResult::success());
+        };
 
-        // When the expr is provided, we display "LINE FUNCTION_NAME FILENAME"
-        // When the expr is omitted, we only display "LINE FILENAME"
-        if self.expr.is_some() {
-            let function_name = match &calling_frame.frame_type {
-                callstack::FrameType::Function(func_call) => func_call.name(),
-                callstack::FrameType::Script(..) => "source".into(),
-                _ => "".into(),
-            };
-
-            writeln!(context.stdout(), "{line} {function_name} {filename}")?;
-        } else {
-            writeln!(context.stdout(), "{line} {filename}")?;
-        }
+        let (Some(line), Some(file), Some(function)) = (
+            element("BASH_LINENO", frame),
+            element("BASH_SOURCE", frame + 1),
+            element("FUNCNAME", frame + 1),
+        ) else {
+            return Ok(ExecutionResult::general_error());
+        };
+        writeln!(context.stdout(), "{line} {function} {file}")?;
 
         Ok(ExecutionResult::success())
     }

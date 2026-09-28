@@ -12,6 +12,10 @@ pub(crate) struct PwdCommand {
     /// Print $PWD if it names the current working directory.
     #[arg(short = 'L', overrides_with = "physical")]
     allow_symlinks: bool,
+
+    /// Operands, which bash ignores.
+    #[arg(trailing_var_arg = true, hide = true)]
+    _operands: Vec<String>,
 }
 
 impl builtins::Command for PwdCommand {

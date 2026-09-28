@@ -8,10 +8,10 @@ use brush_core::{ExecutionResult, builtins, env, variables};
 #[derive(Parser)]
 pub(crate) struct GetOptsCommand {
     /// Specification for options
-    options_string: String,
+    options_string: Option<String>,
 
     /// Name of variable to receive next option
-    variable_name: String,
+    variable_name: Option<String>,
 
     /// Arguments to parse
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -101,18 +101,24 @@ impl builtins::Command for GetOptsCommand {
         &self,
         mut context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        // Validate the target variable name.
-        if !env::valid_variable_name(&self.variable_name) {
+        // Both operands are required: bash prints its usage line alone without them.
+        let (Some(options_string), Some(variable_name)) =
+            (&self.options_string, &self.variable_name)
+        else {
             writeln!(
                 context.stderr(),
-                "{}: `{}': not a valid identifier",
-                context.command_name,
-                self.variable_name
+                "getopts: usage: getopts optstring name [arg ...]"
             )?;
+            return Ok(ExecutionResult::new(2));
+        };
+
+        // Validate the target variable name.
+        if !env::valid_variable_name(variable_name) {
+            context.report(format_args!("`{variable_name}': not a valid identifier"))?;
             return Ok(ExecutionResult::new(1));
         }
 
-        let spec = parse_option_spec(&self.options_string);
+        let spec = parse_option_spec(options_string);
 
         // If unset or non-numeric, assume OPTIND is 1.
         let next_index_signed = context
@@ -149,7 +155,7 @@ impl builtins::Command for GetOptsCommand {
 
         let result = parse_next_option(&mut context, &spec, args_to_parse, next_index)?;
 
-        update_variables(&mut context, &self.variable_name, result)
+        update_variables(&mut context, variable_name, result)
     }
 }
 
@@ -298,7 +304,8 @@ fn resolve_option_argument<SE: brush_core::ShellExtensions>(
                 if is_opterr_enabled(context) {
                     writeln!(
                         context.stderr(),
-                        "getopts: option requires an argument -- {c}"
+                        "{}: option requires an argument -- {c}",
+                        shell_name(context)
                     )?;
                 }
                 (String::from("?"), None)
@@ -326,7 +333,11 @@ fn report_unknown_option<SE: brush_core::ShellExtensions>(
     c: char,
 ) -> Result<(String, Option<String>), brush_core::Error> {
     if !spec.silent_errors && is_opterr_enabled(context) {
-        writeln!(context.stderr(), "getopts: illegal option -- {c}")?;
+        writeln!(
+            context.stderr(),
+            "{}: illegal option -- {c}",
+            shell_name(context)
+        )?;
     }
 
     let optarg = if spec.silent_errors {
@@ -345,7 +356,10 @@ fn update_variables<SE: brush_core::ShellExtensions>(
     variable_name: &str,
     result: GetOptsResult,
 ) -> Result<ExecutionResult, brush_core::Error> {
-    // Update variable value.
+    // Update variable value. A circular name reference warns as bash binds it.
+    context
+        .shell
+        .warn_circular_nameref(&context.params, variable_name, 0, true);
     context.shell.env_mut().update_or_add(
         variable_name,
         variables::ShellValueLiteral::Scalar(result.variable_value),
@@ -388,6 +402,16 @@ fn update_variables<SE: brush_core::ShellExtensions>(
     )?;
 
     Ok(result.exit_code)
+}
+
+/// Bash prefixes getopts' diagnostics with `$0` alone, as the program whose options they are.
+fn shell_name<SE: brush_core::ShellExtensions>(
+    context: &brush_core::ExecutionContext<'_, SE>,
+) -> String {
+    context
+        .shell
+        .current_shell_name()
+        .map_or_else(|| "bash".to_owned(), |name| name.to_string())
 }
 
 /// Returns whether OPTERR is enabled (i.e., getopts should print error messages).

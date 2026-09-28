@@ -30,6 +30,16 @@ impl builtins::Command for PrintfCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         if let Some(variable_name) = &self.output_variable {
+            // Bash refuses a name that is not a variable or an element of one.
+            let base = variable_name
+                .split_once('[')
+                .filter(|(_, rest)| rest.ends_with(']'))
+                .map_or(variable_name.as_str(), |(base, _)| base);
+            if !brush_core::env::valid_variable_name(base) {
+                context.report(format_args!("`{variable_name}': not a valid identifier"))?;
+                return Ok(ExecutionResult::new(2));
+            }
+
             // Format to a u8 vector.
             let mut result: Vec<u8> = vec![];
             format(self.format_and_args.as_slice(), &mut result)?;

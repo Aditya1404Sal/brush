@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::Write;
 
 use brush_core::{ExecutionResult, builtins};
 
@@ -8,29 +9,75 @@ pub(crate) struct PopdCommand {
     /// Pop the path without changing the current working directory.
     #[clap(short = 'n')]
     no_directory_change: bool,
-    //
-    // TODO(popd): implement +N and -N
+
+    /// Remove the Nth entry, counting from the left (`+N`) or the right (`-N`).
+    #[arg(allow_hyphen_values = true)]
+    entry: Option<String>,
+
+    /// More operands, each of which bash also checks.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    extra: Vec<String>,
 }
 
 impl builtins::Command for PopdCommand {
-    type Error = crate::dirs::DirError;
+    type Error = brush_core::Error;
 
     async fn execute<SE: brush_core::ShellExtensions>(
         &self,
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        if let Some(popped) = context.shell.directory_stack_mut().pop() {
-            if !self.no_directory_change {
-                context.shell.set_working_dir(&popped)?;
-            }
-
-            // Display dirs.
-            let dirs_cmd = crate::dirs::DirsCommand::default();
-            dirs_cmd.execute(context).await?;
-
-            Ok(ExecutionResult::success())
-        } else {
-            Err(crate::dirs::DirError::DirStackEmpty)
+        // An operand that is not `+N` or `-N` is a usage error, whichever it is.
+        if let Some(entry) = self.entry.iter().chain(&self.extra).find(|entry| {
+            matches!(
+                crate::dirs::stack_position(entry, usize::MAX),
+                crate::dirs::StackPosition::NotAnIndex
+            )
+        }) {
+            return crate::dirs::report_bad_operand(
+                &context,
+                entry,
+                "invalid argument",
+                "popd: usage: popd [-n] [+N | -N]",
+            );
         }
+        let mut dirs = crate::dirs::listed_dirs(context.shell);
+        if dirs.len() == 1 {
+            context.report("directory stack empty")?;
+            return Ok(ExecutionResult::general_error());
+        }
+        let position = match &self.entry {
+            None => 0,
+            Some(entry) => match crate::dirs::stack_position(entry, dirs.len()) {
+                crate::dirs::StackPosition::At(position) => position,
+                crate::dirs::StackPosition::OutOfRange => {
+                    context.report(format_args!("{entry}: directory stack index out of range"))?;
+                    return Ok(ExecutionResult::general_error());
+                }
+                // As in bash: not `+N` or `-N` is a usage error.
+                crate::dirs::StackPosition::NotAnIndex => {
+                    context.report(format_args!("{entry}: invalid argument"))?;
+                    writeln!(context.stderr(), "popd: usage: popd [-n] [+N | -N]")?;
+                    return Ok(ExecutionResult::new(2));
+                }
+            },
+        };
+
+        // Removing the current directory changes to the next one; with -n, bash removes that
+        // next one instead and stays where it is.
+        let removed = if position == 0 && self.no_directory_change {
+            1
+        } else {
+            position
+        };
+        dirs.remove(removed);
+        if removed == 0 {
+            context.shell.set_working_dir(&dirs[0])?;
+        }
+        crate::dirs::set_stack(context.shell, &dirs[1..]);
+
+        // Display dirs.
+        let dirs_cmd = crate::dirs::DirsCommand::default();
+        dirs_cmd.execute(context).await?;
+        Ok(ExecutionResult::success())
     }
 }

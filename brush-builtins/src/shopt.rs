@@ -40,11 +40,8 @@ impl builtins::Command for ShoptCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.set && self.unset {
-            writeln!(
-                context.stderr(),
-                "cannot set and unset shell options simultaneously"
-            )?;
-            return Ok(ExecutionExitCode::InvalidUsage.into());
+            context.report("cannot set and unset shell options simultaneously")?;
+            return Ok(ExecutionExitCode::GeneralError.into());
         }
 
         if self.options.is_empty() {
@@ -105,10 +102,11 @@ impl builtins::Command for ShoptCommand {
                 };
 
                 if let Some(option_definition) = option_definition {
-                    if self.set {
-                        option_definition.set(context.shell.options_mut(), true);
-                    } else if self.unset {
-                        option_definition.set(context.shell.options_mut(), false);
+                    if self.set || self.unset {
+                        option_definition.set(context.shell.options_mut(), self.set);
+                        if self.set_o_names_only && option_name == "posix" {
+                            context.shell.sync_posixly_correct()?;
+                        }
                     } else {
                         let option_value = option_definition.get(context.shell.options());
                         if !option_value {
@@ -137,12 +135,7 @@ impl builtins::Command for ShoptCommand {
                         }
                     }
                 } else {
-                    writeln!(
-                        context.stderr(),
-                        "{}: {}: invalid shell option name",
-                        context.command_name,
-                        option_name
-                    )?;
+                    context.report(format_args!("{option_name}: invalid shell option name"))?;
                     return_value = ExecutionResult::general_error();
                 }
             }

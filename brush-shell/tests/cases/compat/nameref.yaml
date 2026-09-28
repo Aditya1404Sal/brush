@@ -202,7 +202,6 @@ cases:
       echo "target: $target"
 
   - name: "Nameref with integer attribute"
-    known_failure: true
     stdin: |
       target=0
       declare -ni ref=target
@@ -377,7 +376,6 @@ cases:
       echo "map_foo: ${map[foo]}"
 
   - name: "Nameref to array element - unset through ref"
-    known_failure: true
     stdin: |
       arr=(a b c d)
       declare -n ref='arr[2]'

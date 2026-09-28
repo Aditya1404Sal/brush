@@ -54,7 +54,7 @@ impl builtins::Command for TypeCommand {
 
             if resolved_types.is_empty() {
                 if !self.type_only && !self.force_path_search && !self.show_path_only {
-                    writeln!(context.stderr(), "type: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                 }
 
                 result = ExecutionResult::general_error();

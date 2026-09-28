@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use clap::Parser;
 
-use brush_core::{ExecutionResult, Shell, builtins};
+use brush_core::{
+    ExecutionResult, Shell, builtins,
+    variables::{ArrayLiteral, ShellValue, ShellValueLiteral, ShellValueUnsetType},
+};
 
 /// Unset a variable.
 #[derive(Parser)]
@@ -41,79 +44,169 @@ impl builtins::Command for UnsetCommand {
 
     async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_, SE>,
+        mut context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        //
-        // TODO(nameref): implement nameref
-        //
+        // `unset -n` unsets a nameref itself; plain `unset` unsets the variable it names.
         if self.name_interpretation.name_references {
-            return brush_core::error::unimp("unset: name references are not yet implemented");
+            for name in &self.names {
+                context.shell.env_mut().unset_raw(name)?;
+            }
+            return Ok(ExecutionResult::success());
         }
 
         let unspecified = self.name_interpretation.unspecified();
+        let mut result = ExecutionResult::success();
 
-        #[expect(clippy::needless_continue)]
         for name in &self.names {
             if unspecified || self.name_interpretation.shell_variables {
                 // Try to parse the name as a parameter. If we can't, don't bail; it may not be a
-                // valid variable name/parameter but could still be a function name.
-                if let Ok(parameter) =
-                    brush_parser::word::parse_parameter(name, &context.shell.parser_options())
-                {
-                    let result = match parameter {
-                        brush_parser::word::Parameter::Positional(_) => continue,
-                        brush_parser::word::Parameter::Special(_) => continue,
+                // valid variable name/parameter but could still be a function name. A subscript
+                // nested too deeply to parse fails.
+                let parsed =
+                    brush_parser::word::parse_parameter(name, &context.shell.parser_options());
+                if let Err(error @ brush_parser::WordParseError::NestedTooDeeply) = &parsed {
+                    context.report(error)?;
+                    result = ExecutionResult::general_error();
+                    continue;
+                }
+                if let Ok(parameter) = parsed {
+                    let (base, outcome) = match parameter {
+                        brush_parser::word::Parameter::Positional(_)
+                        | brush_parser::word::Parameter::Special(_) => continue,
+                        // A name reference to an array element unsets the element.
+                        brush_parser::word::Parameter::Named(name)
+                            if let Some((base, index)) =
+                                context.shell.env().resolve_nameref_element(&name) =>
+                        {
+                            let outcome =
+                                unset_array_index(context.shell, &context.params, &base, &index)
+                                    .await;
+                            (base, outcome)
+                        }
                         brush_parser::word::Parameter::Named(name) => {
-                            context.shell.env_mut().unset(name.as_str())?.is_some()
+                            // Bash looks the name up twice; a circular name reference warns.
+                            context.shell.warn_circular_nameref(
+                                &context.params,
+                                name.as_str(),
+                                2,
+                                false,
+                            );
+                            let outcome = context.shell.env_mut().unset(name.as_str());
+                            (name, outcome.map(|unset| unset.is_some()))
                         }
                         brush_parser::word::Parameter::NamedWithIndex { name, index } => {
-                            unset_array_index(context.shell, name.as_str(), index.as_str())?
+                            let outcome =
+                                unset_array_index(context.shell, &context.params, &name, &index)
+                                    .await;
+                            (name, outcome)
                         }
+                        // `unset 'a[@]'` empties an indexed array; an associative array's `@` and
+                        // `*` are ordinary keys.
                         brush_parser::word::Parameter::NamedWithAllIndices {
-                            name: _,
-                            concatenate: _,
-                        } => continue,
+                            name,
+                            concatenate,
+                        } => {
+                            let outcome = unset_all_elements(&mut context, &name, concatenate);
+                            (name, outcome)
+                        }
                     };
 
-                    if result {
-                        continue;
+                    match outcome {
+                        Ok(true) => continue,
+                        Ok(false) => (),
+                        Err(error) => {
+                            let message = match error.kind() {
+                                brush_core::ErrorKind::ReadonlyVariable
+                                | brush_core::ErrorKind::ReadonlyVariableNamed(_) => {
+                                    "cannot unset: readonly variable"
+                                }
+                                brush_core::ErrorKind::NotArray => "not an array variable",
+                                _ => return Err(error),
+                            };
+                            context.report(format_args!("{base}: {message}"))?;
+                            result = ExecutionResult::general_error();
+                            continue;
+                        }
                     }
                 }
             }
 
-            // TODO(unset): Deal with readonly functions
             if unspecified || self.name_interpretation.shell_functions {
-                if context.shell.undefine_func(name) {
+                if context
+                    .shell
+                    .funcs()
+                    .get(name)
+                    .is_some_and(|f| f.is_readonly())
+                {
+                    context.report(format_args!("{name}: cannot unset: readonly function"))?;
+                    result = ExecutionResult::general_error();
                     continue;
                 }
+                context.shell.undefine_func(name);
             }
         }
 
-        Ok(ExecutionResult::success())
+        Ok(result)
     }
 }
 
-fn unset_array_index(
+/// Unsets every element of an indexed array, leaving it declared and empty, as
+/// `unset 'a[@]'` does in bash. For an associative array `@` and `*` are keys like any other.
+fn unset_all_elements(
+    context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    name: &str,
+    concatenate: bool,
+) -> Result<bool, brush_core::Error> {
+    let Some((_, var)) = context.shell.env_mut().get_mut(name) else {
+        return Ok(false);
+    };
+    if var.is_readonly() {
+        return Err(brush_core::ErrorKind::ReadonlyVariable.into());
+    }
+    match var.value() {
+        ShellValue::AssociativeArray(_) => var.unset_index(if concatenate { "*" } else { "@" }),
+        ShellValue::IndexedArray(_) | ShellValue::Unset(ShellValueUnsetType::IndexedArray) => {
+            var.assign(ShellValueLiteral::Array(ArrayLiteral(vec![])), false)?;
+            Ok(true)
+        }
+        _ => Err(brush_core::ErrorKind::NotArray.into()),
+    }
+}
+
+async fn unset_array_index(
     shell: &mut Shell<impl brush_core::ShellExtensions>,
+    params: &brush_core::ExecutionParameters,
     name: &str,
     index: &str,
 ) -> Result<bool, brush_core::Error> {
-    // First check to see if it's an associative array.
-    let is_assoc_array = shell
-        .env()
-        .get(name)
-        .is_some_and(|(_, var)| var.value().is_associative_array());
-
-    // Compute which index we should actually use. For indexed arrays, we need to evaluate
-    // the index string as an arithmetic expression first.
-    let index_to_use: Cow<'_, str> = if is_assoc_array {
-        index.into()
-    } else {
-        // First evaluate the index expression.
-        let index_as_expr = brush_parser::arithmetic::parse(index)?;
-        let evaluated_index = shell.eval_arithmetic(&index_as_expr)?;
-        evaluated_index.to_string().into()
+    let Some((_, var)) = shell.env().get(name) else {
+        return Ok(false);
     };
+    if var.is_readonly() {
+        return Err(brush_core::ErrorKind::ReadonlyVariable.into());
+    }
+    let is_assoc_array = var.value().is_associative_array();
+    let is_scalar = matches!(var.value(), ShellValue::String(_));
+
+    // Compute which index we should actually use. An associative array's key is expanded as a
+    // word, so quotes around it are removed; an indexed array's is evaluated arithmetically.
+    let index_to_use: Cow<'_, str> = if is_assoc_array {
+        shell.basic_expand_string(params, index).await?.into()
+    } else {
+        // Expanded, then evaluated; an error ends the shell, as in bash.
+        let index = shell.basic_expand_string(params, index).await?;
+        brush_core::arithmetic::eval_subscript(shell, &index)?
+            .to_string()
+            .into()
+    };
+
+    // A scalar is element 0 of itself.
+    if is_scalar {
+        if index_to_use == "0" {
+            return Ok(shell.env_mut().unset(name)?.is_some());
+        }
+        return Err(brush_core::ErrorKind::NotArray.into());
+    }
 
     // Now we can try to unset, and return the result.
     shell.env_mut().unset_index(name, index_to_use.as_ref())

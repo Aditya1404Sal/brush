@@ -37,14 +37,19 @@ impl builtins::Command for HashCommand {
         context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut result = ExecutionResult::success();
-        let cmd = &context.command_name;
+
+        // With `set +h`, bash's `hash` does nothing but say so.
+        if !context.shell.options().remember_command_locations {
+            context.report("hashing disabled")?;
+            return Ok(ExecutionResult::general_error());
+        }
 
         if self.remove_all {
             context.shell.program_location_cache_mut().reset();
         } else if self.remove {
             for name in &self.names {
                 if !context.shell.program_location_cache_mut().unset(name) {
-                    writeln!(context.stderr(), "{cmd}: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                     result = ExecutionResult::general_error();
                 }
             }
@@ -72,7 +77,7 @@ impl builtins::Command for HashCommand {
                         )?;
                     }
                 } else {
-                    writeln!(context.stderr(), "{cmd}: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                     result = ExecutionResult::general_error();
                 }
             }
@@ -83,11 +88,7 @@ impl builtins::Command for HashCommand {
 
             for name in &self.names {
                 if is_dir {
-                    writeln!(
-                        context.stderr(),
-                        "{cmd}: {}: Is a directory",
-                        path.display()
-                    )?;
+                    context.report(format_args!("{}: Is a directory", path.display()))?;
                     result = ExecutionResult::general_error();
                     continue;
                 }
@@ -96,6 +97,27 @@ impl builtins::Command for HashCommand {
                     .shell
                     .program_location_cache_mut()
                     .set(name, path.clone());
+            }
+        } else if self.names.is_empty() {
+            // With no names, bash lists the table. Its hit counts start at zero here: commands
+            // hashed without being run from a path have none.
+            let cache = context.shell.program_location_cache();
+            if self.display_as_usable_input {
+                // `hash -l` lists the table as commands that would rebuild it.
+                for (name, path) in cache.entries() {
+                    writeln!(
+                        context.stdout(),
+                        "builtin hash -p {} {name}",
+                        path.display()
+                    )?;
+                }
+            } else if cache.is_empty() {
+                writeln!(context.stdout(), "hash: hash table empty")?;
+            } else {
+                writeln!(context.stdout(), "hits\tcommand")?;
+                for (_, path) in cache.entries() {
+                    writeln!(context.stdout(), "   0\t{}", path.display())?;
+                }
             }
         } else {
             for name in &self.names {
@@ -107,13 +129,31 @@ impl builtins::Command for HashCommand {
                     continue;
                 }
 
+                // As in bash, a function or a builtin is not hashed, and not an error; a builtin
+                // that stands for a program bash has no builtin for is hashed at its file.
+                if context.shell.funcs().get(name).is_some() {
+                    continue;
+                }
+                if let Some(path) = context.shell.program_file(name) {
+                    context.shell.program_location_cache_mut().set(name, path);
+                    continue;
+                }
+                if context
+                    .shell
+                    .builtins()
+                    .get(name)
+                    .is_some_and(|registration| !registration.disabled)
+                {
+                    continue;
+                }
+
                 // Hash the path
                 if context
                     .shell
                     .find_first_executable_in_path_using_cache(name)
                     .is_none()
                 {
-                    writeln!(context.stderr(), "{cmd}: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                     result = ExecutionResult::general_error();
                 }
             }

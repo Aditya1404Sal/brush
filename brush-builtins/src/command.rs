@@ -22,8 +22,9 @@ pub(crate) struct CommandCommand {
     #[arg(short = 'V', overrides_with = "print_description")]
     pub print_verbose_description: bool,
 
-    /// Command and arguments.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    /// Command and arguments. An option before the command that is none of the above is an
+    /// invalid one, as in bash.
+    #[arg(trailing_var_arg = true)]
     pub command_and_args: Vec<String>,
 }
 
@@ -59,7 +60,7 @@ impl CommandCommand {
                 .next()
             else {
                 if self.print_verbose_description {
-                    writeln!(context.stderr(), "command: {name}: not found")?;
+                    context.report(format_args!("{name}: not found"))?;
                 }
                 continue;
             };
