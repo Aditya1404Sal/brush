@@ -12,13 +12,13 @@ ParseResult(
             seq: [
               Compound(ArithmeticForClause(ArithmeticForClauseCommand(
                 initializer: Some(UnexpandedArithmeticExpr(
-                  value: "",
+                  value: "1",
                 )),
                 condition: Some(UnexpandedArithmeticExpr(
-                  value: "",
+                  value: "1",
                 )),
                 updater: Some(UnexpandedArithmeticExpr(
-                  value: "",
+                  value: "1",
                 )),
                 body: DoGroupCommand(
                   list: CompoundList([

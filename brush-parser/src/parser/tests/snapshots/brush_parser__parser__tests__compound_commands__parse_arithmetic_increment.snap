@@ -12,7 +12,7 @@ ParseResult(
             seq: [
               Compound(Arithmetic(ArithmeticCommand(
                 expr: UnexpandedArithmeticExpr(
-                  value: "x++",
+                  value: " x++ ",
                 ),
                 loc: "[location]",
               )), None),

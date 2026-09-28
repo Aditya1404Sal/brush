@@ -26,8 +26,9 @@ peg::parser! {
                     and_ors.push(ao);
                 }
 
-                // N.B. We default to synchronous if no separator op is given.
-                seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
+                // N.B. We default to synchronous if no separator op is given: the command ends
+                // its line.
+                seps.push(last_sep.unwrap_or(SeparatorOperator::Newline));
 
                 let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
@@ -100,6 +101,7 @@ peg::parser! {
             b:brace_group() { ast::CompoundCommand::BraceGroup(b) } /
             s:subshell() { ast::CompoundCommand::Subshell(s) } /
             f:for_clause() { ast::CompoundCommand::ForClause(f) } /
+            non_posix_extensions_enabled() s:select_clause() { ast::CompoundCommand::SelectClause(s) } /
             c:case_clause() { ast::CompoundCommand::CaseClause(c) } /
             i:if_clause() { ast::CompoundCommand::IfClause(i) } /
             w:while_clause() { ast::CompoundCommand::WhileClause(w) } /
@@ -108,13 +110,38 @@ peg::parser! {
             non_posix_extensions_enabled() c:extended_test_command() { ast::CompoundCommand::ExtendedTest(c) } /
             expected!("compound command")
 
+        // Bash keeps the text between `((` and `))` as written, blanks and all.
         pub(crate) rule arithmetic_command() -> ast::ArithmeticCommand =
-            start:specific_operator("(") specific_operator("(") expr:arithmetic_expression() specific_operator(")") end:specific_operator(")") {
+            start:double_open_paren() expr:arithmetic_expression() close:specific_operator(")") end:specific_operator(")")
+            text:text_between(start, close) {
                 let loc = SourceSpan::within(
                     start.location(),
                     end.location()
                 );
-                ast::ArithmeticCommand { expr, loc }
+                // `start` is the first of two adjacent `(`. Without the source, blanks around the
+                // expression become one space each.
+                let value = text
+                    .and_then(|t| t.get(1..).map(str::to_owned))
+                    .unwrap_or_else(|| if expr.value.is_empty() { expr.value } else { std::format!(" {} ", expr.value) });
+                ast::ArithmeticCommand { expr: ast::UnexpandedArithmeticExpr { value }, loc }
+            }
+
+        // The source text after the token `from` and before the token `to`, when the source is
+        // known.
+        rule text_between(from: &'input Token, to: &'input Token) -> Option<String> =
+            #{|input, pos| peg::RuleResult::Matched(pos, input.text_between(from, to))}
+
+        rule source_known() -> bool =
+            #{|input, pos| peg::RuleResult::Matched(pos, input.source.is_some())}
+
+        // `((` with nothing between the parentheses; `( (` opens two subshells, as in bash.
+        rule double_open_paren() -> &'input Token =
+            start:specific_operator("(") second:specific_operator("(") {?
+                if second.location().start.index == start.location().end.index {
+                    Ok(start)
+                } else {
+                    Err("((")
+                }
             }
 
         pub(crate) rule arithmetic_expression() -> ast::UnexpandedArithmeticExpr =
@@ -132,7 +159,8 @@ peg::parser! {
         // TODO(arithmetic): evaluate arithmetic end; the semicolon is used in arithmetic for loops.
         rule arithmetic_end() -> () =
             specific_operator(")") specific_operator(")") {} /
-            specific_operator(";") {}
+            specific_operator(";") {} /
+            specific_operator(";;") {}
 
         rule subshell() -> ast::SubshellCommand =
             start:specific_operator("(") list:compound_list() end:specific_operator(")") {
@@ -145,14 +173,15 @@ peg::parser! {
                 let mut and_ors = vec![first];
                 let mut seps = Vec::with_capacity(remainder.len());
 
+                // A newline separates as `;` does, but bash prints it back as a newline.
                 for (sep, ao) in remainder {
-                    seps.push(sep.unwrap_or(SeparatorOperator::Sequence));
+                    seps.push(sep.unwrap_or(SeparatorOperator::Newline));
                     and_ors.push(ao);
                 }
 
                 // N.B. We default to synchronous if no separator op is given.
                 let last_sep = last_sep.unwrap_or(None);
-                seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
+                seps.push(last_sep.unwrap_or(SeparatorOperator::Newline));
 
                 let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
@@ -160,37 +189,84 @@ peg::parser! {
             }
 
         rule for_clause() -> ast::ForClauseCommand =
-            s:specific_word("for") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:do_group() {
+            s:specific_word("for") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
                 let start = s.location();
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
-                ast::ForClauseCommand { variable_name: n.to_owned(), values: w, body: d, loc }
+                // `for i in; do` loops over nothing; only a loop without `in` loops over "$@".
+                ast::ForClauseCommand { variable_name: n.to_owned(), values: Some(w.unwrap_or_default()), body: d, loc }
             } /
             s:specific_word("for") n:name() sequential_sep()? d:do_group() {
                 let start = s.location();
                 let end = &d.loc;
                 let loc = SourceSpan::within(start, end);
                 ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            } /
+            s:specific_word("for") n:name() sequential_sep() d:brace_body() {
+                let start = s.location();
+                let end = &d.loc;
+                let loc = SourceSpan::within(start, end);
+                ast::ForClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            }
+
+        // N.B. select is a non-sh extension; its grammar is the for loop's.
+        rule select_clause() -> ast::SelectClauseCommand =
+            s:specific_word("select") n:name() linebreak() _in() w:wordlist()? sequential_sep() d:for_body() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: Some(w.unwrap_or_default()), body: d, loc }
+            } /
+            s:specific_word("select") n:name() sequential_sep()? d:do_group() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
+            } /
+            s:specific_word("select") n:name() sequential_sep() d:brace_body() {
+                let loc = SourceSpan::within(s.location(), &d.loc);
+                ast::SelectClauseCommand { variable_name: n.to_owned(), values: None, body: d, loc }
             }
 
         // N.B. The arithmetic for loop is a non-sh extension.
         rule arithmetic_for_clause() -> ast::ArithmeticForClauseCommand =
             s:specific_word("for")
             specific_operator("(") specific_operator("(")
-                initializer:arithmetic_expression()? specific_operator(";")
-                condition:arithmetic_expression()? specific_operator(";")
-                updater:arithmetic_expression()?
-            specific_operator(")") specific_operator(")")
+                clauses:arithmetic_for_clauses()
+            specific_operator(")")
             body:arithmetic_for_body() {
+                let (initializer, condition, updater) = clauses;
                 let start = s.location();
                 let end = &body.loc;
                 let loc = SourceSpan::within(start, end);
                 ast::ArithmeticForClauseCommand { initializer, condition, updater, body, loc }
             }
 
+        // An empty condition leaves `;;`, which reads as one operator (a case terminator).
+        rule arithmetic_for_clauses() -> (
+            Option<ast::UnexpandedArithmeticExpr>,
+            Option<ast::UnexpandedArithmeticExpr>,
+            Option<ast::UnexpandedArithmeticExpr>,
+        ) =
+            initializer:arithmetic_for_expression(";")
+                condition:arithmetic_for_expression(";")
+                updater:arithmetic_for_expression(")") { (Some(initializer), Some(condition), Some(updater)) } /
+            initializer:arithmetic_for_expression(";;")
+                updater:arithmetic_for_expression(")") {
+                    let condition = ast::UnexpandedArithmeticExpr { value: "1".to_owned() };
+                    (Some(initializer), Some(condition), Some(updater))
+                }
+
+        // An arithmetic `for` expression and the operator after it (the updater's is the first
+        // `)` of `))`). Bash keeps the blanks after the expression but not those before it, and
+        // takes an empty one as `1`.
+        rule arithmetic_for_expression(end: &'static str) -> ast::UnexpandedArithmeticExpr =
+            known:source_known() text:$(arithmetic_expression() specific_operator(end)) {
+                let value = text.strip_suffix(end).unwrap_or(&text);
+                let value = if known { value } else { value.trim_end() };
+                let value = if value.trim().is_empty() { "1" } else { value };
+                ast::UnexpandedArithmeticExpr { value: value.to_owned() }
+            }
+
         rule arithmetic_for_body() -> ast::DoGroupCommand =
             sequential_sep()? body:do_group() { body } /
-            body:brace_group() { ast::DoGroupCommand { list: body.list, loc: body.loc } }
+            sequential_sep()? body:brace_body() { body }
 
         rule extended_test_command() -> ast::ExtendedTestExprCommand =
             s:specific_word("[[") linebreak() expr:extended_test_expression() e:specific_word("]]") {
@@ -313,7 +389,7 @@ peg::parser! {
             }
 
         pub(crate) rule case_item_ns() -> ast::CaseItem =
-            s:specific_operator("(")? p:pattern() specific_operator(")") c:compound_list() {
+            s:case_item_open() p:pattern() specific_operator(")") c:compound_list() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = c.location();
 
@@ -321,7 +397,7 @@ peg::parser! {
 
                 ast::CaseItem { patterns: p, cmd: Some(c), post_action: ast::CaseItemPostAction::ExitCase, loc }
             } /
-            s:specific_operator("(")? p:pattern() e:specific_operator(")") linebreak() {
+            s:case_item_open() p:pattern() e:specific_operator(")") linebreak() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(e.location());
 
@@ -330,18 +406,23 @@ peg::parser! {
             }
 
         pub(crate) rule case_item() -> ast::CaseItem =
-            s:specific_operator("(")? p:pattern() specific_operator(")") linebreak() post_action:case_item_post_action() linebreak() {
+            s:case_item_open() p:pattern() specific_operator(")") linebreak() post_action:case_item_post_action() linebreak() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(post_action.1);
                 let loc = maybe_location(start, end);
                 ast::CaseItem { patterns: p, cmd: None, post_action: post_action.0, loc }
             } /
-            s:specific_operator("(")? p:pattern() specific_operator(")") c:compound_list() post_action:case_item_post_action() linebreak() {
+            s:case_item_open() p:pattern() specific_operator(")") c:compound_list() post_action:case_item_post_action() linebreak() {
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(post_action.1);
                 let loc = maybe_location(start, end);
                 ast::CaseItem { patterns: p, cmd: Some(c), post_action: post_action.0, loc }
             }
+
+        // A case item's `(`, if it has one; without it, `esac` ends the case, as in bash.
+        rule case_item_open() -> Option<&'input Token> =
+            o:specific_operator("(") { Some(o) } /
+            !specific_word("esac") { None }
 
         rule case_item_post_action() -> (ast::CaseItemPostAction, &'input SourceSpan)  =
             s:specific_operator(";;") {
@@ -465,6 +546,15 @@ peg::parser! {
                 ast::BraceGroupCommand { list, loc }
             }
 
+        // A for or select loop's body after its separator: `do ... done`, or, as bash also takes,
+        // `{ ... }`.
+        rule for_body() -> ast::DoGroupCommand =
+            do_group() /
+            brace_body()
+
+        rule brace_body() -> ast::DoGroupCommand =
+            b:brace_group() { ast::DoGroupCommand { list: b.list, loc: b.loc } }
+
         rule do_group() -> ast::DoGroupCommand =
             start:specific_word("do") list:compound_list() end:specific_word("done") {
                 let loc = SourceSpan::within(start.location(), end.location());
@@ -472,7 +562,7 @@ peg::parser! {
             }
 
         rule simple_command() -> ast::SimpleCommand =
-            prefix:cmd_prefix() word_and_suffix:(word_or_name:cmd_word() suffix:cmd_suffix()? { (word_or_name, suffix) })? {
+            prefix:cmd_prefix() word_and_suffix:(word_or_name:cmd_word() suffix:cmd_suffix(assignment_builtin(word_or_name))? { (word_or_name, suffix) })? {
                 match word_and_suffix {
                     Some((word_or_name, suffix)) => {
                         ast::SimpleCommand { prefix: Some(prefix), word_or_name: Some(ast::Word::from(word_or_name)), suffix }
@@ -482,7 +572,7 @@ peg::parser! {
                     }
                 }
             } /
-            word_or_name:cmd_name() suffix:cmd_suffix()? {
+            word_or_name:cmd_name() suffix:cmd_suffix(assignment_builtin(word_or_name))? {
                 ast::SimpleCommand { prefix: None, word_or_name: Some(ast::Word::from(word_or_name)), suffix } } /
             expected!("simple command")
 
@@ -501,7 +591,9 @@ peg::parser! {
                 }
             )+ { ast::CommandPrefix(p) }
 
-        rule cmd_suffix() -> ast::CommandSuffix =
+        // After an assignment builtin (`declare`, `local` and the rest), `NAME=(...)` is a
+        // compound assignment; after any other command, as in bash, its `(` is out of place.
+        rule cmd_suffix(compound_assignments: bool) -> ast::CommandSuffix =
             s:(
                 non_posix_extensions_enabled() sub:process_substitution() {
                     let (kind, subshell) = sub;
@@ -510,6 +602,7 @@ peg::parser! {
                 i:io_redirect() {
                     ast::CommandPrefixOrSuffixItem::IoRedirect(i)
                 } /
+                !(!is_true(compound_assignments) [Token::Word(_, _)] specific_operator("("))
                 assignment_and_word:assignment_word() {
                     let (assignment, word) = assignment_and_word;
                     ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, word)
@@ -519,12 +612,18 @@ peg::parser! {
                 }
             )+ { ast::CommandSuffix(s) }
 
+        rule is_true(value: bool) = &[_] {? if value { Ok(()) } else { Err("false") } }
+
         rule redirect_list() -> ast::RedirectList =
             r:io_redirect()+ { ast::RedirectList(r) } /
             expected!("redirect list")
 
         // N.B. here strings are extensions to the POSIX standard.
         rule io_redirect() -> ast::IoRedirect =
+            non_posix_extensions_enabled() v:io_variable() f:io_file() {
+                    let (kind, target) = f;
+                    ast::IoRedirect::NamedFd(v, kind, target)
+                } /
             n:io_number()? f:io_file() {
                     let (kind, target) = f;
                     ast::IoRedirect::File(n, kind, target)
@@ -692,6 +791,16 @@ peg::parser! {
 
         // N.B. An I/O number must be a string of only digits, and it must be
         // followed by a '<' or '>' character (but not consume them). We also
+        // `{name}` directly before a redirection operator names a variable to hold the
+        // descriptor the shell allocates.
+        rule io_variable() -> String =
+            [Token::Word(w, loc) if braced_name(w).is_some()]
+            &([Token::Operator(o, redir_loc) if
+                    o.starts_with(['<', '>']) &&
+                    locations_are_contiguous(loc, redir_loc)]) {?
+                braced_name(w).map(str::to_owned).ok_or("io variable")
+            }
+
         // need to make sure that there was no space between the number and the
         // redirection operator; unfortunately we don't have the space anymore
         // but we can infer it by looking at the tokens' locations.
@@ -758,6 +867,19 @@ fn locations_are_contiguous(loc_left: &crate::SourceSpan, loc_right: &crate::Sou
     loc_left.end.index == loc_right.start.index
 }
 
+impl Tokens<'_> {
+    /// The source text from character `from` to character `to`, when the source is known.
+    fn source_text(&self, from: usize, to: usize) -> Option<String> {
+        let source = self.source?;
+        (from <= to).then(|| source.chars().skip(from).take(to - from).collect())
+    }
+
+    /// The source text after the token `from` and before the token `to`.
+    fn text_between(&self, from: &Token, to: &Token) -> Option<String> {
+        self.source_text(from.location().end.index, to.location().start.index)
+    }
+}
+
 impl peg::Parse for Tokens<'_> {
     type PositionRepr = usize;
 
@@ -806,6 +928,18 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
     /// false and no space is inserted — a safe degradation to the previous
     /// behavior, which also omitted spaces between non-word tokens.
     fn parse_slice(&'a self, start: usize, end: usize) -> Self::Slice {
+        // With the source known, the text is as written.
+        if let (Some(first), Some(last)) = (
+            self.tokens.get(start),
+            end.checked_sub(1).and_then(|e| self.tokens.get(e)),
+        ) {
+            if let Some(text) =
+                self.source_text(first.location().start.index, last.location().end.index)
+            {
+                return text;
+            }
+        }
+
         let mut result = String::new();
         let mut prev_end_index: Option<usize> = None;
 
@@ -824,4 +958,30 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
 
         result
     }
+}
+
+/// Whether bash takes `NAME=(...)` arguments of the command word `token` as compound assignments:
+/// the word must be one of its assignment builtins, written as is.
+fn assignment_builtin(token: &Token) -> bool {
+    matches!(
+        token.to_str(),
+        "alias" | "declare" | "eval" | "export" | "local" | "readonly" | "typeset"
+    )
+}
+
+/// The variable name in `{name}`: a letter or underscore, then letters, digits and underscores.
+fn braced_name(word: &str) -> Option<&str> {
+    let braced = word.strip_prefix('{')?.strip_suffix('}')?;
+    // A variable, or an element of an array (`{a[1]}`).
+    let name = match braced.split_once('[') {
+        Some((name, subscript)) if subscript.len() > 1 && subscript.ends_with(']') => name,
+        Some(_) => return None,
+        None => braced,
+    };
+    let mut chars = name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(braced)
 }

@@ -41,9 +41,11 @@ peg::parser! {
         rule four_arg_expr() -> ast::TestExpr =
             ["!"] e:three_arg_expr() { ast::TestExpr::Not(Box::from(e)) }
 
+        // `-a` binds tighter than `-o`, as in bash.
         rule expression() -> ast::TestExpr = precedence! {
-            left:(@) ["-a"] right:@ { ast::TestExpr::And(Box::from(left), Box::from(right)) }
             left:(@) ["-o"] right:@ { ast::TestExpr::Or(Box::from(left), Box::from(right)) }
+            --
+            left:(@) ["-a"] right:@ { ast::TestExpr::And(Box::from(left), Box::from(right)) }
             --
             ["("] e:expression() [")"] { ast::TestExpr::Parenthesized(Box::from(e)) }
             --
@@ -101,5 +103,35 @@ peg::parser! {
             [">"]   { ast::BinaryPredicate::LeftSortsAfterRight }
 
         rule end() = ![_]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // `x -o '' -a ''` is `x -o ('' -a '')`, as bash reads it.
+        let expr = parse(&["x", "-o", "", "-a", ""]).ok();
+        assert!(
+            matches!(
+                &expr,
+                Some(ast::TestExpr::Or(left, right))
+                    if matches!(**left, ast::TestExpr::Literal(_))
+                        && matches!(**right, ast::TestExpr::And(..))
+            ),
+            "{expr:?}"
+        );
+        let expr = parse(&["a", "-a", "b", "-o", "c", "-a", "d"]).ok();
+        assert!(
+            matches!(
+                &expr,
+                Some(ast::TestExpr::Or(left, right))
+                    if matches!(**left, ast::TestExpr::And(..))
+                        && matches!(**right, ast::TestExpr::And(..))
+            ),
+            "{expr:?}"
+        );
     }
 }

@@ -33,6 +33,9 @@ pub struct ParserOptions {
     pub tilde_expansion_at_word_start: bool,
     /// Whether or not to perform tilde expansion for tildes after colons.
     pub tilde_expansion_after_colon: bool,
+    /// Whether or not to perform tilde expansion for a tilde right after the `=` of a word that
+    /// looks like an assignment (`name=~/x`), as bash does for such words on a command line.
+    pub tilde_expansion_after_assignment_equals: bool,
     /// Select the parser internal implementation
     pub parser_impl: ParserImpl,
 }
@@ -45,6 +48,7 @@ impl Default for ParserOptions {
             sh_mode: false,
             tilde_expansion_at_word_start: true,
             tilde_expansion_after_colon: false,
+            tilde_expansion_after_assignment_equals: false,
             parser_impl: ParserImpl::default(),
         }
     }
@@ -125,6 +129,9 @@ impl<R: std::io::BufRead> Parser<R> {
         #[builder(default = false)]
         /// Whether or not to perform tilde expansion for tildes after colons.
         tilde_expansion_after_colon: bool,
+        #[builder(default = false)]
+        /// Whether or not to perform tilde expansion right after the `=` of an assignment-like word.
+        tilde_expansion_after_assignment_equals: bool,
         #[builder(default)]
         /// Select the parser internal implementation
         parser_impl: ParserImpl,
@@ -135,6 +142,7 @@ impl<R: std::io::BufRead> Parser<R> {
             sh_mode,
             tilde_expansion_at_word_start,
             tilde_expansion_after_colon,
+            tilde_expansion_after_assignment_equals,
             parser_impl,
         };
         Self { reader, options }
@@ -151,8 +159,15 @@ impl<R: std::io::BufRead> Parser<R> {
         //
         match self.options.parser_impl {
             ParserImpl::Peg => {
-                let tokens = self.tokenize()?;
-                parse_tokens(&tokens, &self.options)
+                let (tokens, source) = self.tokenize()?;
+                let parse_result = peg::token_parser::program(
+                    &Tokens {
+                        tokens: &tokens,
+                        source: Some(&source),
+                    },
+                    &self.options,
+                );
+                parse_result_to_error(parse_result, &tokens)
             }
             #[cfg(feature = "winnow-parser")]
             ParserImpl::Winnow => {
@@ -180,13 +195,19 @@ impl<R: std::io::BufRead> Parser<R> {
     pub fn parse_function_parens_and_body(
         &mut self,
     ) -> Result<ast::FunctionBody, crate::error::ParseError> {
-        let tokens = self.tokenize()?;
-        let parse_result =
-            peg::token_parser::function_parens_and_body(&Tokens { tokens: &tokens }, &self.options);
+        let (tokens, source) = self.tokenize()?;
+        let parse_result = peg::token_parser::function_parens_and_body(
+            &Tokens {
+                tokens: &tokens,
+                source: Some(&source),
+            },
+            &self.options,
+        );
         parse_result_to_error(parse_result, &tokens)
     }
 
-    fn tokenize(&mut self) -> Result<Vec<Token>, crate::error::ParseError> {
+    /// The input's tokens, and its text.
+    fn tokenize(&mut self) -> Result<(Vec<Token>, String), crate::error::ParseError> {
         // First we tokenize the input, according to the policy implied by provided options.
         let mut tokenizer = Tokenizer::new(&mut self.reader, &self.options.tokenizer_options());
 
@@ -217,7 +238,7 @@ impl<R: std::io::BufRead> Parser<R> {
 
         tracing::debug!(target: "tokenize", "  => {} token(s)", tokens.len());
 
-        Ok(tokens)
+        Ok((tokens, tokenizer.take_text()))
     }
 }
 
@@ -231,7 +252,13 @@ pub fn parse_tokens(
     tokens: &[Token],
     options: &ParserOptions,
 ) -> Result<ast::Program, crate::error::ParseError> {
-    let parse_result = peg::token_parser::program(&Tokens { tokens }, options);
+    let parse_result = peg::token_parser::program(
+        &Tokens {
+            tokens,
+            source: None,
+        },
+        options,
+    );
     parse_result_to_error(parse_result, tokens)
 }
 
@@ -247,8 +274,11 @@ pub(crate) fn parse_compound_assignment_value(
     options: &ParserOptions,
 ) -> Option<Vec<String>> {
     let mut parser = Parser::new(input.as_bytes(), options);
-    let tokens = parser.tokenize().ok()?;
-    let tokens = Tokens { tokens: &tokens };
+    let (tokens, source) = parser.tokenize().ok()?;
+    let tokens = Tokens {
+        tokens: &tokens,
+        source: Some(&source),
+    };
     let elements = peg::token_parser::compound_assignment_value(&tokens, options).ok()?;
     Some(elements.into_iter().cloned().collect())
 }
