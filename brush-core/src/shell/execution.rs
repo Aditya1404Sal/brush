@@ -22,6 +22,76 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         params
     }
 
+    /// Lowers `SHLVL` by one before `exec` runs `name` in place of the shell, as bash does,
+    /// unless the shell is a `( list )` subshell or `name` is nothing it can run.
+    pub fn exec_shell_level(&mut self, params: &ExecutionParameters, name: &str) {
+        if !self.paren_subshell
+            && self
+                .builtins
+                .get(name)
+                .is_some_and(|builtin| !builtin.disabled)
+        {
+            self.adjust_shell_level(-1, params, true);
+        }
+    }
+
+    /// Changes `SHLVL` by `change`, as bash's `adjust_shell_level` does before it replaces the
+    /// shell with a program: a value that is not a number counts as 0, the level stays at least
+    /// 0, and one of 1000 or more is reported and reset to 1. The variable ends up exported. The
+    /// command's own assignment (`SHLVL=5 cmd`) is the one changed only when `own_assignments`
+    /// holds, as bash sees it only from a builtin or in a subshell; otherwise the program gets
+    /// the shell's level in its place.
+    pub(crate) fn adjust_shell_level(
+        &mut self,
+        change: i64,
+        params: &ExecutionParameters,
+        own_assignments: bool,
+    ) {
+        use crate::env::{EnvironmentLookup, EnvironmentScope};
+        use crate::variables::ShellValueLiteral;
+        use std::io::Write as _;
+
+        let command_scope = if own_assignments {
+            None
+        } else {
+            self.env.take_scope(EnvironmentScope::Command).ok()
+        };
+        let old = self
+            .env_str("SHLVL")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut level = old.saturating_add(change).max(0);
+        if level >= 1000 {
+            let _ = writeln!(
+                params.stderr(self),
+                "{}warning: shell level ({level}) too high, resetting to 1",
+                self.diagnostic_prefix()
+            );
+            level = 1;
+        }
+        let result = self.env.update_or_add(
+            "SHLVL",
+            ShellValueLiteral::Scalar(level.to_string()),
+            |var| {
+                var.export();
+                Ok(())
+            },
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        );
+        if let Some(mut scope) = command_scope {
+            if result.is_ok()
+                && let Some(var) = scope.get_mut("SHLVL")
+            {
+                let _ = var.assign(ShellValueLiteral::Scalar(level.to_string()), false);
+            }
+            self.env.restore_scope(EnvironmentScope::Command, scope);
+        }
+        if let Err(error) = result {
+            let _ = self.display_error(&mut params.stderr(self), &error);
+        }
+    }
+
     pub(super) async fn source_if_exists(
         &mut self,
         path: impl AsRef<Path>,
@@ -133,19 +203,22 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         params: &ExecutionParameters,
         call_type: callstack::ScriptCallType,
     ) -> Result<ExecutionResult, error::Error> {
-        let mut reader = std::io::BufReader::new(file);
-        let mut parser = brush_parser::Parser::new(&mut reader, &self.parser_options());
+        // The text is kept to word a syntax error as bash does.
+        let mut text = String::new();
+        std::io::BufReader::new(file).read_to_string(&mut text)?;
 
         tracing::debug!(target: trace_categories::PARSE, "Parsing sourced file: {}", source_info.source);
-        let parse_result = parser.parse_program();
+        let parse_result = self.parse_string(text.as_str());
 
         let script_positional_args = args.map(Into::into);
 
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
+        self.pending_input = Some(text.as_str().into());
+        let alias_scope = self.alias_scope.take();
 
         #[cfg(any(target_arch = "wasm32", test))]
-        {
+        let result = {
             let mut frame = super::FrameGuard::new(
                 self,
                 |shell| {
@@ -156,17 +229,29 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             );
             frame
                 .shell()
-                .run_parsed_result(parse_result, source_info, params)
+                .run_parsed_result(parse_result, Some(&text), source_info, params)
                 .await
-        }
+        };
         #[cfg(not(any(target_arch = "wasm32", test)))]
-        {
+        let result = {
             let result = self
-                .run_parsed_result(parse_result, source_info, params)
+                .run_parsed_result(parse_result, Some(&text), source_info, params)
                 .await;
             self.call_stack.pop();
             result
+        };
+
+        self.pending_input = None;
+        self.alias_scope = alias_scope;
+
+        // The RETURN trap runs as a sourced script returns, as in bash.
+        if matches!(call_type, callstack::ScriptCallType::Source) {
+            if let Ok(result) = &result {
+                self.last_exit_status = result.exit_code.into();
+            }
+            self.run_return_trap(params).await?;
         }
+        result
     }
 
     /// Executes the given string as a shell program, returning the resulting exit status.
@@ -182,9 +267,18 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         source_info: &crate::SourceInfo,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
-        let parse_result = self.parse_string(command);
-        self.run_parsed_result(parse_result, source_info, params)
-            .await
+        let command: String = command.into();
+        let parse_result = self.parse_string(command.as_str());
+        self.pending_input = Some(command.as_str().into());
+        // Text read now (`eval`'s, a trap's, a sourced file's) expands the aliases in effect now,
+        // even in a function body, whose own text expands those where it was defined.
+        let alias_scope = self.alias_scope.take();
+        let result = self
+            .run_parsed_result(parse_result, Some(&command), source_info, params)
+            .await;
+        self.alias_scope = alias_scope;
+        self.pending_input = None;
+        result
     }
 
     /// Executes the given command, provided to a shell executable on the command
@@ -247,20 +341,21 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         Ok(result)
     }
 
+    /// Runs a parsed program, or reports why it did not parse. `source` is the text that was
+    /// parsed, when known, so a syntax error can be worded as bash words it.
     pub(crate) async fn run_parsed_result(
         &mut self,
         parse_result: Result<brush_parser::ast::Program, brush_parser::ParseError>,
+        source: Option<&str>,
         source_info: &crate::SourceInfo,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
         // If parsing succeeded, run the program. If there's a parse error, it's fatal (per spec).
         let result = match parse_result {
             Ok(prog) => self.run_program(prog, params).await,
-            Err(parse_err) => Err(error::Error::from(error::ErrorKind::ParseError(
-                parse_err,
-                source_info.clone(),
-            ))
-            .into_fatal()),
+            Err(parse_err) => Err(self
+                .syntax_error(parse_err, source, source_info)
+                .into_fatal()),
         };
 
         // Report any errors.
@@ -275,6 +370,33 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
                 Ok(result)
             }
         }
+    }
+
+    /// A parse error, worded as bash words it when the parsed text is known. Bash names what it
+    /// was parsing: a trap handler as `exit trap`, otherwise the source (`-c`, `eval`, a path).
+    fn syntax_error(
+        &self,
+        error: brush_parser::ParseError,
+        source: Option<&str>,
+        source_info: &crate::SourceInfo,
+    ) -> error::Error {
+        let Some(source) = source else {
+            return error::ErrorKind::ParseError(error, source_info.clone()).into();
+        };
+        let origin = match self
+            .call_stack
+            .current_frame()
+            .map(|frame| &frame.frame_type)
+        {
+            Some(callstack::FrameType::TrapHandler(signal)) => {
+                std::format!("{} trap", signal.to_string().to_lowercase())
+            }
+            // Command strings and the substitutions inside them.
+            _ if matches!(source_info.source.as_str(), "main" | "environment") => "-c".to_owned(),
+            _ => source_info.source.clone(),
+        };
+        let lines = brush_parser::bash_diagnostic(&error, source, &self.parser_options());
+        error::ErrorKind::SyntaxError { origin, lines }.into()
     }
 
     /// Executes the given parsed shell program, returning the resulting exit status.

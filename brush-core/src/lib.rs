@@ -13,6 +13,7 @@ pub mod arithmetic;
 mod braceexpansion;
 pub mod builtins;
 pub mod callstack;
+pub mod casemap;
 pub mod commands;
 pub mod completion;
 pub mod env;
@@ -39,6 +40,7 @@ pub mod patterns;
 pub mod process_table;
 pub mod processes;
 mod prompt;
+pub mod rawbytes;
 mod regex;
 pub mod results;
 mod shell;
@@ -67,8 +69,8 @@ pub use interp::{ExecutionParameters, ProcessGroupPolicy};
 pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
 pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};
 pub use shell::{
-    CreateOptions, ProfileLoadBehavior, RcLoadBehavior, SavedCommandStatus, Shell, ShellBuilder,
-    ShellBuilderState, ShellFd, ShellState,
+    CreateOptions, ProfileLoadBehavior, PromptGuard, RcLoadBehavior, SavedCommandStatus, Shell,
+    ShellBuilder, ShellBuilderState, ShellFd, ShellState,
 };
 pub use sourceinfo::SourceInfo;
 pub use variables::{ShellValue, ShellVariable};

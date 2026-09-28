@@ -1,7 +1,10 @@
 //! Shell patterns
 
 use crate::{error, regex, sys, trace_categories};
-use std::{collections::VecDeque, path::Path};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
 /// Represents a piece of a shell pattern.
 #[derive(Clone, Debug)]
@@ -27,6 +30,84 @@ type PatternWord = Vec<PatternPiece>;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FilenameExpansionOptions {
     pub require_dot_in_pattern_to_match_dot_files: bool,
+    /// `globstar`: a `**` component matches any depth of directories.
+    pub globstar: bool,
+    /// `GLOBSORT`: how the results are ordered.
+    pub sort: Option<String>,
+    /// `shopt -u globskipdots`: `.` and `..` match a component that starts with a dot.
+    pub dot_entries: bool,
+}
+
+/// Orders `results`, relative to `working_dir` and already sorted by name, as bash's `GLOBSORT`
+/// asks: by `name` (the default, and what an unknown key means), `size`, `blocks`, `mtime`,
+/// `atime`, `ctime` or `numeric` value, or `nosort`; a leading `-` reverses it (a `+` does
+/// not), ties included. Where a file has no block count or change time (WASI), its size in
+/// 512-byte blocks and its modification time stand in.
+fn globsort(results: &mut [String], working_dir: &Path, sort: Option<&str>) {
+    let Some(sort) = sort else {
+        return;
+    };
+    let (reverse, key) = match sort.strip_prefix('-') {
+        Some(key) => (true, key),
+        None => (false, sort.strip_prefix('+').unwrap_or(sort)),
+    };
+    if key == "nosort" {
+        return;
+    }
+    let metadata = |path: &String| working_dir.join(path).symlink_metadata().ok();
+    let time = |time: Option<std::time::SystemTime>| {
+        time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .unwrap_or_default()
+    };
+    let mut keyed = |value: &dyn Fn(&std::fs::Metadata) -> u128| {
+        results.sort_by_cached_key(|path| metadata(path).map_or(0, |m| value(&m)));
+    };
+    match key {
+        "size" => keyed(&|m| u128::from(m.len())),
+        "blocks" => keyed(&|m| u128::from(file_blocks(m))),
+        "mtime" => keyed(&|m| time(m.modified().ok()).as_nanos()),
+        "atime" => keyed(&|m| time(m.accessed().ok()).as_nanos()),
+        "ctime" => keyed(&|m| change_time(m)),
+        // Names that are numbers first, in numeric order.
+        "numeric" => results.sort_by_cached_key(|name| {
+            name.parse::<i64>()
+                .map_or((1, i64::MAX), |number| (0, number))
+        }),
+        _ => {}
+    }
+    if reverse {
+        results.reverse();
+    }
+}
+
+#[cfg(unix)]
+fn file_blocks(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::blocks(metadata)
+}
+
+#[cfg(not(unix))]
+fn file_blocks(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len().div_ceil(512)
+}
+
+#[cfg(unix)]
+fn change_time(metadata: &std::fs::Metadata) -> u128 {
+    use std::os::unix::fs::MetadataExt;
+    #[expect(clippy::cast_sign_loss)]
+    let seconds = metadata.ctime().max(0) as u128;
+    #[expect(clippy::cast_sign_loss)]
+    let nanos = metadata.ctime_nsec().max(0) as u128;
+    seconds * 1_000_000_000 + nanos
+}
+
+#[cfg(not(unix))]
+fn change_time(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 /// Result of a pattern expansion, distinguishing "no glob metacharacters" from
@@ -181,10 +262,7 @@ impl Pattern {
 
         // Similarly, if we're *confident* the pattern doesn't require expansion, then we
         // know there's a single expansion (before filtering).
-        } else if !self.pieces.iter().any(|piece| {
-            matches!(piece, PatternPiece::Pattern(_))
-                && requires_expansion(piece.as_str(), self.enable_extended_globbing)
-        }) {
+        } else if !pieces_require_expansion(&self.pieces, self.enable_extended_globbing) {
             let concatenated: String = self.pieces.iter().map(|piece| piece.as_str()).collect();
 
             if let Some(filter) = path_filter
@@ -232,6 +310,7 @@ impl Pattern {
             sys::fs::pattern_path_root(&flattened)
         });
 
+        let absolute = absolute_root.is_some();
         let prefix_to_remove;
         let mut paths_so_far = if let Some(root) = absolute_root {
             prefix_to_remove = None;
@@ -256,15 +335,50 @@ impl Pattern {
             vec![working_dir.to_path_buf()]
         };
 
-        for component in components {
-            if !component.iter().any(|piece| {
-                matches!(piece, PatternPiece::Pattern(_))
-                    && requires_expansion(piece.as_str(), self.enable_extended_globbing)
-            }) {
+        let component_count = components.len();
+        // Whether the paths so far came from matching a pattern, rather than being written.
+        let mut matched_so_far = false;
+        for (index, component) in components.into_iter().enumerate() {
+            if options.globstar
+                && matches!(component.as_slice(), [PatternPiece::Pattern(star)] if star == "**")
+            {
+                // Last, `**` names the directory and everything below it; before another
+                // component, the directory and every directory below it. As in bash, the
+                // directory itself is left out when it is the working directory the pattern
+                // is relative to, and named without a trailing slash when a pattern matched
+                // it (`*/**`); only directories have anything below them.
+                let last = index + 1 == component_count;
+                let allow_dot_files = !options.require_dot_in_pattern_to_match_dot_files;
+                for current_path in std::mem::take(&mut paths_so_far) {
+                    if !current_path.is_dir() {
+                        continue;
+                    }
+                    let mut found = vec![];
+                    if !last {
+                        found.push(current_path.clone());
+                    } else if matched_so_far {
+                        found.push(current_path.clone());
+                    } else if index > 0 || absolute {
+                        let written = current_path.display().to_string();
+                        found.push(PathBuf::from(if written.ends_with('/') {
+                            written
+                        } else {
+                            std::format!("{written}/")
+                        }));
+                    }
+                    walk_for_globstar(&current_path, !last, allow_dot_files, &mut found);
+                    paths_so_far.append(&mut found);
+                }
+                matched_so_far = true;
+                continue;
+            }
+
+            if !pieces_require_expansion(&component, self.enable_extended_globbing) {
                 let flattened = component
                     .iter()
                     .map(|piece| piece.as_str())
                     .collect::<String>();
+                matched_so_far = false;
                 paths_so_far.retain_mut(|p| {
                     sys::fs::push_path_for_pattern(p, &flattened);
 
@@ -280,6 +394,7 @@ impl Pattern {
                 continue;
             }
 
+            matched_so_far = true;
             let current_paths = std::mem::take(&mut paths_so_far);
             for current_path in current_paths {
                 let subpattern = Self::from(&component)
@@ -315,21 +430,25 @@ impl Pattern {
                     .map(|entry| entry.path())
                     .collect();
 
+                // Directory listings leave out `.` and `..`; without `globskipdots`, bash matches
+                // them against a component that starts with a dot.
+                if options.dot_entries && subpattern_starts_with_dot {
+                    for name in [".", ".."] {
+                        if regex.is_match(name).unwrap_or(false) {
+                            matching_paths_in_dir.push(current_path.join(name));
+                        }
+                    }
+                }
+
                 matching_paths_in_dir.sort();
 
                 paths_so_far.append(&mut matching_paths_in_dir);
             }
         }
 
-        let results: Vec<_> = paths_so_far
+        let mut results: Vec<_> = paths_so_far
             .into_iter()
             .filter_map(|path| {
-                if let Some(filter) = path_filter
-                    && !filter(path.as_path())
-                {
-                    return None;
-                }
-
                 // Normalize separators *before* stripping the working-dir
                 // prefix so that `prefix_to_remove` (already normalized to
                 // use `/`) matches paths that may contain a mix of `\` and
@@ -344,9 +463,26 @@ impl Pattern {
                     path_ref = stripped;
                 }
 
+                // The working directory itself (`**/` reaching it) is not a result.
+                if path_ref.is_empty() {
+                    return None;
+                }
+
+                // The filter sees each result as it will be returned (GLOBIGNORE's patterns
+                // match `a.txt` for `*`, not the absolute path).
+                if let Some(filter) = path_filter
+                    && !filter(Path::new(path_ref))
+                {
+                    return None;
+                }
+
                 Some(path_ref.to_string())
             })
             .collect();
+
+        // Bash sorts all the results together, not directory by directory.
+        results.sort();
+        globsort(&mut results, working_dir, options.sort.as_deref());
 
         tracing::debug!(target: trace_categories::PATTERN, "  => results: {results:?}");
 
@@ -437,6 +573,66 @@ impl Pattern {
 /// Checks whether a string contains glob metacharacters that would trigger
 /// pathname expansion. Delegates to the pattern parser's grammar, which is
 /// the single source of truth for what constitutes a glob metacharacter.
+/// Everything below `dir` (directories only when `directories_only`), not following symbolic
+/// links and skipping dot files unless `allow_dot_files`, as bash's `globstar` walks.
+fn walk_for_globstar(
+    dir: &Path,
+    directories_only: bool,
+    allow_dot_files: bool,
+    found: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = dir.read_dir() else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if !allow_dot_files && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if is_dir || !directories_only {
+            found.push(entry.path());
+        }
+        if is_dir {
+            walk_for_globstar(&entry.path(), directories_only, allow_dot_files, found);
+        }
+    }
+}
+
+/// Whether the pieces hold a glob. That is decided on the whole of them, quoted pieces escaped:
+/// an extglob can hold a quoted character (`@(\*|b)`), which splits it into pieces that are not
+/// globs by themselves.
+fn pieces_require_expansion(pieces: &[PatternPiece], enable_extended_globbing: bool) -> bool {
+    if !pieces
+        .iter()
+        .any(|piece| matches!(piece, PatternPiece::Pattern(_)))
+    {
+        return false;
+    }
+    let pattern: String = pieces
+        .iter()
+        .map(|piece| match piece {
+            PatternPiece::Pattern(s) => s.clone(),
+            PatternPiece::Literal(s) => escape_for_pattern(s),
+        })
+        .collect();
+    requires_expansion(&pattern, enable_extended_globbing)
+}
+
+/// `s` with every character that means something in a pattern backslash-escaped.
+fn escape_for_pattern(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '*' | '?' | '[' | ']' | '\\' | '(' | ')' | '|' | '@' | '!' | '+'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 fn requires_expansion(s: &str, enable_extended_globbing: bool) -> bool {
     brush_parser::pattern::pattern_has_glob_metacharacters(s, enable_extended_globbing)
 }
@@ -494,6 +690,12 @@ pub(crate) fn remove_smallest_matching_prefix<'a>(
 ) -> Result<&'a str, error::Error> {
     if let Some(pattern) = pattern {
         let re = pattern.to_regex(true, true)?;
+
+        // The shortest prefix is the empty one (`${x#*}` removes nothing), as in bash.
+        if re.is_match("")? {
+            return Ok(s);
+        }
+
         let mut indices = s.char_indices();
 
         #[allow(
@@ -549,6 +751,12 @@ pub(crate) fn remove_smallest_matching_suffix<'a>(
 ) -> Result<&'a str, error::Error> {
     if let Some(pattern) = pattern {
         let re = pattern.to_regex(true, true)?;
+
+        // The shortest suffix is the empty one (`${x%*}` removes nothing), as in bash.
+        if re.is_match("")? {
+            return Ok(s);
+        }
+
         #[allow(
             clippy::string_slice,
             reason = "because we get the indices from char_indices()"
@@ -692,6 +900,15 @@ mod tests {
         assert_eq!(
             remove_smallest_matching_prefix("🚀🚀🚀rocket", Some(&Pattern::from("🚀")))?,
             "🚀🚀rocket"
+        );
+        // A pattern that matches the empty string removes nothing.
+        assert_eq!(
+            remove_smallest_matching_prefix("abc", Some(&Pattern::from("*")))?,
+            "abc"
+        );
+        assert_eq!(
+            remove_smallest_matching_suffix("abc", Some(&Pattern::from("*")))?,
+            "abc"
         );
         Ok(())
     }

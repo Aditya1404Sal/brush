@@ -91,6 +91,9 @@ pub trait ShellState {
     /// Returns the current subshell depth; 0 is returned if this shell is not a subshell.
     fn depth(&self) -> usize;
 
+    /// Returns `BASH_SUBSHELL`: how many subshells this one is nested in, as bash counts them.
+    fn subshell_level(&self) -> usize;
+
     /// Returns the call stack for the shell.
     fn call_stack(&self) -> &crate::callstack::CallStack;
 
@@ -99,6 +102,12 @@ pub trait ShellState {
 
     /// Returns a mutable reference to the shell's history, if it exists.
     fn history_mut(&mut self) -> Option<&mut crate::history::History>;
+
+    /// Returns a mutable reference to the shell's history, creating an empty one first if none
+    /// exists yet -- unlike [`Self::history_mut`], which never creates one. The `history`
+    /// builtin uses this: bash's own history *list* works regardless of the `history` -o
+    /// option's state (only automatic recording, elsewhere, is gated by it).
+    fn history_or_init_mut(&mut self) -> &mut crate::history::History;
 
     /// Returns the shell's official version string (if available).
     fn version(&self) -> Option<&str>;

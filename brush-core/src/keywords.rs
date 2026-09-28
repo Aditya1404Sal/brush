@@ -32,6 +32,12 @@ fn get_keywords(sh_mode_only: bool) -> HashSet<&'static str> {
     keywords
 }
 
+/// The reserved words in the order bash lists them (`compgen -k`).
+pub(crate) const IN_BASH_ORDER: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do",
+    "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc",
+];
+
 pub(crate) static SH_MODE_KEYWORDS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| get_keywords(true));
 pub(crate) static KEYWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| get_keywords(false));

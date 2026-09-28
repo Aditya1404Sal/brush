@@ -52,6 +52,10 @@ pub(crate) enum UnquotedBackslashHandling {
 pub(crate) struct ExpanderOptions {
     /// Whether to perform tilde-expansion.
     pub tilde_expand: bool,
+    /// Whether the word is expanded as a word of the command line, which (as in bash outside
+    /// POSIX mode) gets tilde expansion after its first `=` and after each `:` when it looks like
+    /// an assignment (`make DESTDIR=~/out`). Requires `tilde_expand`.
+    pub assignment_word_tilde: bool,
     /// Whether to perform brace-expansion.
     pub brace_expand: bool,
     /// Whether to perform command substitutions. If disabled, command substitutions
@@ -69,6 +73,7 @@ impl Default for ExpanderOptions {
     fn default() -> Self {
         Self {
             tilde_expand: true,
+            assignment_word_tilde: true,
             brace_expand: true,
             execute_command_substitutions: true,
             pathname_expand: true,
@@ -201,10 +206,13 @@ impl From<ExpansionPiece> for Expansion {
 
 impl Expansion {
     fn classify(&self) -> ParameterState {
-        let non_empty = self
-            .fields
-            .iter()
-            .any(|field| field.0.iter().any(|piece| !piece.as_str().is_empty()));
+        // Bash tests the elements joined by spaces, so two or more elements are never null,
+        // even if each is empty.
+        let non_empty = self.fields.len() > 1
+            || self
+                .fields
+                .iter()
+                .any(|field| field.0.iter().any(|piece| !piece.as_str().is_empty()));
 
         if self.undefined {
             ParameterState::Undefined
@@ -349,6 +357,7 @@ impl WordField {
         Self(vec![])
     }
 
+    /// The length in characters, not bytes, as in a UTF-8 locale; slicing counts the same way.
     pub fn len(&self) -> usize {
         self.0.iter().fold(0, |acc, piece| acc + piece.len())
     }
@@ -440,8 +449,8 @@ impl ExpansionPiece {
         }
     }
 
-    const fn len(&self) -> usize {
-        self.as_str().len()
+    fn len(&self) -> usize {
+        self.as_str().chars().count()
     }
 
     fn make_unsplittable(self) -> Self {
@@ -549,8 +558,62 @@ pub(crate) async fn basic_expand_heredoc_word(
 ) -> Result<String, error::Error> {
     let mut expander = WordExpander::new(shell, params);
     expander.heredoc_mode = true;
+    // A here-document's body is expanded as if in double quotes, so the word of a
+    // `${v:+'x'}` keeps its single quotes, as in bash.
+    expander.in_double_quotes = true;
     expander.disable_brace_expansion = true;
+    expander.assignment_word_tilde = false;
     expander.basic_expand_to_str(word_str.as_ref()).await
+}
+
+/// Expands the text of an arithmetic expression (the inside of `$((...))`, `((...))` or
+/// `$[...]`) as bash does: as if it were inside double quotes, with double quotes removed. A
+/// single quote, or a backslash before a character it does not escape in double quotes, stays in
+/// the text for the arithmetic parser to reject.
+///
+/// # Arguments
+///
+/// * `shell` - The shell in which to perform expansion.
+/// * `params` - The execution parameters to use during expansion.
+/// * `text` - The expression's text.
+pub(crate) async fn basic_expand_arithmetic_text(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    text: &str,
+) -> Result<String, error::Error> {
+    let mut expander = WordExpander::new(shell, params);
+    expander.arithmetic_mode = true;
+    expander.disable_brace_expansion = true;
+    expander.assignment_word_tilde = false;
+    expander.basic_expand_to_str(text).await
+}
+
+/// The output of the command substitution of `command` (backquoted or not), as it replaces the
+/// substitution: without null bytes, which it warns of, or trailing newlines.
+pub(crate) async fn command_substitution_output(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: String,
+    backquoted: bool,
+) -> Result<String, error::Error> {
+    let mut output =
+        commands::invoke_command_in_subshell_and_get_output(shell, params, command, backquoted)
+            .await?;
+
+    // Strips null bytes from command substitution output for compatibility.
+    if output.contains('\0') {
+        writeln!(
+            params.stderr(shell),
+            "{}warning: command substitution: ignored null byte in input",
+            shell.diagnostic_prefix(),
+        )?;
+        output.retain(|c| c != '\0');
+    }
+
+    // We trim trailing newlines, per spec.
+    let trimmed_len = output.trim_end_matches('\n').len();
+    output.truncate(trimmed_len);
+    Ok(output)
 }
 
 /// Applies all basic expansion to the given word (represented as a string),
@@ -588,6 +651,43 @@ pub(crate) async fn full_expand_and_split_word(
     expander.full_expand_with_splitting(word_str.as_ref()).await
 }
 
+/// Like [`full_expand_and_split_word`], for an element of a compound array assignment. Bash gives
+/// an element that looks like an assignment (`a=(x=~)`) no tilde expansion after its `=`.
+///
+/// # Arguments
+///
+/// * `shell` - The shell in which to perform expansion.
+/// * `params` - The execution parameters to use during expansion.
+/// * `word_str` - The element to expand, as a string.
+pub(crate) async fn full_expand_and_split_array_element(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    word_str: impl AsRef<str>,
+) -> Result<Vec<String>, error::Error> {
+    let mut expander = WordExpander::new(shell, params);
+    expander.assignment_word_tilde = false;
+    expander.full_expand_with_splitting(word_str.as_ref()).await
+}
+
+/// Like [`basic_expand_word`], for the word of a here-string (`<<< word`), which bash does not
+/// treat as an assignment-like word (`<<< x=~` stays literal).
+///
+/// # Arguments
+///
+/// * `shell` - The shell in which to perform expansion.
+/// * `params` - The execution parameters to use during expansion.
+/// * `word_str` - The word to expand, as a string.
+pub(crate) async fn basic_expand_here_string(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    word_str: impl AsRef<str>,
+) -> Result<String, error::Error> {
+    let mut expander = WordExpander::new(shell, params);
+    expander.disable_brace_expansion = true;
+    expander.assignment_word_tilde = false;
+    expander.basic_expand_to_str(word_str.as_ref()).await
+}
+
 /// Apply tilde-expansion, parameter expansion, command substitution, and arithmetic expansion;
 /// then perform field splitting and pathname expansion on the result.
 ///
@@ -623,6 +723,8 @@ pub(crate) async fn basic_expand_assignment_word(
     // Bash performs no brace expansion in this context.
     expander.disable_brace_expansion = true;
     expander.parser_options.tilde_expansion_after_colon = true;
+    // The value is not a word of its own: in `y=x=~` only the first `=` counts.
+    expander.assignment_word_tilde = false;
     expander.basic_expand_to_str(word_str.as_ref()).await
 }
 
@@ -642,8 +744,12 @@ pub async fn assign_to_named_parameter(
     value: String,
 ) -> Result<(), error::Error> {
     let parser_options = shell.parser_options();
-    let mut expander = WordExpander::new(shell, params);
     let parameter = brush_parser::word::parse_parameter(name, &parser_options)?;
+    // A circular name reference warns as bash binds it.
+    if let brush_parser::word::Parameter::Named(name) = &parameter {
+        shell.warn_circular_nameref(params, name, 0, true);
+    }
+    let mut expander = WordExpander::new(shell, params);
     expander.assign_to_parameter(&parameter, value).await
 }
 
@@ -667,6 +773,21 @@ struct WordExpander<'a, SE: extensions::ShellExtensions> {
     in_double_quotes: bool,
     /// Whether to use heredoc expansion semantics (literal quotes, no brace expansion).
     heredoc_mode: bool,
+    /// Whether the word is an arithmetic expression's text (see `basic_expand_arithmetic_text`).
+    arithmetic_mode: bool,
+    /// The outermost word being expanded, which some diagnostics quote.
+    outer_word: Option<String>,
+    /// How many times bash looks an array element (or all of them) up, for the warnings a
+    /// circular name reference gets: twice, or once for `${#a[@]}`.
+    element_lookups: usize,
+    /// The text being expanded at the current level (a word, the inside of its double quotes,
+    /// or a here-document's body), which a bad substitution's diagnostic quotes, as bash's does.
+    current_text: String,
+    /// Whether the next word expanded is a command-line word that, if it looks like an
+    /// assignment, gets tilde expansion after its `=` and colons (see
+    /// [`ExpanderOptions::assignment_word_tilde`]). Cleared once that word is taken, so words
+    /// re-expanded inside it (such as `${x:-y=~}`) are not treated that way.
+    assignment_word_tilde: bool,
 }
 
 impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
@@ -675,6 +796,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Self {
             shell,
             params,
+            assignment_word_tilde: !parser_options.posix_mode,
             parser_options,
             disable_brace_expansion: false,
             disable_command_substitutions: false,
@@ -682,6 +804,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             unquoted_backslash_handling: UnquotedBackslashHandling::Strip,
             in_double_quotes: false,
             heredoc_mode: false,
+            arithmetic_mode: false,
+            outer_word: None,
+            element_lookups: 2,
+            current_text: String::new(),
         }
     }
 
@@ -700,6 +826,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Self {
             shell,
             params,
+            assignment_word_tilde: options.tilde_expand
+                && options.assignment_word_tilde
+                && !parser_options.posix_mode,
             parser_options,
             disable_brace_expansion: !options.brace_expand,
             disable_command_substitutions: !options.execute_command_substitutions,
@@ -707,6 +836,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             unquoted_backslash_handling: options.unquoted_backslash_handling,
             in_double_quotes: false,
             heredoc_mode: false,
+            arithmetic_mode: false,
+            outer_word: None,
+            element_lookups: 2,
+            current_text: String::new(),
         }
     }
 
@@ -743,7 +876,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             let pattern = self
                 .basic_expand_pattern(word)
                 .await?
-                .set_extended_globbing(self.parser_options.enable_extended_globbing);
+                .set_extended_globbing(self.shell.options().extended_globbing);
 
             Ok(Some(pattern))
         } else {
@@ -809,6 +942,14 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
     async fn basic_expand(&mut self, word: &str) -> Result<Expansion, error::Error> {
         tracing::debug!(target: trace_categories::EXPANSION, "Basic expanding: '{word}'");
 
+        if self.outer_word.is_none() {
+            self.outer_word = Some(word.to_owned());
+        }
+
+        // Bash tests the word as written, before brace expansion: `{x=~,y}` is not assignment-like.
+        let assignment_word = std::mem::take(&mut self.assignment_word_tilde)
+            && brush_parser::word::assignment_value_start(word).is_some();
+
         // Quick short circuit to avoid more expensive parsing. The characters below are
         // understood to be the *only* ones indicative of *possible* expansion. There's
         // still a possibility no expansion needs to be done, but that's okay; we'll still
@@ -816,10 +957,17 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         let expansion_chars: &[char] = if self.heredoc_mode {
             // Heredoc bodies treat quotes as literal; only $, `, and \ trigger expansion.
             &['$', '`', '\\']
+        } else if self.arithmetic_mode {
+            // Arithmetic text treats single quotes as literal and removes double quotes.
+            &['$', '`', '\\', '"']
         } else {
             &['$', '`', '\\', '\'', '\"', '~', '{']
         };
-        if !word.contains(expansion_chars) {
+        // So is a process substitution (`<(list)`, `>(list)`) in an unquoted word.
+        let process_substitution = !self.heredoc_mode
+            && !self.arithmetic_mode
+            && (word.contains("<(") || word.contains(">("));
+        if !word.contains(expansion_chars) && !process_substitution {
             return Ok(Expansion::from(ExpansionPiece::UnquotedLiteral(
                 word.to_owned(),
             )));
@@ -829,7 +977,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         // Bash performs it before every other expansion and each result is a word of its
         // own; that is what keeps the results separate when IFS lacks a space.
         let Some(brace_words) = self.brace_expand_if_needed(word) else {
-            return self.expand_unbraced_word(word).await;
+            return self.expand_unbraced_word(word, assignment_word).await;
         };
 
         tracing::debug!(target: trace_categories::EXPANSION, "  => brace expanded to {brace_words:?}");
@@ -838,12 +986,16 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         // the `concatenate` flag of "${arr[@]}". With several results each one contributes
         // its fields and array semantics don't propagate.
         if let [only] = brace_words.as_slice() {
-            return self.expand_unbraced_word(only).await;
+            return self.expand_unbraced_word(only, assignment_word).await;
         }
 
         let mut fields = vec![];
         for brace_word in &brace_words {
-            fields.extend(self.expand_unbraced_word(brace_word).await?.fields);
+            fields.extend(
+                self.expand_unbraced_word(brace_word, assignment_word)
+                    .await?
+                    .fields,
+            );
         }
 
         Ok(Expansion {
@@ -854,20 +1006,52 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
     /// Apply tilde-expansion, parameter expansion, command substitution and arithmetic
     /// expansion to a word that contains no brace expression (or is one result of one).
-    async fn expand_unbraced_word(&mut self, word: &str) -> Result<Expansion, error::Error> {
+    /// An `assignment_word` also gets tilde expansion after its first `=` and after colons.
+    async fn expand_unbraced_word(
+        &mut self,
+        word: &str,
+        assignment_word: bool,
+    ) -> Result<Expansion, error::Error> {
         // Heredoc mode only affects top-level parsing (literal quotes); recursive
         // expansion of parameter words (e.g., ${var:-"default"}) uses normal semantics.
         let pieces = if self.heredoc_mode {
             self.heredoc_mode = false;
             brush_parser::word::parse_heredoc(word, &self.parser_options)?
+        } else if self.arithmetic_mode {
+            self.arithmetic_mode = false;
+            brush_parser::word::parse_arithmetic_text(word, &self.parser_options)?
+        } else if assignment_word {
+            let options = brush_parser::ParserOptions {
+                tilde_expansion_after_colon: true,
+                tilde_expansion_after_assignment_equals: true,
+                ..self.parser_options.clone()
+            };
+            brush_parser::word::parse(word, &options)?
         } else {
             brush_parser::word::parse(word, &self.parser_options)?
         };
 
         let mut expansions = Vec::with_capacity(pieces.len());
+        let outer_text = std::mem::replace(&mut self.current_text, word.to_owned());
         for piece in pieces {
-            expansions.push(self.expand_word_piece(piece.piece).await?);
+            // Inside double quotes, the text a diagnostic quotes is what they enclose.
+            let quoted = match &piece.piece {
+                brush_parser::word::WordPiece::DoubleQuotedSequence(_) => Some(1),
+                brush_parser::word::WordPiece::GettextDoubleQuotedSequence(_) => Some(2),
+                _ => None,
+            };
+            if let Some(open) = quoted {
+                word.get(piece.start_index + open..piece.end_index.saturating_sub(1))
+                    .unwrap_or_default()
+                    .clone_into(&mut self.current_text);
+            }
+            let expansion = self.expand_word_piece(piece.piece).await;
+            if quoted.is_some() {
+                word.clone_into(&mut self.current_text);
+            }
+            expansions.push(expansion?);
         }
+        self.current_text = outer_text;
 
         Ok(coalesce_expansions(expansions))
     }
@@ -897,7 +1081,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
                 result?
             } else {
-                // Not double-quoted - wrap in double-quotes to get double-quote parsing semantics
+                // Not double-quoted - wrap in double-quotes to get double-quote parsing semantics.
+                // Bash (with extquote, its default) still expands a `$'...'` in such a word.
+                let word = self.expand_ansi_c_quotes_for_double_quotes(word);
                 let wrapped = std::format!("\"{word}\"");
                 self.basic_expand(&wrapped).await?
             }
@@ -917,6 +1103,39 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
 
         Ok(expansion)
+    }
+
+    /// Replaces each `$'...'` in a word that is about to be expanded inside double quotes with
+    /// its value, escaped for double quotes.
+    fn expand_ansi_c_quotes_for_double_quotes<'w>(&self, word: &'w str) -> Cow<'w, str> {
+        if !word.contains("$'") {
+            return Cow::Borrowed(word);
+        }
+        let Ok(pieces) = brush_parser::word::parse(word, &self.parser_options) else {
+            return Cow::Borrowed(word);
+        };
+        let mut replaced = String::with_capacity(word.len());
+        for piece in pieces {
+            if let brush_parser::word::WordPiece::AnsiCQuotedText(text) = &piece.piece {
+                let Ok((bytes, _)) = escape::expand_backslash_escapes(
+                    text.as_str(),
+                    escape::EscapeExpansionMode::AnsiCQuotes,
+                ) else {
+                    return Cow::Borrowed(word);
+                };
+                for c in crate::rawbytes::decode_vec(bytes).chars() {
+                    if matches!(c, '\\' | '$' | '`' | '"') {
+                        replaced.push('\\');
+                    }
+                    replaced.push(c);
+                }
+            } else if let Some(text) = word.get(piece.start_index..piece.end_index) {
+                replaced.push_str(text);
+            } else {
+                return Cow::Borrowed(word);
+            }
+        }
+        Cow::Owned(replaced)
     }
 
     /// Performs brace expansion on the word, yielding the resulting words, or `None` if
@@ -981,26 +1200,57 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
     fn expand_pathnames_in_field(&self, field: WordField) -> Result<Vec<String>, error::Error> {
         let pattern = patterns::Pattern::from(field.clone())
-            .set_extended_globbing(self.parser_options.enable_extended_globbing)
+            .set_extended_globbing(self.shell.options().extended_globbing)
             .set_case_insensitive(self.shell.options().case_insensitive_pathname_expansion);
 
+        // A non-empty GLOBIGNORE drops the matches it names and, as bash does, turns dotglob on.
+        let ignored: Vec<patterns::Pattern> = self
+            .shell
+            .env_str("GLOBIGNORE")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .split(':')
+                    .filter(|pattern| !pattern.is_empty())
+                    .map(|pattern| {
+                        patterns::Pattern::from(pattern)
+                            .set_extended_globbing(self.shell.options().extended_globbing)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let options = patterns::FilenameExpansionOptions {
-            require_dot_in_pattern_to_match_dot_files: !self.shell.options().glob_matches_dotfiles,
+            require_dot_in_pattern_to_match_dot_files: !self.shell.options().glob_matches_dotfiles
+                && ignored.is_empty(),
+            globstar: self.shell.options().enable_star_star_glob,
+            sort: self
+                .shell
+                .env_str("GLOBSORT")
+                .map(|value| value.to_string()),
+            dot_entries: !self.shell.options().glob_skip_dots,
+        };
+        let keep = |path: &std::path::Path| {
+            let name = path.file_name().map(|name| name.to_string_lossy());
+            ignored.is_empty()
+                || (!matches!(name.as_deref(), Some("." | ".."))
+                    && !ignored.iter().any(|pattern| {
+                        pattern
+                            .exactly_matches(path.to_string_lossy().as_ref())
+                            .unwrap_or(false)
+                    }))
         };
 
         // On error (e.g. malformed pattern), default to NoGlob so the field
         // passes through as a literal rather than triggering failglob.
         let expansion = pattern
-            .expand(
-                self.shell.working_dir(),
-                Some(&patterns::Pattern::accept_all_expand_filter),
-                &options,
-            )
+            .expand(self.shell.working_dir(), Some(&keep), &options)
             .unwrap_or_default();
 
         if expansion.is_unmatched_glob()
             && self.shell.options().fail_expansion_on_globs_without_match
         {
+            // As in bash, this abandons the top-level command, from a function or a redirection
+            // as much as from the command itself (see `Error::abandons_command`).
             let field_str = String::from(field);
             return Err(error::ErrorKind::NoMatch(field_str).into());
         }
@@ -1035,9 +1285,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     s.as_str(),
                     escape::EscapeExpansionMode::AnsiCQuotes,
                 )?;
-                Expansion::from(ExpansionPiece::Unsplittable(
-                    String::from_utf8_lossy(expanded.as_slice()).into_owned(),
-                ))
+                Expansion::from(ExpansionPiece::Unsplittable(crate::rawbytes::decode_vec(
+                    expanded,
+                )))
             }
             brush_parser::word::WordPiece::DoubleQuotedSequence(pieces)
             | brush_parser::word::WordPiece::GettextDoubleQuotedSequence(pieces) => {
@@ -1070,37 +1320,31 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     kind: ExpansionKind::String,
                 }
             }
-            brush_parser::word::WordPiece::TildeExpansion(tilde_expr) => {
-                Expansion::from(ExpansionPiece::Unsplittable(
-                    self.expand_tilde_expression(&tilde_expr)?.to_string(),
-                ))
-            }
+            brush_parser::word::WordPiece::TildeExpansion(tilde_expr) => Expansion::from(
+                ExpansionPiece::Unsplittable(self.expand_tilde_expression(&tilde_expr).to_string()),
+            ),
             brush_parser::word::WordPiece::ParameterExpansion(p) => {
                 self.expand_parameter_expr(p).await?
             }
-            brush_parser::word::WordPiece::BackquotedCommandSubstitution(s)
-            | brush_parser::word::WordPiece::CommandSubstitution(s) => {
-                let mut cmd_output = if !self.disable_command_substitutions {
-                    commands::invoke_command_in_subshell_and_get_output(self.shell, self.params, s)
-                        .await?
-                } else {
+            brush_parser::word::WordPiece::BackquotedCommandSubstitution(s) => {
+                self.expand_command_substitution(s, true).await?
+            }
+            brush_parser::word::WordPiece::CommandSubstitution(s) => {
+                self.expand_command_substitution(s, false).await?
+            }
+            brush_parser::word::WordPiece::ProcessSubstitution(kind, command) => {
+                let path = if self.disable_command_substitutions {
                     String::new()
+                } else {
+                    crate::interp::setup_word_process_substitution(
+                        self.shell,
+                        self.params,
+                        &kind,
+                        &command,
+                    )
+                    .await?
                 };
-
-                // Strips null bytes from command substitution output for compatibility.
-                if cmd_output.contains('\0') {
-                    writeln!(
-                        self.params.stderr(self.shell),
-                        "warning: command substitution: ignored null byte in input",
-                    )?;
-                    cmd_output.retain(|c| c != '\0');
-                }
-
-                // We trim trailing newlines, per spec.
-                let trimmed_len = cmd_output.trim_end_matches('\n').len();
-                cmd_output.truncate(trimmed_len);
-
-                Expansion::from(ExpansionPiece::Splittable(cmd_output))
+                Expansion::from(ExpansionPiece::Unsplittable(path))
             }
             brush_parser::word::WordPiece::EscapeSequence(s) => {
                 let Some(escaped) = s.strip_prefix('\\') else {
@@ -1150,59 +1394,54 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Ok(expansion)
     }
 
-    fn expand_tilde_expression(
-        &self,
-        tilde_expr: &brush_parser::word::TildeExpr,
-    ) -> Result<Cow<'_, str>, error::Error> {
+    fn expand_tilde_expression(&self, tilde_expr: &brush_parser::word::TildeExpr) -> Cow<'_, str> {
         match tilde_expr {
             brush_parser::word::TildeExpr::Home => {
-                if let Some(home_dir) = self.shell.home_dir() {
-                    Ok(Cow::Owned(home_dir.to_string_lossy().to_string()))
-                } else {
-                    Err(error::ErrorKind::TildeWithoutValidHome.into())
-                }
+                // Like bash, a user with no home directory (no HOME and no passwd entry, as on
+                // WASI) gets `/` rather than an error.
+                self.shell
+                    .home_dir()
+                    .map_or(Cow::Borrowed("/"), |home_dir| {
+                        Cow::Owned(home_dir.to_string_lossy().to_string())
+                    })
             }
             brush_parser::word::TildeExpr::UserHome(username) => {
-                Ok(sys::users::get_user_home_dir(username).map_or_else(
+                sys::users::get_user_home_dir(username).map_or_else(
                     || Cow::Owned(std::format!("~{username}")),
                     |p| Cow::Owned(p.to_string_lossy().to_string()),
-                ))
+                )
             }
-            brush_parser::word::TildeExpr::WorkingDir => {
-                Ok(self.shell.working_dir().to_string_lossy())
-            }
-            brush_parser::word::TildeExpr::OldWorkingDir => {
-                if let Some(old_pwd) = self.shell.env_str("OLDPWD") {
-                    Ok(old_pwd)
-                } else {
-                    Ok(Cow::Borrowed("~-"))
-                }
-            }
+            brush_parser::word::TildeExpr::WorkingDir => self.shell.working_dir().to_string_lossy(),
+            // With OLDPWD unset (declared, as at startup, but given no value), `~-` stays as is.
+            brush_parser::word::TildeExpr::OldWorkingDir => match self.shell.env_str("OLDPWD") {
+                Some(old_pwd) if self.shell.env().is_set("OLDPWD") => old_pwd,
+                _ => Cow::Borrowed("~-"),
+            },
             brush_parser::word::TildeExpr::NthDirFromBottomOfDirStack { n } => {
                 let dir_stack_count = self.shell.directory_stack().len();
 
                 if let Some(dir) = self.shell.directory_stack().get(*n) {
-                    Ok(dir.to_string_lossy())
+                    dir.to_string_lossy()
                 } else if *n == dir_stack_count {
-                    Ok(self.shell.working_dir().to_string_lossy())
+                    self.shell.working_dir().to_string_lossy()
                 } else {
-                    Ok(Cow::Owned(std::format!("~-{n}")))
+                    Cow::Owned(std::format!("~-{n}"))
                 }
             }
             brush_parser::word::TildeExpr::NthDirFromTopOfDirStack { n, plus_used } => {
                 if *n == 0 {
-                    return Ok(self.shell.working_dir().to_string_lossy());
+                    return self.shell.working_dir().to_string_lossy();
                 }
 
                 let dir_stack_count = self.shell.directory_stack().len();
                 if dir_stack_count >= *n
                     && let Some(dir) = self.shell.directory_stack().get(dir_stack_count - *n)
                 {
-                    return Ok(dir.to_string_lossy());
+                    return dir.to_string_lossy();
                 }
 
                 let plus_or_nothing = if *plus_used { "+" } else { "" };
-                Ok(Cow::Owned(std::format!("~{plus_or_nothing}{n}")))
+                Cow::Owned(std::format!("~{plus_or_nothing}{n}"))
             }
         }
     }
@@ -1271,8 +1510,21 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         Ok(fields)
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn expand_parameter_expr(
+        &mut self,
+        expr: brush_parser::word::ParameterExpr,
+    ) -> Result<Expansion, error::Error> {
+        // Bash looks the variable up once more for these operators than for `$v`, and a circular
+        // name reference warns at each lookup.
+        if let Some((name, lookups)) = extra_parameter_lookups(&expr) {
+            self.shell
+                .warn_circular_nameref(self.params, name, lookups, false);
+        }
+        self.expand_parameter_expr_inner(expr).await
+    }
+
+    #[expect(clippy::too_many_lines)]
+    async fn expand_parameter_expr_inner(
         &mut self,
         expr: brush_parser::word::ParameterExpr,
     ) -> Result<Expansion, error::Error> {
@@ -1320,9 +1572,42 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         ParameterState::DefinedEmptyString,
                     ) => Ok(expanded_parameter),
                     _ => {
+                        // `${a[@]:=w}` assigns an associative array's element `@` (or `*`), as in
+                        // bash; any other variable has no such element.
+                        let element;
+                        let parameter = match &parameter {
+                            brush_parser::word::Parameter::NamedWithAllIndices {
+                                name,
+                                concatenate,
+                            } => {
+                                let assoc = self.shell.env().get(name).is_some_and(|(_, var)| {
+                                    matches!(
+                                        var.value(),
+                                        ShellValue::AssociativeArray(_)
+                                            | ShellValue::Unset(
+                                                ShellValueUnsetType::AssociativeArray
+                                            )
+                                    )
+                                });
+                                if !assoc {
+                                    return Err(error::Error::from(
+                                        error::ErrorKind::ArrayIndexOutOfRange(diagnostic_name(
+                                            &parameter,
+                                        )),
+                                    )
+                                    .into_fatal());
+                                }
+                                element = brush_parser::word::Parameter::NamedWithIndex {
+                                    name: name.clone(),
+                                    index: if *concatenate { "\\*" } else { "\\@" }.to_owned(),
+                                };
+                                &element
+                            }
+                            parameter => parameter,
+                        };
                         let expanded_default = self.expand_parameter_word(default_value).await?;
                         let expanded_default_value = self.fields_to_string(expanded_default);
-                        self.assign_to_parameter(&parameter, expanded_default_value.clone())
+                        self.assign_to_parameter(parameter, expanded_default_value.clone())
                             .await?;
                         Ok(Expansion::from(expanded_default_value))
                     }
@@ -1338,6 +1623,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     .expand_parameter_allowing_unset(&parameter, indirect)
                     .await?;
                 let error_message = error_message.as_ref().map_or("", |v| v.as_str());
+                let null_counts = matches!(
+                    test_type,
+                    brush_parser::word::ParameterTestType::UnsetOrNull
+                );
 
                 match (test_type, expanded_parameter.classify()) {
                     (_, ParameterState::NonZeroLength)
@@ -1346,9 +1635,31 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         ParameterState::DefinedEmptyString,
                     ) => Ok(expanded_parameter),
                     _ => {
-                        let result = self.basic_expand_to_str(error_message).await?;
+                        // As bash words it: `NAME: message`, with a default message when there
+                        // is no word. Bash expands the word as if unquoted, splits what its
+                        // expansions give, and joins the fields with spaces.
+                        let message = if error_message.is_empty() {
+                            if null_counts {
+                                "parameter null or not set".to_owned()
+                            } else {
+                                "parameter not set".to_owned()
+                            }
+                        } else {
+                            let previously_in_double_quotes =
+                                std::mem::replace(&mut self.in_double_quotes, false);
+                            let expansion = self.basic_expand(error_message).await;
+                            self.in_double_quotes = previously_in_double_quotes;
+                            fieldsplit::split_fields(&self.shell.ifs(), expansion?)
+                                .into_iter()
+                                .map(String::from)
+                                .join(" ")
+                        };
+                        // Bash names a positional or special parameter here by itself (`1`,
+                        // `@`), and an indirect one with its `!`.
+                        let name = parameter_error_name(&parameter, indirect);
                         let err: error::Error =
-                            error::ErrorKind::CheckedExpansionError(result).into();
+                            error::ErrorKind::CheckedExpansionError(format!("{name}: {message}"))
+                                .into();
 
                         // Expansion errors are fatal per POSIX spec
                         Err(err.into_fatal())
@@ -1372,6 +1683,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         brush_parser::word::ParameterTestType::Unset,
                         ParameterState::DefinedEmptyString,
                     ) => Ok(self.expand_parameter_word(alternative_value).await?),
+                    // Otherwise the parameter's own (null) expansion stands, as in bash: for
+                    // "${a[@]:+w}" with no elements that is no word at all.
+                    _ if expanded_parameter.fields.is_empty() => Ok(expanded_parameter),
                     _ => Ok(Expansion::from(String::new())),
                 }
             }
@@ -1390,13 +1704,16 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     }
                     _ => false,
                 };
+                // Bash looks the array up once for its length.
+                let element_lookups = std::mem::replace(&mut self.element_lookups, 1);
                 let expansion = if allow_unset {
                     self.expand_parameter_allowing_unset(&parameter, indirect)
-                        .await?
+                        .await
                 } else {
-                    self.expand_parameter(&parameter, indirect).await?
+                    self.expand_parameter(&parameter, indirect).await
                 };
-                Ok(Expansion::from(expansion.polymorphic_len().to_string()))
+                self.element_lookups = element_lookups;
+                Ok(Expansion::from(expansion?.polymorphic_len().to_string()))
             }
             brush_parser::word::ParameterExpr::RemoveSmallestSuffixPattern {
                 parameter,
@@ -1490,7 +1807,19 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 // A negative offset counts back from the end of the offset space: -1
                 // addresses the last character or position, or -- for an indexed array --
                 // the highest subscript.
-                let mut expanded_offset = offset.eval(self.shell, self.params, false).await?;
+                // Bash names the parameter in an error of the offset or the length.
+                let in_substring = |error: crate::arithmetic::EvalError| match error {
+                    // An error in a subscript is reported as itself.
+                    crate::arithmetic::EvalError::InSubscript(_) => error,
+                    error => crate::arithmetic::EvalError::InSubstring(
+                        parameter_error_name(&parameter, indirect),
+                        Box::new(error),
+                    ),
+                };
+                let mut expanded_offset = offset
+                    .eval(self.shell, self.params, false)
+                    .await
+                    .map_err(in_substring)?;
                 if expanded_offset < 0 {
                     expanded_offset += expanded_parameter.kind.offset_space(expanded_parameter_len);
                 }
@@ -1510,7 +1839,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_offset = expanded_parameter.kind.offset_to_position(expanded_offset);
 
                 let end_offset = if let Some(length) = length {
-                    let expanded_length = length.eval(self.shell, self.params, false).await?;
+                    let expanded_length = length
+                        .eval(self.shell, self.params, false)
+                        .await
+                        .map_err(in_substring)?;
 
                     if expanded_length < 0 {
                         // For a string, a negative length says where the slice *ends*,
@@ -1545,13 +1877,26 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 indirect,
                 op: ParameterTransformOp::ToAttributeFlags,
             } => {
-                if let (_, _, Some(var)) = self
+                let flags = if let (_, _, Some(var)) = self
                     .try_resolve_parameter_to_variable(&parameter, indirect)
                     .await?
                 {
-                    Ok(var.attribute_flags(self.shell).into())
+                    var.attribute_flags(self.shell)
                 } else {
-                    Ok(String::new().into())
+                    String::new()
+                };
+                if names_all_elements(&parameter) {
+                    // Bash gives the flags once for each element (or positional parameter).
+                    let expanded = self
+                        .expand_parameter_allowing_unset(&parameter, indirect)
+                        .await?;
+                    let count = expanded.fields.len();
+                    Ok(element_list(
+                        std::iter::repeat_n(flags, count),
+                        expanded.concatenate,
+                    ))
+                } else {
+                    Ok(flags.into())
                 }
             }
             brush_parser::word::ParameterExpr::Transform {
@@ -1559,20 +1904,43 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 indirect,
                 op: ParameterTransformOp::ToAssignmentLogic,
             } => {
+                if let brush_parser::word::Parameter::Special(
+                    brush_parser::word::SpecialParameter::AllPositionalParameters { concatenate },
+                ) = &parameter
+                {
+                    // The positional parameters as the `set` command that assigns them.
+                    let args = self.shell.current_shell_args();
+                    let words: Vec<String> = if args.is_empty() {
+                        vec![]
+                    } else {
+                        ["set".to_owned(), "--".to_owned()]
+                            .into_iter()
+                            .chain(args.iter().map(|arg| {
+                                escape::force_quote(arg, escape::QuoteMode::SingleQuote)
+                            }))
+                            .collect()
+                    };
+                    return Ok(element_list(words, *concatenate));
+                }
+
                 if let (Some(name), index, Some(var)) = self
                     .try_resolve_parameter_to_variable(&parameter, indirect)
                     .await?
                 {
+                    // A nameref is shown as the variable it names.
+                    let name = self.shell.env().resolve_nameref(&name).into_owned();
                     let assignable_value_str = var
                         .value()
                         .to_assignable_str(index.as_deref(), self.shell)?;
 
-                    let mut attr_str = var.attribute_flags(self.shell);
-                    if attr_str.is_empty() {
-                        attr_str.push('-');
-                    }
+                    let attr_str = var.attribute_flags(self.shell);
+                    let attr_or_dash = if attr_str.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        attr_str.clone()
+                    };
 
-                    match var.value() {
+                    let text = match var.value() {
                         ShellValue::IndexedArray(_)
                         | ShellValue::AssociativeArray(_)
                         // TODO(dynamic): confirm this
@@ -1582,21 +1950,89 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                             } else {
                                 "="
                             };
-
-                            Ok(std::format!(
-                            "declare -{attr_str} {name}{equals_or_nothing}{assignable_value_str}"
-                        )
-                            .into())
+                            std::format!(
+                                "declare -{attr_or_dash} {name}{equals_or_nothing}{assignable_value_str}"
+                            )
+                        }
+                        ShellValue::String(_) if attr_str.is_empty() => {
+                            std::format!("{name}={assignable_value_str}")
                         }
                         ShellValue::String(_) => {
-                            Ok(std::format!("{name}={assignable_value_str}").into())
+                            std::format!("declare -{attr_str} {name}={assignable_value_str}")
                         }
-                        ShellValue::Unset(_) => {
-                            Ok(std::format!("declare -{attr_str} {name}").into())
-                        }
+                        ShellValue::Unset(_) => std::format!("declare -{attr_or_dash} {name}"),
+                    };
+
+                    if let brush_parser::word::Parameter::NamedWithAllIndices {
+                        concatenate: false,
+                        ..
+                    } = &parameter
+                    {
+                        // "${a[@]@A}" is the declaration's words, as bash gives them.
+                        Ok(element_list(
+                            text.splitn(3, ' ').map(ToOwned::to_owned),
+                            false,
+                        ))
+                    } else {
+                        Ok(text.into())
                     }
+                } else if names_all_elements(&parameter) {
+                    Ok(element_list(std::iter::empty(), false))
                 } else {
                     Ok(String::new().into())
+                }
+            }
+            brush_parser::word::ParameterExpr::Transform {
+                parameter: brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate },
+                indirect: false,
+                op: ParameterTransformOp::PossiblyQuoteWithArraysExpanded { separate_words },
+            } if self.shell.env().get(&name).is_some_and(|(_, var)| {
+                matches!(
+                    var.value(),
+                    ShellValue::IndexedArray(_) | ShellValue::AssociativeArray(_)
+                )
+            }) =>
+            {
+                // An array's keys and values: @K as one string of pairs, each value
+                // double-quoted; @k as separate words, as bash gives them.
+                let (keys, values, associative) = self
+                    .shell
+                    .env()
+                    .get(&name)
+                    .map(|(_, var)| {
+                        (
+                            var.value().element_keys(self.shell),
+                            var.value().element_values(self.shell),
+                            matches!(var.value(), ShellValue::AssociativeArray(_)),
+                        )
+                    })
+                    .unwrap_or_default();
+                if keys.is_empty() {
+                    // No elements expand to no words.
+                    Ok(element_list(std::iter::empty(), concatenate))
+                } else if separate_words {
+                    Ok(element_list(
+                        keys.into_iter().zip(values).flat_map(<[String; 2]>::from),
+                        concatenate,
+                    ))
+                } else {
+                    let mut pairs = keys
+                        .iter()
+                        .zip(&values)
+                        .map(|(key, value)| {
+                            let key = if associative {
+                                escape::quote_if_needed(key, escape::QuoteMode::DoubleQuote)
+                            } else {
+                                Cow::Borrowed(key.as_str())
+                            };
+                            let value = escape::force_quote(value, escape::QuoteMode::DoubleQuote);
+                            std::format!("{key} {value}")
+                        })
+                        .join(" ");
+                    if associative && !pairs.is_empty() {
+                        pairs.push(' ');
+                    }
+                    Ok(pairs.into())
                 }
             }
             brush_parser::word::ParameterExpr::Transform {
@@ -1637,7 +2073,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| c.to_uppercase())
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| {
+                        std::iter::once(crate::casemap::to_upper(c))
+                    })
                 })
                 .await
             }
@@ -1650,9 +2088,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_string(s.as_str(), expanded_pattern.as_ref(), |str| {
-                        str.to_uppercase()
-                    })
+                    Self::pattern_to_string(
+                        s.as_str(),
+                        expanded_pattern.as_ref(),
+                        crate::casemap::upper,
+                    )
                 })
                 .await
             }
@@ -1665,7 +2105,9 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| c.to_lowercase())
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| {
+                        std::iter::once(crate::casemap::to_lower(c))
+                    })
                 })
                 .await
             }
@@ -1678,9 +2120,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
 
                 transform_expansion(expanded_parameter, async |s| {
-                    Self::pattern_to_string(s.as_str(), expanded_pattern.as_ref(), |str| {
-                        str.to_lowercase()
-                    })
+                    Self::pattern_to_string(
+                        s.as_str(),
+                        expanded_pattern.as_ref(),
+                        crate::casemap::lower,
+                    )
                 })
                 .await
             }
@@ -1695,12 +2139,26 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let expanded_pattern = self
                     .basic_expand_pattern(pattern.as_str())
                     .await?
-                    .set_extended_globbing(self.parser_options.enable_extended_globbing)
+                    .set_extended_globbing(self.shell.options().extended_globbing)
                     .set_case_insensitive(self.shell.options().case_insensitive_conditionals);
 
-                // If no replacement was provided, then we replace with an empty string.
+                // If no replacement was provided, then we replace with an empty string. With
+                // patsub_replacement (on by default, as in bash), an unquoted `&` in it stands
+                // for the text matched; a quoted or escaped one is itself.
                 let replacement = replacement.unwrap_or(String::new());
-                let expanded_replacement = self.basic_expand_to_str(&replacement).await?;
+                let template = if self.shell.options().patsub_replacement {
+                    let expansion = self.basic_expand(&replacement).await?;
+                    let joiner = if expansion.concatenate {
+                        self.shell.ifs_joiner()
+                    } else {
+                        String::from(' ')
+                    };
+                    replacement_template(expansion, &joiner)
+                } else {
+                    vec![ReplacementPiece::Text(
+                        self.basic_expand_to_str(&replacement).await?,
+                    )]
+                };
 
                 let regex = expanded_pattern.to_regex(
                     matches!(match_kind, brush_parser::word::SubstringMatchKind::Prefix),
@@ -1711,7 +2169,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     Ok(Self::replace_substring(
                         s.as_str(),
                         &regex,
-                        expanded_replacement.as_str(),
+                        &template,
                         &match_kind,
                     ))
                 })
@@ -1728,8 +2186,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                         .shell
                         .env()
                         .iter()
-                        .filter_map(|(name, _)| {
-                            if name.starts_with(prefix.as_str()) {
+                        // A variable declared but never given a value is not listed, as in bash.
+                        .filter_map(|(name, var)| {
+                            if name.starts_with(prefix.as_str())
+                                && !matches!(var.value(), ShellValue::Unset(_))
+                            {
                                 Some(name.to_owned())
                             } else {
                                 None
@@ -1768,7 +2229,181 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     undefined: false,
                 })
             }
+            brush_parser::word::ParameterExpr::ToggleCaseFirstChar {
+                parameter,
+                indirect,
+                pattern,
+            } => {
+                let expanded_parameter = self.expand_parameter(&parameter, indirect).await?;
+                let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
+
+                transform_expansion(expanded_parameter, async |s| {
+                    Self::pattern_to_first_char(s, expanded_pattern.as_ref(), |c| {
+                        std::iter::once(crate::casemap::toggle(c))
+                    })
+                })
+                .await
+            }
+            brush_parser::word::ParameterExpr::ToggleCasePattern {
+                parameter,
+                indirect,
+                pattern,
+            } => {
+                let expanded_parameter = self.expand_parameter(&parameter, indirect).await?;
+                let expanded_pattern = self.basic_expand_opt_pattern(pattern.as_deref()).await?;
+
+                transform_expansion(expanded_parameter, async |s| {
+                    Self::pattern_to_string(
+                        s.as_str(),
+                        expanded_pattern.as_ref(),
+                        crate::casemap::toggled,
+                    )
+                })
+                .await
+            }
+            brush_parser::word::ParameterExpr::FunctionSubstitution { command, reply } => {
+                if self.disable_command_substitutions {
+                    return Ok(Expansion::from(String::new()));
+                }
+                let value = if reply {
+                    commands::invoke_command_in_current_shell_for_reply(
+                        self.shell,
+                        self.params,
+                        command,
+                    )
+                    .await?
+                } else {
+                    let mut output = commands::invoke_command_in_current_shell_and_get_output(
+                        self.shell,
+                        self.params,
+                        command,
+                    )
+                    .await?;
+                    // As with `$(...)`: null bytes are dropped and trailing newlines trimmed.
+                    if output.contains('\0') {
+                        writeln!(
+                            self.params.stderr(self.shell),
+                            "{}warning: command substitution: ignored null byte in input",
+                            self.shell.diagnostic_prefix(),
+                        )?;
+                        output.retain(|c| c != '\0');
+                    }
+                    let trimmed_len = output.trim_end_matches('\n').len();
+                    output.truncate(trimmed_len);
+                    output
+                };
+                Ok(Expansion::from(ExpansionPiece::Splittable(value)))
+            }
+            brush_parser::word::ParameterExpr::BadSubstitution { text, .. }
+                if text.starts_with('`') =>
+            {
+                // Bash quotes the rest of the here-document from the backquote; it fails only the
+                // command whose here-document it is.
+                Err(error::ErrorKind::BadSubstitution(format!(
+                    "bad substitution: no closing \"`\" in {text}"
+                ))
+                .into())
+            }
+            // A here-document body's command substitution that is left open or does not parse,
+            // reported as bash's parser reports it, from the line after the command's.
+            brush_parser::word::ParameterExpr::BadSubstitution { text, .. }
+                if text.starts_with("$(") && !text.starts_with("$((") =>
+            {
+                let line = self
+                    .shell
+                    .call_stack()
+                    .current_frame()
+                    .and_then(|frame| frame.current_line())
+                    .unwrap_or(1);
+                let lines = brush_parser::command_substitution_diagnostic(
+                    text.get(2..).unwrap_or_default(),
+                    line + 1,
+                    &self.parser_options,
+                );
+                if lines.is_empty() {
+                    return Err(error::ErrorKind::BadSubstitution(format!(
+                        "{text}: bad substitution"
+                    ))
+                    .into());
+                }
+                Err(error::ErrorKind::SyntaxError {
+                    origin: "command substitution".to_owned(),
+                    lines,
+                }
+                .into())
+            }
+            brush_parser::word::ParameterExpr::BadSubstitution {
+                text,
+                transform: true,
+            } if self.transformed_parameter_is_empty(&text).await? => {
+                // Bash checks the operator only when there is a value to transform.
+                Ok(Expansion::undefined())
+            }
+            brush_parser::word::ParameterExpr::BadSubstitution { text, transform } => {
+                // As in bash, this ends a non-interactive shell; a transformation that does not
+                // exist ends `bash -c` with 127, as an unset variable does. The diagnostic
+                // quotes the text being expanded around it. A subscript left open hides the
+                // closing brace from bash, which says so, quoting the whole word.
+                let inner = text
+                    .strip_prefix("${")
+                    .and_then(|t| t.strip_suffix('}'))
+                    .unwrap_or_default();
+                let unclosed_subscript = inner
+                    .rfind('[')
+                    .is_some_and(|open| !inner.get(open..).unwrap_or_default().contains(']'));
+                let context = if self.current_text.is_empty() {
+                    text.as_str()
+                } else {
+                    self.current_text.as_str()
+                };
+                let kind = if transform {
+                    error::ErrorKind::CheckedExpansionError(format!("{context}: bad substitution"))
+                } else if text.starts_with("$[") {
+                    // A `$[` left open in a here-document; bash quotes the body.
+                    error::ErrorKind::BadSubstitution(format!(
+                        "bad substitution: no closing `]' in {}",
+                        self.outer_word.as_deref().unwrap_or(&text)
+                    ))
+                } else if text.starts_with("$((") {
+                    // A comment hid the closing `))` (`$((1 # c))`); bash quotes the word.
+                    error::ErrorKind::BadSubstitution(format!(
+                        "bad substitution: no closing `)' in {}",
+                        self.outer_word.as_deref().unwrap_or(&text)
+                    ))
+                } else if unclosed_subscript {
+                    error::ErrorKind::BadSubstitution(format!(
+                        "bad substitution: no closing `}}' in {}",
+                        self.outer_word.as_deref().unwrap_or(&text)
+                    ))
+                } else {
+                    error::ErrorKind::BadSubstitution(format!("{context}: bad substitution"))
+                };
+                Err(error::Error::from(kind).into_fatal())
+            }
         }
+    }
+
+    /// Whether the parameter of `text`, a `${parameter@op}` whose operator does not exist, is
+    /// unset or has no elements, which bash expands to nothing without checking the operator.
+    async fn transformed_parameter_is_empty(&mut self, text: &str) -> Result<bool, error::Error> {
+        let inner = text
+            .strip_prefix("${")
+            .and_then(|t| t.strip_suffix('}'))
+            .unwrap_or_default();
+        let (indirect, rest) = match inner.strip_prefix('!') {
+            Some(rest) if !rest.starts_with('@') || rest.starts_with("@@") => (true, rest),
+            _ => (false, inner),
+        };
+        // The parameter is the shortest text before an `@` that is one.
+        let parameter = rest.match_indices('@').find_map(|(at, _)| {
+            let candidate = rest.get(..at).filter(|c| !c.is_empty())?;
+            brush_parser::word::parse_parameter(candidate, &self.parser_options).ok()
+        });
+        let Some(parameter) = parameter else {
+            return Ok(false);
+        };
+        let expansion = self.expand_parameter(&parameter, indirect).await?;
+        Ok(expansion.undefined || expansion.fields.is_empty())
     }
 
     async fn assign_to_parameter<T: Into<String>>(
@@ -1800,7 +2435,10 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 concatenate: _,
             }
             | brush_parser::word::Parameter::Special(_) => {
-                return Err(error::ErrorKind::CannotAssignToSpecialParameter.into());
+                return Err(
+                    error::ErrorKind::CannotAssignToSpecialParameter(diagnostic_name(parameter))
+                        .into(),
+                );
             }
         };
 
@@ -1826,6 +2464,21 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
     }
 
+    /// Parses the value of an indirect expansion as the parameter to expand; one that names
+    /// none ends a non-interactive shell, as in bash.
+    fn parse_indirect_parameter(
+        &self,
+        value: String,
+    ) -> Result<brush_parser::word::Parameter, error::Error> {
+        // As in bash, this abandons the top-level command (see `Error::abandons_command`).
+        brush_parser::word::parse_parameter(value.as_str(), &self.parser_options).map_err(|error| {
+            match error {
+                brush_parser::WordParseError::NestedTooDeeply => error.into(),
+                _ => error::ErrorKind::InvalidVariableName(value).into(),
+            }
+        })
+    }
+
     async fn try_resolve_parameter_to_variable(
         &mut self,
         parameter: &brush_parser::word::Parameter,
@@ -1836,8 +2489,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         } else {
             let expansion = self.expand_parameter(parameter, false).await?;
             let parameter_str: String = self.fields_to_string(expansion);
-            let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+            let inner_parameter = self.parse_indirect_parameter(parameter_str)?;
             Ok(self.try_resolve_parameter_to_variable_without_indirect(&inner_parameter))
         }
     }
@@ -1875,7 +2527,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             Ok(Expansion::undefined())
         } else {
             let err: error::Error =
-                error::ErrorKind::ExpandingUnsetVariable(parameter.to_string()).into();
+                error::ErrorKind::ExpandingUnsetVariable(diagnostic_name(parameter)).into();
             Err(err.into_fatal())
         }
     }
@@ -1904,18 +2556,77 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         indirect: bool,
         allow_unset_vars: bool,
     ) -> Result<Expansion, error::Error> {
-        let expansion = self
-            .expand_parameter_without_indirect(parameter, allow_unset_vars)
-            .await?;
+        // `${!ref}` of a name reference is the name it refers to, as in bash; one that comes back
+        // to itself refers to none.
+        if indirect
+            && let brush_parser::word::Parameter::Named(name) = parameter
+            && let Some((_, var)) = self.shell.env().get_raw(name)
+            && var.is_treated_as_nameref()
+        {
+            if self.shell.env().circular_nameref(name).is_some() {
+                return Err(error::ErrorKind::InvalidIndirectExpansion(name.clone()).into());
+            }
+            let target = match var.value() {
+                ShellValue::String(target) => target.clone(),
+                _ => String::new(),
+            };
+            return Ok(Expansion::from(target));
+        }
         if !indirect {
+            return self
+                .expand_parameter_without_indirect(parameter, allow_unset_vars)
+                .await;
+        }
+        // The variable holding the name may be unset only when it is a positional parameter
+        // (`${!1}` is empty); otherwise bash reports it, `set -u` or not.
+        let expansion = self
+            .expand_parameter_without_indirect(parameter, true)
+            .await?;
+        if expansion.undefined
+            && matches!(
+                parameter,
+                brush_parser::word::Parameter::Named(_)
+                    | brush_parser::word::Parameter::NamedWithIndex { .. }
+            )
+        {
+            return Err(
+                error::ErrorKind::InvalidIndirectExpansion(diagnostic_name(parameter)).into(),
+            );
+        }
+        if expansion.fields.is_empty()
+            && matches!(
+                parameter,
+                brush_parser::word::Parameter::Special(
+                    brush_parser::word::SpecialParameter::AllPositionalParameters { .. }
+                )
+            )
+        {
+            // `${!@}` and `${!*}` with no positional parameters expand to nothing, as in bash.
             Ok(expansion)
         } else {
+            let unset_is_error =
+                !allow_unset_vars && self.shell.options().treat_unset_variables_as_error;
+            let unset = || {
+                if unset_is_error {
+                    // Bash names the parameter as written: `!r: unbound variable`.
+                    Err(error::Error::from(error::ErrorKind::ExpandingUnsetVariable(
+                        parameter_error_name(parameter, true),
+                    ))
+                    .into_fatal())
+                } else {
+                    Ok(Expansion::undefined())
+                }
+            };
+            if expansion.undefined {
+                return unset();
+            }
             let parameter_str: String = self.fields_to_string(expansion);
-            let inner_parameter =
-                brush_parser::word::parse_parameter(parameter_str.as_str(), &self.parser_options)?;
+            let inner_parameter = self.parse_indirect_parameter(parameter_str)?;
 
-            self.expand_parameter_without_indirect(&inner_parameter, allow_unset_vars)
-                .await
+            let inner = self
+                .expand_parameter_without_indirect(&inner_parameter, true)
+                .await?;
+            if inner.undefined { unset() } else { Ok(inner) }
         }
     }
 
@@ -1924,6 +2635,20 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         parameter: &brush_parser::word::Parameter,
         allow_unset_vars: bool,
     ) -> Result<Expansion, error::Error> {
+        // A nameref to an array element (`declare -n ref='arr[1]'`) expands as that element.
+        let element;
+        let parameter = match parameter {
+            brush_parser::word::Parameter::Named(n) => {
+                match self.shell.env().resolve_nameref_element(n) {
+                    Some((name, index)) => {
+                        element = brush_parser::word::Parameter::NamedWithIndex { name, index };
+                        &element
+                    }
+                    None => parameter,
+                }
+            }
+            _ => parameter,
+        };
         match parameter {
             brush_parser::word::Parameter::Positional(p) => {
                 if *p == 0 {
@@ -1937,10 +2662,50 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     self.undefined_expansion(parameter, allow_unset_vars)
                 }
             }
+            // `$!` is unset until a job has been started in the background.
+            brush_parser::word::Parameter::Special(
+                brush_parser::word::SpecialParameter::LastBackgroundProcessId,
+            ) if self.last_background_pid().is_none() => {
+                self.undefined_expansion(parameter, allow_unset_vars)
+            }
             brush_parser::word::Parameter::Special(s) => Ok(self.expand_special_parameter(s)),
             brush_parser::word::Parameter::Named(n) => {
                 if !env::valid_variable_name(n.as_str()) {
-                    Err(error::ErrorKind::BadSubstitution(n.clone()).into())
+                    Err(
+                        error::ErrorKind::BadSubstitution(format!("${{{n}}}: bad substitution"))
+                            .into(),
+                    )
+                } else if let Some((closing, global)) = self.shell.env().circular_nameref(n) {
+                    // Bash warns, and expands the global variable the reference closes on when a
+                    // function's local closes it (`local -n v=v` reads the global `v`), else
+                    // nothing.
+                    let _ = writeln!(
+                        self.params.stderr(self.shell),
+                        "{}warning: {n}: circular name reference",
+                        self.shell.diagnostic_prefix()
+                    );
+                    let value = if global {
+                        self.shell
+                            .env()
+                            .get_using_policy_raw(&closing, env::EnvironmentLookup::OnlyInGlobal)
+                            .filter(|var| !matches!(var.value(), ShellValue::Unset(_)))
+                            .and_then(|var| var.value().try_get_cow_str(self.shell))
+                            .map(|value| value.to_string())
+                    } else {
+                        None
+                    };
+                    match value {
+                        Some(value) => Ok(Expansion::from(value)),
+                        None => self.undefined_expansion(parameter, allow_unset_vars),
+                    }
+                } else if self.shell.env().is_circular_nameref(n) {
+                    // Bash warns and expands nothing.
+                    let _ = writeln!(
+                        self.params.stderr(self.shell),
+                        "{}warning: {n}: circular name reference",
+                        self.shell.diagnostic_prefix()
+                    );
+                    self.undefined_expansion(parameter, allow_unset_vars)
                 } else if let Some((_, var)) = self.shell.env().get(n) {
                     if matches!(var.value(), ShellValue::Unset(_)) {
                         self.undefined_expansion(parameter, allow_unset_vars)
@@ -1957,6 +2722,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
             brush_parser::word::Parameter::NamedWithIndex { name, index } => {
+                self.warn_circular_element(name);
                 // First check to see if it's an associative array.
                 let is_set_assoc_array = if let Some((_, var)) = self.shell.env().get(name) {
                     matches!(
@@ -1973,16 +2739,29 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     .expand_array_index(index.as_str(), is_set_assoc_array)
                     .await?;
 
-                // Index into the array.
-                if let Some((_, var)) = self.shell.env().get(name)
-                    && let Ok(Some(value)) = var.value().get_at(index_to_use.as_str(), self.shell)
-                {
-                    Ok(Expansion::from(value.to_string()))
-                } else {
-                    self.undefined_expansion(parameter, allow_unset_vars)
+                // Index into the array. A negative index before the first element is reported, as
+                // bash does, and expands to nothing.
+                let element = self.shell.env().get(name).map(|(_, var)| {
+                    var.value()
+                        .get_at(index_to_use.as_str(), self.shell)
+                        .map(|value| value.map(|value| value.to_string()))
+                });
+                match element {
+                    Some(Ok(Some(value))) => Ok(Expansion::from(value)),
+                    Some(Err(error))
+                        if matches!(error.kind(), error::ErrorKind::ArrayIndexOutOfRange(_)) =>
+                    {
+                        let error: error::Error =
+                            error::ErrorKind::ArrayIndexOutOfRange(name.clone()).into();
+                        let mut stderr = self.params.stderr(self.shell);
+                        let _ = self.shell.display_error(&mut stderr, &error);
+                        Ok(Expansion::from(String::new()))
+                    }
+                    _ => self.undefined_expansion(parameter, allow_unset_vars),
                 }
             }
             brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate } => {
+                self.warn_circular_element(name);
                 if let Some((_, var)) = self.shell.env().get(name) {
                     // Resolve a dynamic value once, so the kind and the element values
                     // can't disagree: a getter like RANDOM's changes on every read.
@@ -2028,6 +2807,28 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
     }
 
+    /// Expands a command substitution, `$( )` or (when `backquoted`) `` ` ` ``, to its output.
+    async fn expand_command_substitution(
+        &mut self,
+        s: String,
+        backquoted: bool,
+    ) -> Result<Expansion, error::Error> {
+        let cmd_output = if self.disable_command_substitutions {
+            String::new()
+        } else {
+            command_substitution_output(self.shell, self.params, s, backquoted).await?
+        };
+        Ok(Expansion::from(ExpansionPiece::Splittable(cmd_output)))
+    }
+
+    /// Warns twice of an element of a circular name reference (`local -n v=v; ${v[0]}`), as
+    /// bash's two lookups of it do; the element is the global array's (see
+    /// [`env::ShellEnvironment::circular_nameref`]).
+    fn warn_circular_element(&self, name: &str) {
+        self.shell
+            .warn_circular_nameref(self.params, name, self.element_lookups, false);
+    }
+
     async fn expand_array_index(
         &mut self,
         index: &str,
@@ -2037,11 +2838,17 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             self.basic_expand_to_str(index).await?
         } else {
             arithmetic::expand_and_eval(self.shell, self.params, index, false)
-                .await?
+                .await
+                .map_err(arithmetic::EvalError::in_subscript)?
                 .to_string()
         };
 
         Ok(index_to_use)
+    }
+
+    /// The process number `$!` names: the last job started in the background, if any.
+    const fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.shell.last_background_pid()
     }
 
     fn expand_special_parameter(
@@ -2069,18 +2876,15 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::SpecialParameter::ProcessId => {
                 // WASM has no host process id; `$$` is the session's synthetic shell number.
                 #[cfg(target_arch = "wasm32")]
-                return Expansion::from(self.shell.processes().shell_pid().to_string());
+                return Expansion::from(self.shell.shell_pid().to_string());
                 #[cfg(not(target_arch = "wasm32"))]
                 Expansion::from(std::process::id().to_string())
             }
-            brush_parser::word::SpecialParameter::LastBackgroundProcessId => {
-                if let Some(job) = self.shell.jobs().current_job()
-                    && let Some(pid) = job.representative_pid()
-                {
-                    return Expansion::from(pid.to_string());
-                }
-                Expansion::from(String::new())
-            }
+            brush_parser::word::SpecialParameter::LastBackgroundProcessId => Expansion::from(
+                self.shell
+                    .last_background_pid()
+                    .map_or_else(String::new, |pid| pid.to_string()),
+            ),
             brush_parser::word::SpecialParameter::ShellName => Expansion::from(
                 self.shell
                     .current_shell_name()
@@ -2093,7 +2897,17 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         &mut self,
         expr: brush_parser::ast::UnexpandedArithmeticExpr,
     ) -> Result<String, error::Error> {
-        let value = expr.eval(self.shell, self.params, false).await?;
+        // An unset variable under `set -u` ends the shell here as it does anywhere else.
+        let value = expr
+            .eval(self.shell, self.params, false)
+            .await
+            .map_err(|error| match error.unset_variable() {
+                Some(name) => {
+                    error::Error::from(error::ErrorKind::ExpandingUnsetVariable(name.to_owned()))
+                        .into_fatal()
+                }
+                None => error.into(),
+            })?;
         Ok(value.to_string())
     }
 
@@ -2152,9 +2966,21 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
     fn replace_substring(
         s: &str,
         regex: &fancy_regex::Regex,
-        replacement: &str,
+        template: &[ReplacementPiece],
         match_kind: &SubstringMatchKind,
     ) -> String {
+        // The replacement is built from the template for each match; its text is never read
+        // as the regex crate's `$name` syntax.
+        let replacement = |captures: &fancy_regex::Captures<'_, str>| -> String {
+            let matched = captures.get(0).map_or("", |m| m.as_str());
+            template
+                .iter()
+                .map(|piece| match piece {
+                    ReplacementPiece::Text(text) => text.as_str(),
+                    ReplacementPiece::Match => matched,
+                })
+                .collect()
+        };
         match match_kind {
             brush_parser::word::SubstringMatchKind::Prefix
             | brush_parser::word::SubstringMatchKind::Suffix
@@ -2175,16 +3001,18 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         came_from_undefined: bool,
     ) -> Result<String, error::Error> {
         match op {
+            // The prompt's command substitutions leave `$?` alone, as in bash.
             brush_parser::word::ParameterTransformOp::PromptExpand => {
-                prompt::expand_prompt(self.shell, self.params, s).await
+                let saved_status = self.shell.save_command_status();
+                let result = prompt::expand_prompt(self.shell, self.params, s).await;
+                self.shell.restore_command_status(saved_status);
+                result
             }
-            brush_parser::word::ParameterTransformOp::CapitalizeInitial => {
-                Ok(to_initial_capitals(s))
-            }
+            brush_parser::word::ParameterTransformOp::CapitalizeInitial => Ok(capitalize_first(s)),
             brush_parser::word::ParameterTransformOp::ExpandEscapeSequences => {
                 let (result, _) =
                     escape::expand_backslash_escapes(s, escape::EscapeExpansionMode::AnsiCQuotes)?;
-                Ok(String::from_utf8_lossy(result.as_slice()).into_owned())
+                Ok(crate::rawbytes::decode_vec(result))
             }
             brush_parser::word::ParameterTransformOp::PossiblyQuoteWithArraysExpanded {
                 separate_words: _separate_words,
@@ -2204,8 +3032,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     Ok(escape::force_quote(s, escape::QuoteMode::SingleQuote))
                 }
             }
-            brush_parser::word::ParameterTransformOp::ToLowerCase => Ok(s.to_lowercase()),
-            brush_parser::word::ParameterTransformOp::ToUpperCase => Ok(s.to_uppercase()),
+            brush_parser::word::ParameterTransformOp::ToLowerCase => Ok(crate::casemap::lower(s)),
+            brush_parser::word::ParameterTransformOp::ToUpperCase => Ok(crate::casemap::upper(s)),
             brush_parser::word::ParameterTransformOp::ToAssignmentLogic
             | brush_parser::word::ParameterTransformOp::ToAttributeFlags => {
                 unreachable!("covered in caller")
@@ -2228,6 +3056,67 @@ fn list_element_fields(values: Vec<String>, preserve_empty_elements: bool) -> Ve
             WordField(vec![piece])
         })
         .collect()
+}
+
+/// A piece of the replacement in `${x/pattern/replacement}`.
+enum ReplacementPiece {
+    /// Text put in as it is.
+    Text(String),
+    /// The text the pattern matched (an unquoted `&`).
+    Match,
+}
+
+/// The replacement as text and matches: an `&` in unquoted text (the word's own or an
+/// unquoted expansion's) is the match; quoted text, including a backslash-escaped `&`, is
+/// taken literally.
+fn replacement_template(expansion: Expansion, joiner: &str) -> Vec<ReplacementPiece> {
+    let mut template = vec![];
+    for (i, field) in expansion.fields.into_iter().enumerate() {
+        if i > 0 {
+            template.push(ReplacementPiece::Text(joiner.to_owned()));
+        }
+        for piece in field.0 {
+            match piece {
+                ExpansionPiece::Unsplittable(text) => template.push(ReplacementPiece::Text(text)),
+                ExpansionPiece::UnquotedLiteral(text) | ExpansionPiece::Splittable(text) => {
+                    for (j, part) in text.split('&').enumerate() {
+                        if j > 0 {
+                            template.push(ReplacementPiece::Match);
+                        }
+                        if !part.is_empty() {
+                            template.push(ReplacementPiece::Text(part.to_owned()));
+                        }
+                    }
+                }
+                ExpansionPiece::EmptyListElement { .. } => (),
+            }
+        }
+    }
+    template
+}
+
+/// Whether the parameter names all of an array's elements or all positional parameters.
+const fn names_all_elements(parameter: &brush_parser::word::Parameter) -> bool {
+    matches!(
+        parameter,
+        brush_parser::word::Parameter::NamedWithAllIndices { .. }
+            | brush_parser::word::Parameter::Special(
+                brush_parser::word::SpecialParameter::AllPositionalParameters { .. }
+            )
+    )
+}
+
+/// An expansion of the given values as separate elements, as a list-valued parameter expands.
+fn element_list(values: impl IntoIterator<Item = String>, concatenate: bool) -> Expansion {
+    Expansion {
+        fields: values
+            .into_iter()
+            .map(|value| WordField(vec![ExpansionPiece::Splittable(value)]))
+            .collect(),
+        concatenate,
+        kind: ExpansionKind::ElementList,
+        undefined: false,
+    }
 }
 
 fn coalesce_expansions(expansions: Vec<Expansion>) -> Expansion {
@@ -2254,23 +3143,14 @@ fn coalesce_expansions(expansions: Vec<Expansion>) -> Expansion {
         })
 }
 
-fn to_initial_capitals(s: &str) -> String {
-    let mut result = String::new();
-    let mut capitalize_next = true;
-
-    for c in s.chars() {
-        if c.is_whitespace() {
-            capitalize_next = true;
-            result.push(c);
-        } else if capitalize_next {
-            result.push_str(c.to_uppercase().to_string().as_str());
-            capitalize_next = false;
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
+/// The string with its first character in upper case, as `${x@u}` gives.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        std::iter::once(crate::casemap::to_upper(first))
+            .chain(chars)
+            .collect()
+    })
 }
 
 async fn transform_expansion<F, FReturn>(
@@ -2321,6 +3201,125 @@ fn may_contain_braces_to_expand(s: &str) -> bool {
     }
 
     saw_opening_brace && saw_closing_brace
+}
+
+/// A parameter as bash names it in a diagnostic: `x`, `a[1]`, `$1`, `$@`.
+/// How bash names `parameter` in an error of its expansion, `${x?}` or `set -u`'s: a positional or
+/// special parameter by itself (`1`, `@`), and an indirect one with its `!`.
+fn parameter_error_name(parameter: &brush_parser::word::Parameter, indirect: bool) -> String {
+    use brush_parser::word::Parameter;
+    let name = match parameter {
+        Parameter::Positional(n) => n.to_string(),
+        Parameter::Special(special) => special.to_string(),
+        parameter => diagnostic_name(parameter),
+    };
+    if indirect { format!("!{name}") } else { name }
+}
+
+fn diagnostic_name(parameter: &brush_parser::word::Parameter) -> String {
+    use brush_parser::word::Parameter;
+    match parameter {
+        Parameter::Positional(n) => format!("${n}"),
+        Parameter::Special(special) => format!("${special}"),
+        Parameter::Named(name) => name.clone(),
+        Parameter::NamedWithIndex { name, index } => format!("{name}[{index}]"),
+        Parameter::NamedWithAllIndices { name, concatenate } => {
+            format!("{name}[{}]", if *concatenate { '*' } else { '@' })
+        }
+    }
+}
+
+/// The variable an operator of `expr` looks up more times than `$v` does, and how many more, as
+/// bash's lookups go: a pattern, case, substring, replacement or `@` operator looks a variable up
+/// three times and an element twice (`$v` once, `${a[i]}` twice), and `${!a[@]}` once.
+const fn extra_parameter_lookups(
+    expr: &brush_parser::word::ParameterExpr,
+) -> Option<(&str, usize)> {
+    use brush_parser::word::{Parameter, ParameterExpr as E};
+    // `@A` and `@a` look it up once more.
+    let (parameter, more) = match expr {
+        E::Transform {
+            parameter,
+            indirect: false,
+            op:
+                brush_parser::word::ParameterTransformOp::ToAssignmentLogic
+                | brush_parser::word::ParameterTransformOp::ToAttributeFlags,
+        } => (parameter, 1),
+        E::RemoveSmallestSuffixPattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::RemoveLargestSuffixPattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::RemoveSmallestPrefixPattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::RemoveLargestPrefixPattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::Substring {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::Transform {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::UppercaseFirstChar {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::UppercasePattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::LowercaseFirstChar {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::LowercasePattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::ToggleCaseFirstChar {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::ToggleCasePattern {
+            parameter,
+            indirect: false,
+            ..
+        }
+        | E::ReplaceSubstring {
+            parameter,
+            indirect: false,
+            ..
+        } => (parameter, 0),
+        E::MemberKeys { variable_name, .. } => return Some((variable_name.as_str(), 1)),
+        _ => return None,
+    };
+    match parameter {
+        Parameter::Named(name) => Some((name.as_str(), 2 + more)),
+        Parameter::NamedWithIndex { name, .. } | Parameter::NamedWithAllIndices { name, .. } => {
+            Some((name.as_str(), 1 + more))
+        }
+        _ => None,
+    }
 }
 
 #[expect(clippy::panic_in_result_fn)]
@@ -2417,9 +3416,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_initial_capitals() {
-        assert_eq!(to_initial_capitals("ab bc cd"), String::from("Ab Bc Cd"));
-        assert_eq!(to_initial_capitals(" a "), String::from(" A "));
-        assert_eq!(to_initial_capitals(""), String::new());
+    fn test_capitalize_first() {
+        assert_eq!(capitalize_first("ab bc cd"), String::from("Ab bc cd"));
+        assert_eq!(capitalize_first(" a "), String::from(" a "));
+        assert_eq!(capitalize_first("é"), String::from("É"));
+        assert_eq!(capitalize_first(""), String::new());
     }
 }

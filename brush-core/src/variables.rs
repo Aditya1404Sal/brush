@@ -12,8 +12,9 @@ use crate::{error, escape, extensions};
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShellVariable {
-    /// The value currently associated with the variable.
-    value: ShellValue,
+    /// The value currently associated with the variable. Clones of the variable (a subshell's,
+    /// a pipeline stage's) share it until one of them changes it.
+    value: std::sync::Arc<ShellValue>,
     /// Whether or not the variable is marked as exported to child processes.
     exported: bool,
     /// Whether or not the variable is marked as read-only.
@@ -28,6 +29,153 @@ pub struct ShellVariable {
     treat_as_integer: bool,
     /// Whether or not the variable should be treated as a name reference.
     treat_as_nameref: bool,
+    /// What a dynamic variable keeps between reads and assignments.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dynamic_state: DynamicState,
+}
+
+/// What a dynamic variable keeps between reads and assignments: `RANDOM`'s generator, and the
+/// count `SECONDS` was last assigned.
+#[derive(Debug, Default)]
+pub(crate) enum DynamicState {
+    /// Nothing is kept.
+    #[default]
+    None,
+    /// `RANDOM`'s generator.
+    Random(RandomGenerator),
+    /// The value `SECONDS` was last assigned, and when, in whole seconds since the epoch.
+    Seconds(Option<(i64, i64)>),
+}
+
+impl Clone for DynamicState {
+    fn clone(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Random(generator) => Self::Random(generator.clone()),
+            Self::Seconds(assigned) => Self::Seconds(*assigned),
+        }
+    }
+}
+
+impl DynamicState {
+    /// Applies an assignment of `value` (already evaluated, as the variables are integers).
+    fn assign(&mut self, value: &str) {
+        let value = value.trim().parse::<i64>().unwrap_or(0);
+        match self {
+            Self::None => (),
+            Self::Random(generator) => generator.seed(value),
+            Self::Seconds(assigned) => *assigned = Some((value, epoch_seconds())),
+        }
+    }
+
+    /// Marks `RANDOM`'s generator, if this is it, as belonging to a new subshell or process: bash
+    /// reseeds it there before its first value, so each subshell's sequence is its own.
+    pub(crate) fn enter_subshell(&self) {
+        if let Self::Random(generator) = self {
+            generator
+                .reseed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The next value of `RANDOM`, if this is its generator.
+    pub(crate) fn next_random(&self) -> Option<u32> {
+        match self {
+            Self::Random(generator) => Some(generator.next()),
+            _ => None,
+        }
+    }
+
+    /// The value of `SECONDS`, if it was assigned one.
+    pub(crate) fn assigned_seconds(&self) -> Option<i64> {
+        match self {
+            Self::Seconds(Some((value, since))) => {
+                Some(value.wrapping_add(epoch_seconds().saturating_sub(*since)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The current time in whole seconds since the epoch.
+pub(crate) fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Bash's generator for `RANDOM`: the Park-Miller minimal standard generator, folded to 15 bits,
+/// never giving the same value twice in a row. Assigning `RANDOM` seeds it, so a seeded sequence
+/// repeats exactly as bash's does; a subshell reseeds it before its first value, as bash does.
+#[derive(Debug)]
+pub(crate) struct RandomGenerator {
+    state: std::sync::atomic::AtomicU32,
+    last: std::sync::atomic::AtomicU32,
+    /// Whether to reseed before the next value (a subshell that has not seeded it).
+    reseed: std::sync::atomic::AtomicBool,
+}
+
+impl RandomGenerator {
+    /// A generator with the given seed.
+    pub(crate) const fn new(seed: u32) -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU32::new(seed),
+            last: std::sync::atomic::AtomicU32::new(0),
+            reseed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn seed(&self, seed: i64) {
+        // Bash keeps the low 32 bits of the seed.
+        self.state
+            .store(seed as u32, std::sync::atomic::Ordering::Relaxed);
+        self.last.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reseed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn next(&self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.reseed.swap(false, Relaxed) {
+            self.state.store(rand::random(), Relaxed);
+            self.last.store(0, Relaxed);
+        }
+        let last = self.last.load(Relaxed);
+        let mut state = self.state.load(Relaxed);
+        let value = loop {
+            // x' = 16807 x mod (2^31 - 1), split so that nothing overflows; 0 cannot seed it.
+            let x = i64::from(if state == 0 { 123_459_876 } else { state });
+            let (high, low) = (x / 127_773, x % 127_773);
+            let t = 16807 * low - 2836 * high;
+            state = (if t < 0 { t + 0x7fff_ffff } else { t }) as u32;
+            let value = ((state >> 16) ^ (state & 0xffff)) & 0x7fff;
+            if value != last {
+                break value;
+            }
+        };
+        self.state.store(state, Relaxed);
+        self.last.store(value, Relaxed);
+        value
+    }
+}
+
+impl Clone for RandomGenerator {
+    fn clone(&self) -> Self {
+        let generator = Self::new(self.state.load(std::sync::atomic::Ordering::Relaxed));
+        generator.last.store(
+            self.last.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        generator.reseed.store(
+            self.reseed.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        generator
+    }
 }
 
 /// Kind of transformation to apply to a variable's value when it is updated.
@@ -47,7 +195,7 @@ pub enum ShellVariableUpdateTransform {
 impl Default for ShellVariable {
     fn default() -> Self {
         Self {
-            value: ShellValue::String(String::new()),
+            value: std::sync::Arc::new(ShellValue::String(String::new())),
             exported: false,
             readonly: false,
             enumerable: true,
@@ -55,6 +203,7 @@ impl Default for ShellVariable {
             trace: false,
             treat_as_integer: false,
             treat_as_nameref: false,
+            dynamic_state: DynamicState::None,
         }
     }
 }
@@ -67,14 +216,25 @@ impl ShellVariable {
     /// * `value` - The value to associate with the variable.
     pub fn new<I: Into<ShellValue>>(value: I) -> Self {
         Self {
-            value: value.into(),
+            value: std::sync::Arc::new(value.into()),
             ..Self::default()
         }
     }
 
     /// Returns the value associated with the variable.
-    pub const fn value(&self) -> &ShellValue {
+    pub fn value(&self) -> &ShellValue {
         &self.value
+    }
+
+    /// What the dynamic variable keeps between reads and assignments.
+    pub(crate) const fn dynamic_state(&self) -> &DynamicState {
+        &self.dynamic_state
+    }
+
+    /// Gives the dynamic variable state to keep between reads and assignments.
+    pub(crate) const fn set_dynamic_state(&mut self, state: DynamicState) -> &mut Self {
+        self.dynamic_state = state;
+        self
     }
 
     /// Returns whether or not the variable is exported to child processes.
@@ -191,7 +351,8 @@ impl ShellVariable {
     pub fn convert_to_indexed_array(&mut self) -> Result<(), error::Error> {
         match self.value() {
             ShellValue::IndexedArray(_) => Ok(()),
-            ShellValue::AssociativeArray(_) => {
+            ShellValue::AssociativeArray(_)
+            | ShellValue::Unset(ShellValueUnsetType::AssociativeArray) => {
                 Err(error::ErrorKind::ConvertingAssociativeArrayToIndexedArray.into())
             }
             _ => {
@@ -200,7 +361,7 @@ impl ShellVariable {
                     0,
                     self.value.to_cow_str_without_dynamic_support().to_string(),
                 );
-                self.value = ShellValue::IndexedArray(new_values);
+                self.value = std::sync::Arc::new(ShellValue::IndexedArray(new_values));
                 Ok(())
             }
         }
@@ -210,16 +371,16 @@ impl ShellVariable {
     pub fn convert_to_associative_array(&mut self) -> Result<(), error::Error> {
         match self.value() {
             ShellValue::AssociativeArray(_) => Ok(()),
-            ShellValue::IndexedArray(_) => {
+            ShellValue::IndexedArray(_) | ShellValue::Unset(ShellValueUnsetType::IndexedArray) => {
                 Err(error::ErrorKind::ConvertingIndexedArrayToAssociativeArray.into())
             }
             _ => {
-                let mut new_values: BTreeMap<String, String> = BTreeMap::new();
+                let mut new_values = AssociativeValues::default();
                 new_values.insert(
                     String::from("0"),
                     self.value.to_cow_str_without_dynamic_support().to_string(),
                 );
-                self.value = ShellValue::AssociativeArray(new_values);
+                self.value = std::sync::Arc::new(ShellValue::AssociativeArray(new_values));
                 Ok(())
             }
         }
@@ -240,7 +401,7 @@ impl ShellVariable {
         let value = self.convert_value_literal_for_assignment(value);
 
         if append {
-            match (&self.value, &value) {
+            match (&*self.value, &value) {
                 // If we're appending an array to a declared-but-unset variable (or appending
                 // anything to a declared-but-unset array), then fill it out first.
                 (ShellValue::Unset(_), ShellValueLiteral::Array(_))
@@ -269,7 +430,7 @@ impl ShellVariable {
             let treat_as_int = self.is_treated_as_integer();
             let update_transform = self.get_update_transform();
 
-            match &mut self.value {
+            match std::sync::Arc::make_mut(&mut self.value) {
                 ShellValue::String(base) => match value {
                     ShellValueLiteral::Scalar(suffix) => {
                         if treat_as_int {
@@ -313,7 +474,7 @@ impl ShellVariable {
                 ShellValue::Dynamic { .. } => Ok(()),
             }
         } else {
-            match (&self.value, value) {
+            match (&*self.value, value) {
                 // If we're updating an array value with a string, then treat it as an update to
                 // just the "0"-indexed element of the array.
                 (
@@ -337,7 +498,9 @@ impl ShellVariable {
                     | ShellValue::Dynamic { .. },
                     ShellValueLiteral::Array(literal_values),
                 ) => {
-                    self.value = ShellValue::indexed_array_from_literals(literal_values);
+                    self.value = std::sync::Arc::new(ShellValue::indexed_array_from_literals(
+                        literal_values,
+                    ));
                     Ok(())
                 }
 
@@ -348,17 +511,22 @@ impl ShellVariable {
                     | ShellValue::Unset(ShellValueUnsetType::AssociativeArray),
                     ShellValueLiteral::Array(literal_values),
                 ) => {
-                    self.value = ShellValue::associative_array_from_literals(literal_values)?;
+                    self.value = std::sync::Arc::new(ShellValue::associative_array_from_literals(
+                        literal_values,
+                    )?);
                     Ok(())
                 }
 
-                // Handle updates to dynamic values; for now we just drop them.
-                // TODO(dynamic): Allow updates to dynamic values
-                (ShellValue::Dynamic { .. }, _) => Ok(()),
+                // An assignment seeds `RANDOM` and restarts `SECONDS`; other dynamic values
+                // ignore it.
+                (ShellValue::Dynamic { .. }, ShellValueLiteral::Scalar(s)) => {
+                    self.dynamic_state.assign(&s);
+                    Ok(())
+                }
 
                 // Assign a scalar value to a scalar or unset (and untyped) variable.
                 (ShellValue::String(_) | ShellValue::Unset(_), ShellValueLiteral::Scalar(s)) => {
-                    self.value = ShellValue::String(s);
+                    self.value = std::sync::Arc::new(ShellValue::String(s));
                     Ok(())
                 }
             }
@@ -380,7 +548,11 @@ impl ShellVariable {
         value: String,
         append: bool,
     ) -> Result<(), error::Error> {
-        match &self.value {
+        if self.is_readonly() {
+            return Err(error::ErrorKind::ReadonlyVariable.into());
+        }
+
+        match &*self.value {
             ShellValue::Unset(_) => {
                 self.assign(ShellValueLiteral::Array(ArrayLiteral(vec![])), false)?;
             }
@@ -393,7 +565,7 @@ impl ShellVariable {
         let treat_as_int = self.is_treated_as_integer();
         let value = self.convert_value_str_for_assignment(value);
 
-        match &mut self.value {
+        match std::sync::Arc::make_mut(&mut self.value) {
             ShellValue::IndexedArray(arr) => {
                 let key = get_key_for_indexed_array(arr, array_index.as_str())?;
 
@@ -479,14 +651,18 @@ impl ShellVariable {
         } else {
             match update_transform {
                 ShellVariableUpdateTransform::None => (),
-                ShellVariableUpdateTransform::Lowercase => *s = (*s).to_lowercase(),
-                ShellVariableUpdateTransform::Uppercase => *s = (*s).to_uppercase(),
+                // One character for one, as bash converts (see `casemap`).
+                ShellVariableUpdateTransform::Lowercase => *s = crate::casemap::lower(s),
+                ShellVariableUpdateTransform::Uppercase => *s = crate::casemap::upper(s),
                 ShellVariableUpdateTransform::Capitalize => {
                     // This isn't really title-case; only the first character is capitalized.
-                    *s = s.to_lowercase();
-                    if let Some(c) = s.chars().next() {
-                        s.replace_range(0..1, &c.to_uppercase().to_string());
-                    }
+                    let mut chars = s.chars();
+                    *s = chars
+                        .next()
+                        .map(crate::casemap::to_upper)
+                        .into_iter()
+                        .chain(chars.map(crate::casemap::to_lower))
+                        .collect();
                 }
             }
         }
@@ -499,7 +675,7 @@ impl ShellVariable {
     ///
     /// * `index` - The index at which to unset the value.
     pub fn unset_index(&mut self, index: &str) -> Result<bool, error::Error> {
-        match &mut self.value {
+        match std::sync::Arc::make_mut(&mut self.value) {
             ShellValue::Unset(ty) => match ty {
                 ShellValueUnsetType::Untyped => Err(error::ErrorKind::NotArray.into()),
                 ShellValueUnsetType::AssociativeArray | ShellValueUnsetType::IndexedArray => {
@@ -523,9 +699,9 @@ impl ShellVariable {
     /// * `shell` - The shell in which the variable is being resolved.
     pub fn resolve_value(&self, shell: &Shell<impl extensions::ShellExtensions>) -> ShellValue {
         // N.B. We do *not* specially handle a dynamic value that resolves to a dynamic value.
-        match &self.value {
+        match &*self.value {
             ShellValue::Dynamic { getter, .. } => getter(shell),
-            _ => self.value.clone(),
+            _ => (*self.value).clone(),
         }
     }
 
@@ -541,12 +717,6 @@ impl ShellVariable {
         if value.is_associative_array() {
             result.push('A');
         }
-        if matches!(
-            self.get_update_transform(),
-            ShellVariableUpdateTransform::Capitalize
-        ) {
-            result.push('c');
-        }
         if self.is_treated_as_integer() {
             result.push('i');
         }
@@ -556,26 +726,139 @@ impl ShellVariable {
         if self.is_readonly() {
             result.push('r');
         }
-        if matches!(
-            self.get_update_transform(),
-            ShellVariableUpdateTransform::Lowercase
-        ) {
-            result.push('l');
-        }
         if self.is_trace_enabled() {
             result.push('t');
-        }
-        if matches!(
-            self.get_update_transform(),
-            ShellVariableUpdateTransform::Uppercase
-        ) {
-            result.push('u');
         }
         if self.is_exported() {
             result.push('x');
         }
+        // Bash lists the case attributes last.
+        match self.get_update_transform() {
+            ShellVariableUpdateTransform::Capitalize => result.push('c'),
+            ShellVariableUpdateTransform::Lowercase => result.push('l'),
+            ShellVariableUpdateTransform::Uppercase => result.push('u'),
+            ShellVariableUpdateTransform::None => {}
+        }
 
         result
+    }
+}
+
+/// An associative array's elements, listed in the order bash's hash table lists them.
+///
+/// That is by bucket of the key's FNV-1 hash, and within a bucket most recently added first. The
+/// table starts with 1024 buckets and grows fourfold, rehashing, once it holds twice as many
+/// elements as buckets; removing elements never shrinks it.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AssociativeValues {
+    values: std::collections::HashMap<String, String>,
+    /// The keys in each non-empty bucket, head of the bucket's list first.
+    buckets: BTreeMap<u32, Vec<String>>,
+    bucket_count: u32,
+}
+
+impl Default for AssociativeValues {
+    fn default() -> Self {
+        Self {
+            values: std::collections::HashMap::new(),
+            buckets: BTreeMap::new(),
+            bucket_count: 1024,
+        }
+    }
+}
+
+impl AssociativeValues {
+    /// Bash's `hash_string`: 32-bit FNV-1 over the key's bytes.
+    fn hash(key: &str) -> u32 {
+        key.bytes().fold(2_166_136_261_u32, |hash, byte| {
+            hash.wrapping_mul(16_777_619) ^ u32::from(byte)
+        })
+    }
+
+    fn bucket(&self, key: &str) -> u32 {
+        Self::hash(key) & (self.bucket_count - 1)
+    }
+
+    /// Returns the value of `key`, if present.
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.values.get(key)
+    }
+
+    /// Sets `key` to `value`, returning its previous value. A new key goes to the head of its
+    /// bucket; an existing one keeps its place.
+    pub fn insert(&mut self, key: String, value: String) -> Option<String> {
+        if let Some(existing) = self.values.get_mut(&key) {
+            return Some(std::mem::replace(existing, value));
+        }
+        if self.values.len() >= self.bucket_count as usize * 2 {
+            self.rehash(self.bucket_count.saturating_mul(4));
+        }
+        let bucket = self.bucket(&key);
+        self.buckets
+            .entry(bucket)
+            .or_default()
+            .insert(0, key.clone());
+        self.values.insert(key, value)
+    }
+
+    /// Removes `key`, returning its value.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        let value = self.values.remove(key)?;
+        let bucket = self.bucket(key);
+        if let Some(keys) = self.buckets.get_mut(&bucket) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.buckets.remove(&bucket);
+            }
+        }
+        Some(value)
+    }
+
+    /// Moves every key to a table of `bucket_count` buckets as bash does: bucket by bucket, each
+    /// key going to the head of its new bucket.
+    fn rehash(&mut self, bucket_count: u32) {
+        let old = std::mem::take(&mut self.buckets);
+        self.bucket_count = bucket_count;
+        for key in old.into_values().flatten() {
+            let bucket = self.bucket(&key);
+            self.buckets.entry(bucket).or_default().insert(0, key);
+        }
+    }
+
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether there are no elements.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// The keys, in bash's order.
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.buckets.values().flatten()
+    }
+
+    /// The values, in bash's order.
+    pub fn values(&self) -> impl Iterator<Item = &String> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    /// The keys and values, in bash's order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.keys()
+            .filter_map(|key| self.values.get(key).map(|value| (key, value)))
+    }
+}
+
+impl<'a> IntoIterator for &'a AssociativeValues {
+    type Item = (&'a String, &'a String);
+    type IntoIter = Box<dyn Iterator<Item = (&'a String, &'a String)> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
     }
 }
 
@@ -591,7 +874,7 @@ pub enum ShellValue {
     /// A string.
     String(String),
     /// An associative array.
-    AssociativeArray(BTreeMap<String, String>),
+    AssociativeArray(AssociativeValues),
     /// An indexed array.
     IndexedArray(BTreeMap<u64, String>),
     /// A value that is dynamically computed.
@@ -702,6 +985,60 @@ impl From<Vec<&str>> for ShellValueLiteral {
 #[derive(Clone, Debug)]
 pub struct ArrayLiteral(pub Vec<(Option<String>, String)>);
 
+/// Where the elements of an indexed array literal go: a key places an element (and those after
+/// it), and a negative key counts back from one past the array's highest index, as in bash.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedLiteralKeys {
+    next: i64,
+    end: i64,
+}
+
+impl IndexedLiteralKeys {
+    /// For a literal replacing `existing`'s value, or appended to it.
+    ///
+    /// # Arguments
+    ///
+    /// * `existing` - The variable's current value, if it has one.
+    /// * `append` - Whether the literal is appended (`+=`).
+    pub fn new(existing: Option<&ShellValue>, append: bool) -> Self {
+        let end = match existing {
+            Some(ShellValue::IndexedArray(values)) if append => {
+                values.keys().next_back().map_or(0, |last| {
+                    i64::try_from(*last).unwrap_or(i64::MAX).saturating_add(1)
+                })
+            }
+            Some(ShellValue::String(_)) if append => 1,
+            _ => 0,
+        };
+        Self { next: end, end }
+    }
+
+    /// Places the next element at the evaluated `key`, returning the index it resolves to, or
+    /// `None` when a negative key counts back past the start.
+    pub const fn key(&mut self, key: i64) -> Option<i64> {
+        let key = if key < 0 {
+            key.saturating_add(self.end)
+        } else {
+            key
+        };
+        if key < 0 {
+            return None;
+        }
+        self.next = key;
+        Some(key)
+    }
+
+    /// Records an element placed where the next one goes.
+    pub const fn placed(&mut self) {
+        self.end = if self.end > self.next.saturating_add(1) {
+            self.end
+        } else {
+            self.next.saturating_add(1)
+        };
+        self.next = self.next.saturating_add(1);
+    }
+}
+
 /// Style for formatting a shell variable's value.
 #[derive(Copy, Clone, Debug)]
 pub enum FormatStyle {
@@ -808,14 +1145,14 @@ impl ShellValue {
     ///
     /// * `literals` - The literals to construct the associative array from.
     pub fn associative_array_from_literals(literals: ArrayLiteral) -> Result<Self, error::Error> {
-        let mut values = BTreeMap::new();
+        let mut values = AssociativeValues::default();
         Self::update_associative_array_from_literals(&mut values, literals)?;
 
         Ok(Self::AssociativeArray(values))
     }
 
     fn update_associative_array_from_literals(
-        existing_values: &mut BTreeMap<String, String>,
+        existing_values: &mut AssociativeValues,
         literal_values: ArrayLiteral,
     ) -> Result<(), error::Error> {
         let mut current_key = None;
@@ -866,8 +1203,12 @@ impl ShellValue {
                 result.push('(');
 
                 for (key, value) in values {
-                    let formatted_key =
-                        escape::quote_if_needed(key.as_str(), escape::QuoteMode::DoubleQuote);
+                    // Bash also quotes a key that would read as all the elements.
+                    let formatted_key = if matches!(key.as_str(), "@" | "*") {
+                        escape::force_quote(key.as_str(), escape::QuoteMode::DoubleQuote).into()
+                    } else {
+                        escape::quote_if_needed(key.as_str(), escape::QuoteMode::DoubleQuote)
+                    };
                     let formatted_value =
                         escape::force_quote(value.as_str(), escape::QuoteMode::DoubleQuote);
 
@@ -1039,10 +1380,12 @@ fn get_key_for_indexed_array(
 ) -> Result<u64, error::Error> {
     let mut index_value = index_str.parse::<i64>().unwrap_or(0);
 
-    // Handle negative indices, but check for out-of-range values.
+    // A negative index counts back from one past the highest index, as in bash, so for a sparse
+    // array `-1` is the last element rather than the element count minus one.
     #[expect(clippy::cast_possible_wrap)]
     if index_value < 0 {
-        index_value += values.len() as i64;
+        let end = values.keys().next_back().map_or(0, |max| *max as i64 + 1);
+        index_value += end;
         if index_value < 0 {
             return Err(error::ErrorKind::ArrayIndexOutOfRange(index_str.to_owned()).into());
         }
@@ -1087,5 +1430,43 @@ impl From<Vec<String>> for ShellValue {
 impl From<Vec<&str>> for ShellValue {
     fn from(values: Vec<&str>) -> Self {
         Self::indexed_array_from_strs(values.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(values: &AssociativeValues) -> Vec<&str> {
+        values.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn associative_values_are_listed_in_bash_order() {
+        let mut values = AssociativeValues::default();
+        for key in ["web", "db", "cache", "api"] {
+            values.insert(key.to_owned(), String::new());
+        }
+        // Bash 5: `declare -A port=([web]=80 [db]=5432 [cache]=6379 [api]=8080)`.
+        assert_eq!(keys(&values), ["db", "api", "web", "cache"]);
+
+        // A key removed and added again goes to the head of its bucket; updating keeps its place.
+        values.remove("db");
+        values.insert("db".to_owned(), String::new());
+        values.insert("zz".to_owned(), String::new());
+        values.insert("web".to_owned(), "x".to_owned());
+        assert_eq!(keys(&values), ["db", "api", "zz", "web", "cache"]);
+        assert_eq!(values.get("web").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn associative_values_grow_and_keep_every_key() {
+        let mut values = AssociativeValues::default();
+        for i in 0..3000 {
+            values.insert(format!("k{i}"), i.to_string());
+        }
+        assert_eq!(values.len(), 3000);
+        assert_eq!(values.keys().count(), 3000);
+        assert_eq!(values.get("k2999").map(String::as_str), Some("2999"));
     }
 }

@@ -172,6 +172,11 @@ pub enum CompleteOption {
 pub struct Config {
     commands: HashMap<String, Spec>,
 
+    /// Whether a spec was ever defined: bash makes its table of specs with the first one, and
+    /// until then removing a spec that is not there is no error.
+    #[cfg_attr(feature = "serde", serde(default))]
+    table_made: bool,
+
     /// Optionally, a completion spec to be used as a default, when earlier
     /// matches yield no candidates.
     pub default: Option<Spec>,
@@ -541,8 +546,10 @@ impl Spec {
                     }
                 }
                 CompleteAction::Builtin => {
-                    for name in shell.builtins().keys() {
-                        if name.starts_with(token) {
+                    // Bash lists its builtins in name order; one that stands for a program bash
+                    // has no builtin for (`cat`) is a command (`-c`), not a builtin.
+                    for name in shell.builtins().keys().sorted() {
+                        if name.starts_with(token) && !shell.is_file_program(name) {
                             candidates.push(name.to_owned());
                         }
                     }
@@ -574,15 +581,21 @@ impl Spec {
                     candidates.append(&mut file_completions);
                 }
                 CompleteAction::Disabled => {
-                    for (name, registration) in shell.builtins() {
-                        if registration.disabled && name.starts_with(token) {
+                    for (name, registration) in shell.builtins().iter().sorted_by_key(|v| v.0) {
+                        if registration.disabled
+                            && name.starts_with(token)
+                            && !shell.is_file_program(name)
+                        {
                             candidates.push(name.to_owned());
                         }
                     }
                 }
                 CompleteAction::Enabled => {
-                    for (name, registration) in shell.builtins() {
-                        if !registration.disabled && name.starts_with(token) {
+                    for (name, registration) in shell.builtins().iter().sorted_by_key(|v| v.0) {
+                        if !registration.disabled
+                            && name.starts_with(token)
+                            && !shell.is_file_program(name)
+                        {
                             candidates.push(name.to_owned());
                         }
                     }
@@ -602,7 +615,9 @@ impl Spec {
                 CompleteAction::Function => {
                     // Functions are stored unordered; bash enumerates them sorted by name.
                     for (name, _) in shell.funcs().iter().sorted_by_key(|v| v.0) {
-                        candidates.push(name.to_owned());
+                        if name.starts_with(token) {
+                            candidates.push(name.to_owned());
+                        }
                     }
                 }
                 CompleteAction::Group => {
@@ -614,8 +629,8 @@ impl Spec {
                 }
                 CompleteAction::HelpTopic => {
                     // For now, we only have help topics for built-in commands.
-                    for name in shell.builtins().keys() {
-                        if name.starts_with(token) {
+                    for name in shell.builtins().keys().sorted() {
+                        if name.starts_with(token) && !shell.is_file_program(name) {
                             candidates.push(name.to_owned());
                         }
                     }
@@ -698,7 +713,8 @@ impl Spec {
                     }
                 }
                 CompleteAction::Variable => {
-                    for (key, _) in shell.env().iter() {
+                    // Variables are stored unordered; bash enumerates them sorted by name.
+                    for (key, _) in shell.env().iter().sorted_by_key(|v| v.0) {
                         if key.starts_with(token) {
                             candidates.push(key.to_owned());
                         }
@@ -760,9 +776,13 @@ impl Spec {
 
         // Run the command.
         let params = shell.default_exec_params();
-        let output =
-            commands::invoke_command_in_subshell_and_get_output(&mut shell, &params, command_line)
-                .await?;
+        let output = commands::invoke_command_in_subshell_and_get_output(
+            &mut shell,
+            &params,
+            command_line,
+            false,
+        )
+        .await?;
 
         // Split results.
         let candidates = output.lines().map(str::to_owned).collect();
@@ -980,6 +1000,17 @@ impl Config {
         }
     }
 
+    /// Whether a spec was ever defined (see [`Self::note_spec_defined`]).
+    pub const fn table_made(&self) -> bool {
+        self.table_made
+    }
+
+    /// Notes that a spec was defined, as the default, empty-line and initial-word specs are by
+    /// assigning them directly.
+    pub const fn note_spec_defined(&mut self) {
+        self.table_made = true;
+    }
+
     /// Returns an iterator over the completion specs.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Spec)> {
         self.commands.iter()
@@ -1007,6 +1038,7 @@ impl Config {
     /// * `name` - The name of the command.
     /// * `spec` - The completion spec to associate with the command.
     pub fn set(&mut self, name: &str, spec: Spec) {
+        self.table_made = true;
         match name {
             EMPTY_COMMAND => {
                 self.empty_line = Some(spec);

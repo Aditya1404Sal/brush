@@ -24,25 +24,24 @@ pub fn get_default_standard_utils_paths() -> Vec<std::path::PathBuf> {
     vec![]
 }
 
-/// The regular file backing the emulated `/dev/null`. Kept under /tmp (created on demand — a
-/// fresh wasm guest may have an empty writable fs) and hidden, so it never surfaces as a real
-/// `/dev` tree the platform doesn't actually have.
-const NULL_BACKING_PATH: &str = "/tmp/.brush-null";
-
-/// Opens a null-like file backed by a truncate-on-open regular file.
+/// Opens a null-like file: a fresh, empty regular file whose name is removed as soon as it is
+/// open.
 ///
 /// There are no device nodes on this platform, so `/dev/null` is emulated: every open sees an
-/// empty file (reads yield EOF) and bytes written are discarded by the next open. Not
-/// byte-for-byte `/dev/null` (bytes exist until the next open), but the redirect semantics
-/// (`> /dev/null`, `2>/dev/null`, `< /dev/null`) hold.
+/// empty file (reads yield EOF) and bytes written go to an anonymous file freed on close. The
+/// name exists only during this call, so scripts never see it, and no directory (not even
+/// `/tmp`, which may not exist) is created for it.
 pub fn open_null_file() -> Result<std::fs::File, error::Error> {
-    let _ = std::fs::create_dir_all("/tmp");
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = format!("/.brush-null-{n}");
     let f = std::fs::File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(NULL_BACKING_PATH)?;
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path);
     Ok(f)
 }
 

@@ -16,18 +16,23 @@ pub struct Error {
     /// Whether or not the error should be considered a "fatal" error that would
     /// result in abnormal exit of a non-interactive shell.
     fatal: bool,
+
+    /// Whether the error was already shown where it happened, so that whatever handles it
+    /// later does not show it again.
+    reported: bool,
 }
 
 /// Monolithic error type for the shell
 #[derive(thiserror::Error, Debug)]
 pub enum ErrorKind {
-    /// A tilde expression was used without a valid HOME variable
-    #[error("cannot expand tilde expression with HOME not set")]
-    TildeWithoutValidHome,
-
     /// An attempt was made to assign a list to an array member
     #[error("cannot assign list to array member")]
     AssigningListToArrayMember,
+
+    /// A regular expression (`[[ =~ ]]`) that does not compile, with the reason as bash's
+    /// regex library words it.
+    #[error("invalid regular expression `{0}': {1}")]
+    InvalidRegex(String, &'static str),
 
     /// An attempt was made to convert an associative array to an indexed array.
     #[error("cannot convert associative array to indexed array")]
@@ -38,7 +43,7 @@ pub enum ErrorKind {
     ConvertingIndexedArrayToAssociativeArray,
 
     /// An error occurred while sourcing the indicated script file.
-    #[error("failed to source file: {0}")]
+    #[error("{}: {}", .0.display(), io_message(.1))]
     FailedSourcingFile(PathBuf, #[source] std::io::Error),
 
     /// The process or process group does not exist.
@@ -54,11 +59,11 @@ pub enum ErrorKind {
     FailedToSendSignal,
 
     /// An attempt was made to assign a value to a special parameter.
-    #[error("cannot assign in this way")]
-    CannotAssignToSpecialParameter,
+    #[error("{0}: cannot assign in this way")]
+    CannotAssignToSpecialParameter(String),
 
     /// Checked expansion error.
-    #[error("expansion error: {0}")]
+    #[error("{0}")]
     CheckedExpansionError(String),
 
     /// A reference was made to an unknown shell function.
@@ -66,11 +71,11 @@ pub enum ErrorKind {
     FunctionNotFound(String),
 
     /// Command was not found.
-    #[error("command not found: {0}")]
+    #[error("{0}: command not found")]
     CommandNotFound(String),
 
     /// Not a builtin.
-    #[error("not a shell builtin: {0}")]
+    #[error("{0}: not a shell builtin")]
     BuiltinNotFound(String),
 
     /// The working directory does not exist.
@@ -80,6 +85,15 @@ pub enum ErrorKind {
     /// Failed to execute command.
     #[error("failed to execute command '{0}': {1}")]
     FailedToExecuteCommand(String, #[source] std::io::Error),
+
+    /// A command named by a path cannot run, for the reason given (`No such file or directory`,
+    /// `Is a directory`), as the kernel's `execve` would say.
+    #[error("{0}: {1}")]
+    CannotExecutePath(String, &'static str),
+
+    /// A command resolved to a file, which this platform cannot run as a process.
+    #[error("{0}: executing files is unsupported in bash-tool")]
+    ExecutingFilesUnsupported(String),
 
     /// History item was not found.
     #[error("history item not found")]
@@ -131,13 +145,22 @@ pub enum ErrorKind {
     #[error("invalid redirection target")]
     InvalidRedirection,
 
+    /// A redirection target expanded to no word or to several (`> $empty`).
+    #[error("{0}: ambiguous redirect")]
+    AmbiguousRedirect(String),
+
     /// An error occurred while redirecting input or output with the given file.
-    #[error("failed to redirect to {0}: {1}")]
+    #[error("{0}: {1}")]
     RedirectionFailure(String, String),
 
     /// An error occurred evaluating an arithmetic expression.
-    #[error("arithmetic evaluation error: {0}")]
-    EvalError(#[from] crate::arithmetic::EvalError),
+    #[error("{0}")]
+    EvalError(crate::arithmetic::EvalError),
+
+    /// An error in an indexed array's subscript: bash reports it without the command's name and
+    /// ends the shell.
+    #[error("{0}")]
+    ArithmeticSubscript(crate::arithmetic::EvalError),
 
     /// The given string could not be parsed as an integer.
     #[error("failed to parse '{s}' as a {int_type_name}, base-{radix} integer: {inner}")]
@@ -168,6 +191,10 @@ pub enum ErrorKind {
     #[error("cannot mutate readonly variable")]
     ReadonlyVariable,
 
+    /// An attempt was made to assign to the named readonly variable.
+    #[error("{0}: readonly variable")]
+    ReadonlyVariableNamed(String),
+
     /// The indicated pattern is invalid.
     #[error("invalid pattern: '{0}'")]
     InvalidPattern(String),
@@ -181,12 +208,20 @@ pub enum ErrorKind {
     InvalidRegexError(fancy_regex::Error, String),
 
     /// An I/O error occurred.
-    #[error("i/o error: {0}")]
+    #[error("{}", io_message(.0))]
     IoError(#[from] std::io::Error),
 
-    /// Invalid substitution syntax.
-    #[error("bad substitution: {0}")]
+    /// Invalid substitution syntax; holds bash's message (`${v:}: bad substitution`).
+    #[error("{0}")]
     BadSubstitution(String),
+
+    /// An indirect expansion's value is not a name to expand.
+    #[error("{0}: invalid variable name")]
+    InvalidVariableName(String),
+
+    /// `${!ref}` of a name reference that cannot be followed (`local -n v=v`).
+    #[error("{0}: invalid indirect expansion")]
+    InvalidIndirectExpansion(String),
 
     /// An error occurred while creating a child process.
     #[error("failed to create child process")]
@@ -199,6 +234,17 @@ pub enum ErrorKind {
     /// An error occurred while parsing.
     #[error("{1}: {0}")]
     ParseError(crate::parser::ParseError, crate::SourceInfo),
+
+    /// A syntax error in bash's words (see [`brush_parser::bash_diagnostic`]): each line follows
+    /// the `NAME: ORIGIN: ` prefix, where ORIGIN names what was being parsed (`-c`, `eval`, a
+    /// script path, `exit trap`).
+    #[error("{origin}: {}", .lines.join("\n"))]
+    SyntaxError {
+        /// What was being parsed.
+        origin: String,
+        /// The diagnostic lines, without prefix.
+        lines: Vec<String>,
+    },
 
     /// An error occurred while parsing a function body.
     #[error("{0}: {1}")]
@@ -241,7 +287,7 @@ pub enum ErrorKind {
     OpenFileNotWritable(&'static str),
 
     /// Bad file descriptor.
-    #[error("bad file descriptor: {0}")]
+    #[error("{0}: Bad file descriptor")]
     BadFileDescriptor(ShellFd),
 
     /// Printf failure
@@ -256,17 +302,50 @@ pub enum ErrorKind {
     #[error("interrupted")]
     Interrupted,
 
-    /// Maximum function call depth was exceeded.
-    #[error("maximum function call depth exceeded")]
-    MaxFunctionCallDepthExceeded,
+    /// A function call would nest deeper than `FUNCNEST` (or the embedder's limit) allows: the
+    /// function's name and the nesting level reached.
+    #[error("{0}: maximum function nesting level exceeded ({1})")]
+    MaxFunctionCallDepthExceeded(String, usize),
+
+    /// A function call would nest deeper than the stack can hold: the function's name and the
+    /// nesting level reached.
+    #[error(
+        "{0}: maximum function nesting level exceeded ({1}): deeper nesting is unsupported in bash-tool"
+    )]
+    FunctionNestingTooDeep(String, usize),
+
+    /// A command substitution's output exceeded what the shell holds in memory.
+    #[error(
+        "command substitution: output over {} MiB is unsupported in bash-tool",
+        crate::openfiles::MAX_SUBSTITUTION_BYTES >> 20
+    )]
+    SubstitutionTooLarge,
+
+    /// Execution would nest deeper than the stack can hold.
+    #[error("maximum nesting level exceeded: deeper nesting is unsupported in bash-tool")]
+    NestingTooDeep,
 
     /// System time error.
     #[error("system time error: {0}")]
     TimeError(#[from] std::time::SystemTimeError),
 
+    /// A `test` operand that must be an integer is not one.
+    #[error("{0}: integer expected")]
+    IntegerExpressionExpected(String),
+
     /// Array index out of range.
-    #[error("array index out of range: {0}")]
+    #[error("{0}: bad array subscript")]
     ArrayIndexOutOfRange(String),
+
+    /// An element without a subscript in a compound assignment to an associative array whose
+    /// elements have them; bash names no builtin for it.
+    #[error("{0}: {1}: must use subscript when assigning associative array")]
+    AssocSubscriptRequired(String, String),
+
+    /// An element of an array literal whose key is empty or counts back past the start
+    /// (`a=([-1]=x)`): it abandons the top-level command, reported without the command's name.
+    #[error("{0}: bad array subscript")]
+    BadArrayElement(String),
 
     /// Unhandled key code.
     #[error("unhandled key code: {0:?}")]
@@ -275,6 +354,11 @@ pub enum ErrorKind {
     /// An error occurred in a built-in command.
     #[error("{1}: {0}")]
     BuiltinError(Box<dyn BuiltinError>, String),
+
+    /// The embedder refused to run a prompt string's expansions (see
+    /// [`crate::Shell::set_prompt_guard`]); the diagnostic is its own.
+    #[error("{0}")]
+    PromptRefused(String),
 
     /// Operation not supported on this platform.
     #[error("operation not supported on this platform: {0}")]
@@ -285,7 +369,7 @@ pub enum ErrorKind {
     HistoryNotEnabled,
 
     /// Expanding an unset variable.
-    #[error("expanding unset variable: {0}")]
+    #[error("{0}: unbound variable")]
     ExpandingUnsetVariable(String),
 
     /// An internal error occurred.
@@ -360,6 +444,9 @@ where
     }
 }
 
+/// `execve`'s reason for a path that names nothing.
+pub(crate) const NO_SUCH_FILE: &str = "No such file or directory";
+
 impl From<&ErrorKind> for results::ExecutionExitCode {
     fn from(value: &ErrorKind) -> Self {
         match value {
@@ -367,10 +454,16 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::Unimplemented(..) | ErrorKind::UnimplementedAndTracked(..) => {
                 Self::Unimplemented
             }
-            ErrorKind::ParseError(..) => Self::InvalidUsage,
+            ErrorKind::ParseError(..) | ErrorKind::SyntaxError { .. } => Self::InvalidUsage,
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
+            ErrorKind::IntegerExpressionExpected(..) => Self::InvalidUsage,
+            ErrorKind::PromptRefused(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
+            ErrorKind::CannotExecutePath(_, reason) if *reason == NO_SUCH_FILE => Self::NotFound,
+            ErrorKind::CannotExecutePath(..) => Self::CannotExecute,
+            // Found but not run: bash's status for a file it cannot execute.
+            ErrorKind::ExecutingFilesUnsupported(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
             ErrorKind::BuiltinError(inner, ..) => inner.as_exit_code(),
@@ -395,6 +488,15 @@ impl From<&Error> for results::ExecutionExitCode {
     }
 }
 
+impl From<crate::arithmetic::EvalError> for ErrorKind {
+    fn from(error: crate::arithmetic::EvalError) -> Self {
+        match error {
+            crate::arithmetic::EvalError::InSubscript(inner) => Self::ArithmeticSubscript(*inner),
+            error => Self::EvalError(error),
+        }
+    }
+}
+
 impl<T> From<T> for Error
 where
     ErrorKind: From<T>,
@@ -403,6 +505,7 @@ where
         Self {
             kind: convertible_to_kind.into(),
             fatal: false,
+            reported: false,
         }
     }
 }
@@ -415,9 +518,61 @@ impl Error {
         self
     }
 
+    /// Marks the error as already shown where it happened.
+    #[must_use]
+    pub const fn into_reported(mut self) -> Self {
+        self.reported = true;
+        self
+    }
+
+    /// Whether the error was already shown where it happened.
+    pub const fn is_reported(&self) -> bool {
+        self.reported
+    }
+
+    /// Whether the error abandons the rest of the top-level command, as assigning to a
+    /// readonly variable does in bash: it passes through function calls rather than becoming
+    /// the call's status. Only an assignment statement does this, and it reports the error
+    /// where it happens; a builtin or a loop that cannot assign the variable just fails.
+    pub const fn abandons_command(&self) -> bool {
+        // A failed glob under failglob, and an indirect expansion of a value that is no name, do
+        // the same, reported where the top-level command ends.
+        (matches!(self.kind, ErrorKind::ReadonlyVariableNamed(_)) && self.reported)
+            || matches!(
+                self.kind,
+                ErrorKind::NoMatch(_)
+                    | ErrorKind::InvalidVariableName(_)
+                    | ErrorKind::InvalidIndirectExpansion(_)
+                    | ErrorKind::BadArrayElement(_)
+            )
+    }
+
+    /// The reason a path could not be used, as the system words it ("No such file or
+    /// directory", "Not a directory"), for a diagnostic that names the path itself.
+    pub fn path_reason(&self) -> String {
+        match &self.kind {
+            ErrorKind::IoError(error) => io_message(error),
+            ErrorKind::NotADirectory(_) => "Not a directory".to_owned(),
+            ErrorKind::WorkingDirMissing(_) => "No such file or directory".to_owned(),
+            kind => kind.to_string(),
+        }
+    }
+
+    /// The arithmetic error this error carries, or the error itself when it is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error itself when it is not an arithmetic error.
+    pub fn into_eval_error(self) -> Result<crate::arithmetic::EvalError, Self> {
+        match self.kind {
+            ErrorKind::EvalError(error) => Ok(error),
+            _ => Err(self),
+        }
+    }
+
     /// Returns whether or not this error is fatal.
     pub const fn is_fatal(&self) -> bool {
-        self.fatal
+        self.fatal || matches!(self.kind, ErrorKind::ArithmeticSubscript(_))
     }
 
     /// Returns a reference to the error kind.
@@ -460,14 +615,81 @@ impl Error {
         self,
         shell: &Shell<impl extensions::ShellExtensions>,
     ) -> results::ExecutionResult {
-        let next_control_flow = self.to_control_flow(shell);
-        let exit_code = results::ExecutionExitCode::from(&self);
+        let mut next_control_flow = self.to_control_flow(shell);
+        // A fatal error among the EXIT trap's own commands ends the trap but not with the error's
+        // status: the shell keeps the status it had as the trap began, as in bash (only `exit`
+        // or errexit in the trap sets it).
+        if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
+            && matches!(
+                shell
+                    .call_stack()
+                    .current_frame()
+                    .map(|frame| &frame.frame_type),
+                Some(crate::callstack::FrameType::TrapHandler(
+                    crate::traps::TrapSignal::Exit
+                ))
+            )
+        {
+            next_control_flow = results::ExecutionControlFlow::Normal;
+        }
+        // An unset variable (`set -u`, `${x?}`) ends `bash -c` with 127, as in bash; a script
+        // read from a file or standard input, `set -e`, or a subshell ended by it gives 1.
+        let exit_code = if matches!(next_control_flow, results::ExecutionControlFlow::ExitShell)
+            && shell.depth() == shell.process_depth
+            && shell.options().command_string_mode
+            && !shell.options().exit_on_nonzero_command_exit
+            && matches!(
+                self.kind,
+                ErrorKind::ExpandingUnsetVariable(..) | ErrorKind::CheckedExpansionError(..)
+            ) {
+            results::ExecutionExitCode::NotFound
+        } else {
+            results::ExecutionExitCode::from(&self)
+        };
 
         results::ExecutionResult {
             next_control_flow,
             exit_code,
             terminating_signal: None,
         }
+    }
+}
+
+/// A syntax error's diagnostic lines (see [`brush_parser::bash_diagnostic`]) for code whose first
+/// line is `shift` lines further on: the line each names, and the line an unfinished command
+/// started on.
+pub(crate) fn shift_diagnostic_lines(lines: Vec<String>, shift: usize) -> Vec<String> {
+    let shifted = |line: &str| line.parse::<usize>().map(|line| line + shift);
+    lines
+        .into_iter()
+        .map(|diagnostic| {
+            let Some((line, message)) = diagnostic
+                .strip_prefix("line ")
+                .and_then(|rest| rest.split_once(": "))
+            else {
+                return diagnostic;
+            };
+            let Ok(line) = shifted(line) else {
+                return diagnostic;
+            };
+            let message = match message.rsplit_once(" command on line ") {
+                Some((head, start)) if let Ok(start) = shifted(start) => {
+                    format!("{head} command on line {start}")
+                }
+                _ => message.to_owned(),
+            };
+            format!("line {line}: {message}")
+        })
+        .collect()
+}
+
+/// An I/O error's message as bash words it: the system's description, without the
+/// ` (os error N)` Rust appends.
+pub fn io_message(error: &std::io::Error) -> String {
+    let text = error.to_string();
+    match text.rsplit_once(" (os error ") {
+        Some((message, _)) if text.ends_with(')') => message.to_owned(),
+        _ => text,
     }
 }
 
@@ -488,4 +710,45 @@ pub fn unimp<T>(msg: &'static str) -> Result<T, Error> {
 /// * `project_issue_id` - The GitHub issue ID where the implementation is tracked.
 pub fn unimp_with_issue<T>(msg: &'static str, project_issue_id: u32) -> Result<T, Error> {
     Err(ErrorKind::UnimplementedAndTracked(msg, project_issue_id).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shift_diagnostic_lines;
+
+    #[test]
+    fn shifts_the_lines_a_syntax_error_names() {
+        let lines = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|&line| line.to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shift_diagnostic_lines(
+                lines(&[
+                    "line 1: syntax error near unexpected token `fi'",
+                    "line 1: `fi'",
+                ]),
+                5,
+            ),
+            lines(&[
+                "line 6: syntax error near unexpected token `fi'",
+                "line 6: `fi'"
+            ])
+        );
+        assert_eq!(
+            shift_diagnostic_lines(
+                lines(&[
+                    "line 2: syntax error: unexpected end of file from `if' command on line 1"
+                ]),
+                3,
+            ),
+            lines(&["line 5: syntax error: unexpected end of file from `if' command on line 4"])
+        );
+        assert_eq!(
+            shift_diagnostic_lines(lines(&["line 1: `echo on line 2'"]), 1),
+            lines(&["line 2: `echo on line 2'"])
+        );
+    }
 }

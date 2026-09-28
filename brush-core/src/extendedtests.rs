@@ -65,7 +65,67 @@ async fn apply_unary_predicate(
             .await;
     }
 
-    apply_unary_predicate_to_str(op, expanded_operand.as_str(), shell, params)
+    // `-v NAME[SUBSCRIPT]`: an indexed array's subscript is arithmetic, evaluated here where the
+    // shell can be changed; the check below then sees a plain number.
+    let operand = if matches!(op, ast::UnaryPredicate::ShellVariableIsSetAndAssigned) {
+        evaluate_subscript(shell, params, expanded_operand).await?
+    } else {
+        expanded_operand
+    };
+
+    apply_unary_predicate_to_str(op, operand.as_str(), shell, params)
+}
+
+async fn evaluate_subscript(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    operand: String,
+) -> Result<String, error::Error> {
+    let Some((name, index)) = operand.strip_suffix(']').and_then(|r| r.split_once('[')) else {
+        return Ok(operand);
+    };
+    let indexed = shell
+        .env()
+        .get(name)
+        .is_some_and(|(_, var)| !matches!(var.value(), crate::ShellValue::AssociativeArray(_)));
+    if !indexed || index == "@" || index == "*" || index.parse::<i64>().is_ok() {
+        return Ok(operand);
+    }
+    let index = arithmetic::expand_and_eval(shell, params, index, false)
+        .await
+        .map_err(arithmetic::EvalError::in_subscript)?;
+    Ok(format!("{name}[{index}]"))
+}
+
+/// A file-type test of a path that names one of the command's descriptors (`[ -f /dev/stdin ]`),
+/// answered from what the descriptor is open on, as bash's `stat` of it does: a redirection
+/// decides, not the shell's own original streams. `None` when the test or the descriptor does not
+/// say.
+fn descriptor_type_test(
+    op: &ast::UnaryPredicate,
+    operand: &str,
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Option<bool> {
+    use crate::openfiles::DescriptorType as T;
+    let kind = || shell.open_file_named(params, operand)?.test_type();
+    Some(match op {
+        ast::UnaryPredicate::FileExists => kind().map(|_| true)?,
+        ast::UnaryPredicate::FileExistsAndIsRegularFile => {
+            matches!(kind()?, T::File(metadata) if metadata.is_file())
+        }
+        ast::UnaryPredicate::FileExistsAndIsDir => {
+            matches!(kind()?, T::File(metadata) if metadata.is_dir())
+        }
+        ast::UnaryPredicate::FileExistsAndIsCharSpecialFile => {
+            matches!(kind()?, T::CharacterDevice)
+        }
+        ast::UnaryPredicate::FileExistsAndIsFifo => matches!(kind()?, T::Fifo),
+        ast::UnaryPredicate::FileExistsAndIsNotZeroLength => {
+            matches!(kind()?, T::File(metadata) if metadata.len() > 0)
+        }
+        _ => return None,
+    })
 }
 
 #[expect(clippy::too_many_lines)]
@@ -75,9 +135,60 @@ pub(crate) fn apply_unary_predicate_to_str(
     shell: &Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
+    if let Some(answer) = descriptor_type_test(op, operand, shell, params) {
+        return Ok(answer);
+    }
     match op {
         ast::UnaryPredicate::StringHasNonZeroLength => Ok(!operand.is_empty()),
         ast::UnaryPredicate::StringHasZeroLength => Ok(operand.is_empty()),
+        // An empty path names no file, not the working directory it would resolve to.
+        ast::UnaryPredicate::FileExists
+        | ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsCharSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsDir
+        | ast::UnaryPredicate::FileExistsAndIsRegularFile
+        | ast::UnaryPredicate::FileExistsAndIsSetgid
+        | ast::UnaryPredicate::FileExistsAndIsSymlink
+        | ast::UnaryPredicate::FileExistsAndHasStickyBit
+        | ast::UnaryPredicate::FileExistsAndIsFifo
+        | ast::UnaryPredicate::FileExistsAndIsReadable
+        | ast::UnaryPredicate::FileExistsAndIsNotZeroLength
+        | ast::UnaryPredicate::FileExistsAndIsSetuid
+        | ast::UnaryPredicate::FileExistsAndIsWritable
+        | ast::UnaryPredicate::FileExistsAndIsExecutable
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId
+        | ast::UnaryPredicate::FileExistsAndModifiedSinceLastRead
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveUserId
+        | ast::UnaryPredicate::FileExistsAndIsSocket
+            if operand.is_empty() =>
+        {
+            Ok(false)
+        }
+        // `/dev/fd/N` exists only while the descriptor is open, as on Linux; WASI has no such
+        // files, so the platform answers for every number.
+        #[cfg(target_arch = "wasm32")]
+        ast::UnaryPredicate::FileExists
+        | ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsCharSpecialFile
+        | ast::UnaryPredicate::FileExistsAndIsDir
+        | ast::UnaryPredicate::FileExistsAndIsRegularFile
+        | ast::UnaryPredicate::FileExistsAndIsSetgid
+        | ast::UnaryPredicate::FileExistsAndIsSymlink
+        | ast::UnaryPredicate::FileExistsAndHasStickyBit
+        | ast::UnaryPredicate::FileExistsAndIsFifo
+        | ast::UnaryPredicate::FileExistsAndIsReadable
+        | ast::UnaryPredicate::FileExistsAndIsNotZeroLength
+        | ast::UnaryPredicate::FileExistsAndIsSetuid
+        | ast::UnaryPredicate::FileExistsAndIsWritable
+        | ast::UnaryPredicate::FileExistsAndIsExecutable
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId
+        | ast::UnaryPredicate::FileExistsAndModifiedSinceLastRead
+        | ast::UnaryPredicate::FileExistsAndOwnedByEffectiveUserId
+        | ast::UnaryPredicate::FileExistsAndIsSocket
+            if shell.names_closed_fd(params, operand) =>
+        {
+            Ok(false)
+        }
         ast::UnaryPredicate::FileExists => {
             let path = shell.absolute_path(Path::new(operand));
             Ok(path.exists())
@@ -127,16 +238,16 @@ pub(crate) fn apply_unary_predicate_to_str(
             }
         }
         ast::UnaryPredicate::FdIsOpenTerminal => {
-            // Trim whitespace before parsing, matching bash behavior.
-            if let Ok(fd) = operand.trim().parse::<ShellFd>() {
-                if let Some(open_file) = params.try_fd(shell, fd) {
-                    Ok(open_file.is_terminal())
-                } else {
-                    Ok(false)
-                }
-            } else {
-                Ok(false)
-            }
+            // Trim whitespace before parsing, matching bash behavior; what is not a number is an
+            // error, as bash reports it.
+            let number = operand
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| error::ErrorKind::IntegerExpressionExpected(operand.to_owned()))?;
+            Ok(ShellFd::try_from(number)
+                .ok()
+                .and_then(|fd| params.try_fd(shell, fd))
+                .is_some_and(|open_file| open_file.is_terminal()))
         }
         ast::UnaryPredicate::FileExistsAndIsSetuid => {
             let path = shell.absolute_path(Path::new(operand));
@@ -148,12 +259,18 @@ pub(crate) fn apply_unary_predicate_to_str(
         }
         ast::UnaryPredicate::FileExistsAndIsExecutable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.executable())
+            // A program a builtin stands for (`/bin/cat`) can be executed.
+            Ok(path.executable_or_searchable() || shell.program_builtin(operand).is_some())
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
             let path = shell.absolute_path(Path::new(operand));
             if !path.exists() {
                 return Ok(false);
+            }
+
+            // WASI has no owners: every file in the shell's filesystem is its own.
+            if cfg!(target_family = "wasm") {
+                return Ok(true);
             }
 
             let md = path.metadata()?;
@@ -166,6 +283,11 @@ pub(crate) fn apply_unary_predicate_to_str(
             let path = shell.absolute_path(Path::new(operand));
             if !path.exists() {
                 return Ok(false);
+            }
+
+            // WASI has no owners: every file in the shell's filesystem is its own.
+            if cfg!(target_family = "wasm") {
+                return Ok(true);
             }
 
             let md = path.metadata()?;
@@ -185,11 +307,42 @@ pub(crate) fn apply_unary_predicate_to_str(
                 Ok(false)
             }
         }
-        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(shell.env().is_set(operand)),
-        ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get(operand) {
+        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => {
+            // Bash looks the name up once, and a circular name reference warns.
+            shell.warn_circular_nameref(params, operand, 1, false);
+            Ok(variable_is_set(shell, operand))
+        }
+        ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get_raw(operand) {
             Some((_, reffed)) => Ok(reffed.value().is_set() && reffed.is_treated_as_nameref()),
             None => Ok(false),
         },
+    }
+}
+
+/// `-v NAME` or `-v NAME[SUBSCRIPT]`: whether the variable, or that element of it, is set. An
+/// indexed array's subscript must already be evaluated to a number; an associative array's is a
+/// key; `@` and `*` ask whether the array has any element.
+fn variable_is_set(shell: &Shell<impl extensions::ShellExtensions>, operand: &str) -> bool {
+    let Some((name, index)) = operand.strip_suffix(']').and_then(|r| r.split_once('[')) else {
+        // A number names a positional parameter; an array's name, its element 0.
+        if !operand.is_empty() && operand.chars().all(|c| c.is_ascii_digit()) {
+            return operand
+                .parse::<usize>()
+                .is_ok_and(|n| n == 0 || n <= shell.current_shell_args().len());
+        }
+        return match shell.env().get(operand) {
+            Some((_, var)) if var.value().is_array() => {
+                var.value().get_at("0", shell).is_ok_and(|v| v.is_some())
+            }
+            _ => shell.env().is_set(operand),
+        };
+    };
+    match shell.env().get(name) {
+        None => false,
+        Some((_, var)) if index == "@" || index == "*" => {
+            !var.value().element_values(shell).is_empty()
+        }
+        Some((_, var)) => var.value().get_at(index, shell).is_ok_and(|v| v.is_some()),
     }
 }
 
@@ -202,24 +355,29 @@ async fn apply_binary_predicate(
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
     match op {
-        ast::BinaryPredicate::StringMatchesRegex => {
+        // A pattern that starts quoted is a regular expression too, its quoted text matched
+        // literally, as in bash.
+        ast::BinaryPredicate::StringMatchesRegex
+        | ast::BinaryPredicate::StringContainsSubstring => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
             let regex = expansion::basic_expand_regex(shell, params, right)
                 .await?
                 .set_multiline(true);
 
             if shell.options().print_commands_and_arguments {
+                // As the regex library gets it: expanded, with quoted text escaped.
+                let pattern = regex.pattern();
                 shell
-                    .trace_command(params, std::format!("[[ {s} {op} {right} ]]"))
+                    .trace_command(params, std::format!("[[ {s} {op} {pattern} ]]"))
                     .await;
             }
 
             let (matches, captures) = match regex.matches(s.as_str()) {
                 Ok(Some(captures)) => (true, captures),
                 Ok(None) => (false, vec![]),
-                // If we can't compile the regex, don't abort the whole operation but make sure to
-                // report it.
-                // TODO(test): Docs indicate we should yield 2 on an invalid regex (not 1).
+                // A regular expression that does not compile fails the whole test (status 2).
+                Err(e) if matches!(e.kind(), error::ErrorKind::InvalidRegex(..)) => return Err(e),
+                // Otherwise don't abort the whole operation, but make sure to report it.
                 Err(e) => {
                     tracing::warn!("error using regex: {}", e);
                     (false, vec![])
@@ -266,18 +424,6 @@ async fn apply_binary_predicate(
             }
 
             Ok(left != right)
-        }
-        ast::BinaryPredicate::StringContainsSubstring => {
-            let s = expansion::basic_expand_word(shell, params, left).await?;
-            let substring = expansion::basic_expand_word(shell, params, right).await?;
-
-            if shell.options().print_commands_and_arguments {
-                shell
-                    .trace_command(params, std::format!("[[ {s} {op} {substring} ]]"))
-                    .await;
-            }
-
-            Ok(s.contains(substring.as_str()))
         }
         ast::BinaryPredicate::FilesReferToSameDeviceAndInodeNumbers => {
             let left = expansion::basic_expand_word(shell, params, left).await?;
@@ -432,9 +578,10 @@ async fn apply_binary_predicate(
         // (nocasematch).
         ast::BinaryPredicate::StringExactlyMatchesPattern => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
+            // Bash matches `[[ == ]]` patterns as extended globs whether or not extglob is on.
             let pattern = expansion::basic_expand_pattern(shell, params, right)
                 .await?
-                .set_extended_globbing(shell.options().extended_globbing)
+                .set_extended_globbing(true)
                 .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
             if shell.options().print_commands_and_arguments {
@@ -452,9 +599,10 @@ async fn apply_binary_predicate(
         }
         ast::BinaryPredicate::StringDoesNotExactlyMatchPattern => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
+            // Bash matches `[[ == ]]` patterns as extended globs whether or not extglob is on.
             let pattern = expansion::basic_expand_pattern(shell, params, right)
                 .await?
-                .set_extended_globbing(shell.options().extended_globbing)
+                .set_extended_globbing(true)
                 .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
             if shell.options().print_commands_and_arguments {
@@ -498,32 +646,24 @@ pub(crate) fn apply_binary_predicate_to_strs(
             // TODO(test): According to docs, should be lexicographical order of the current locale.
             Ok(left > right)
         }
-        ast::BinaryPredicate::ArithmeticEqualTo => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left == right,
-        )),
-        ast::BinaryPredicate::ArithmeticNotEqualTo => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left != right,
-        )),
-        ast::BinaryPredicate::ArithmeticLessThan => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left < right,
-        )),
-        ast::BinaryPredicate::ArithmeticLessThanOrEqualTo => Ok(
-            apply_test_binary_arithmetic_predicate(left, right, |left, right| left <= right),
-        ),
-        ast::BinaryPredicate::ArithmeticGreaterThan => Ok(apply_test_binary_arithmetic_predicate(
-            left,
-            right,
-            |left, right| left > right,
-        )),
-        ast::BinaryPredicate::ArithmeticGreaterThanOrEqualTo => Ok(
-            apply_test_binary_arithmetic_predicate(left, right, |left, right| left >= right),
-        ),
+        ast::BinaryPredicate::ArithmeticEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left == right)
+        }
+        ast::BinaryPredicate::ArithmeticNotEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left != right)
+        }
+        ast::BinaryPredicate::ArithmeticLessThan => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left < right)
+        }
+        ast::BinaryPredicate::ArithmeticLessThanOrEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left <= right)
+        }
+        ast::BinaryPredicate::ArithmeticGreaterThan => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left > right)
+        }
+        ast::BinaryPredicate::ArithmeticGreaterThanOrEqualTo => {
+            apply_test_binary_arithmetic_predicate(left, right, |left, right| left >= right)
+        }
         ast::BinaryPredicate::StringExactlyMatchesPattern => {
             let pattern = patterns::Pattern::from(right)
                 .set_extended_globbing(shell.options().extended_globbing)
@@ -549,16 +689,16 @@ fn apply_test_binary_arithmetic_predicate(
     left: &str,
     right: &str,
     op: fn(i64, i64) -> bool,
-) -> bool {
-    // We trim leading/trailing whitespace (including newlines) before parsing integers.
-    let left: Result<i64, _> = left.trim().parse();
-    let right: Result<i64, _> = right.trim().parse();
-
-    if let (Ok(left), Ok(right)) = (left, right) {
-        op(left, right)
-    } else {
-        false
-    }
+) -> Result<bool, error::Error> {
+    // Leading and trailing whitespace (including newlines) is allowed around each integer; any
+    // other operand is an error, as in bash (`[ 1 -eq x ]` is status 2).
+    let parse = |operand: &str| {
+        operand
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| error::ErrorKind::IntegerExpressionExpected(operand.to_owned()))
+    };
+    Ok(op(parse(left)?, parse(right)?))
 }
 
 fn left_file_is_older_or_does_not_exist_when_right_does(

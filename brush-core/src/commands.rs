@@ -17,14 +17,14 @@ use crate::ExecutionExitCode;
 
 use crate::{
     ErrorKind, ExecutionControlFlow, ExecutionParameters, ExecutionResult, Shell, ShellFd,
-    builtins, commands, env, error, escape,
+    builtins, error, escape,
     extensions::{self, ShellExtensions},
     functions,
     interp::{self, Execute, ProcessGroupPolicy},
     openfiles::{self, OpenFile, OpenFiles},
     pathsearch, processes,
     results::ExecutionSpawnResult,
-    sys, trace_categories, traps, variables,
+    sys, trace_categories, traps,
 };
 
 /// Encapsulates the result of waiting for a command to complete.
@@ -59,6 +59,13 @@ impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
     /// Returns the standard error file; usable with `write!` et al.
     pub fn stderr(&self) -> openfiles::OpenFile {
         self.params.stderr(self.shell)
+    }
+
+    /// Writes a builtin's diagnostic as bash does: `NAME: line N: BUILTIN: message`.
+    pub fn report(&self, message: impl std::fmt::Display) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let prefix = self.shell.diagnostic_prefix();
+        writeln!(self.stderr(), "{prefix}{}: {message}", self.command_name)
     }
 
     /// Returns the file descriptor with the given number. Returns `None`
@@ -112,15 +119,22 @@ impl CommandArg {
     pub(crate) fn quote_for_tracing(&self) -> Cow<'_, str> {
         match self {
             Self::String(s) => escape::quote_if_needed(s, escape::QuoteMode::SingleQuote),
+            // Bash prints the word `name=value` as it prints any word, quoted whole when it
+            // needs to be: `e=`, `'a=x y'`. A compound array assignment was traced on its own as
+            // it was expanded, and the command shows only its name.
+            Self::Assignment(a)
+                if matches!(a.value, brush_parser::ast::AssignmentValue::Array(_)) =>
+            {
+                a.name.to_string().into()
+            }
             Self::Assignment(a) => {
-                let mut s = a.name.to_string();
                 let op = if a.append { "+=" } else { "=" };
-                s.push_str(op);
-                s.push_str(&escape::quote_if_needed(
-                    a.value.to_string().as_str(),
+                escape::quote_if_needed(
+                    format!("{}{op}{}", a.name, a.value).as_str(),
                     escape::QuoteMode::SingleQuote,
-                ));
-                s.into()
+                )
+                .into_owned()
+                .into()
             }
         }
     }
@@ -256,31 +270,6 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
     Ok(cmd)
 }
 
-pub(crate) async fn on_preexecute(
-    cmd: &mut commands::SimpleCommand<'_, impl extensions::ShellExtensions>,
-) -> Result<(), error::Error> {
-    // Set BASH_COMMAND before invoking the DEBUG trap (and generally before
-    // executing commands).
-    let full_cmd = cmd.args.iter().map(|arg| arg.to_string()).join(" ");
-    cmd.shell.env_mut().update_or_add(
-        "BASH_COMMAND",
-        variables::ShellValueLiteral::Scalar(full_cmd),
-        |_| Ok(()),
-        env::EnvironmentLookup::Anywhere,
-        env::EnvironmentScope::Global,
-    )?;
-
-    // Fire the DEBUG trap if one is registered.
-    if cmd.shell.traps().handles(traps::TrapSignal::Debug) {
-        let _ = cmd
-            .shell
-            .invoke_trap_handler(traps::TrapSignal::Debug, &cmd.params)
-            .await?;
-    }
-
-    Ok(())
-}
-
 /// Represents a simple command to be executed.
 pub struct SimpleCommand<'a, SE: extensions::ShellExtensions> {
     /// The shell to run the command in.
@@ -316,6 +305,11 @@ pub struct SimpleCommand<'a, SE: extensions::ShellExtensions> {
     /// process.
     #[allow(clippy::type_complexity)]
     pub post_execute: Option<fn(&mut Shell<SE>) -> Result<(), error::Error>>,
+
+    /// Whether the command's last argument becomes `$_` once it runs: not for a pipeline stage's
+    /// own command, which bash runs in the stage's process as it exits (see
+    /// [`Shell::stage_command`]).
+    pub(crate) record_last_arg: bool,
 }
 
 impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
@@ -346,6 +340,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             process_group_id: None,
             argv0: None,
             post_execute: None,
+            record_last_arg: true,
         }
     }
 
@@ -359,6 +354,12 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         reason = "these unwrap calls should not panic"
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
+        // A program's path (`/bin/cat`) runs the builtin that stands for it, under its own name.
+        let named_by_path = sys::fs::contains_path_separator(&self.command_name);
+        if named_by_path && let Some(name) = self.shell.program_builtin(&self.command_name) {
+            self.command_name = name.to_owned();
+        }
+
         // First see if it's the name of a builtin.
         let builtin = self.shell.builtins().get(&self.command_name).cloned();
 
@@ -388,6 +389,20 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // then invoke it.
         if let Some(builtin) = builtin {
             if !builtin.disabled {
+                // A program run by name is hashed at its file, as bash hashes a command it finds
+                // on `PATH`.
+                if !named_by_path
+                    && self.shell.options().remember_command_locations
+                    && self
+                        .shell
+                        .program_location_cache()
+                        .get(&self.command_name)
+                        .is_none()
+                    && let Some(path) = self.shell.program_file(&self.command_name)
+                {
+                    let name = self.command_name.clone();
+                    self.shell.program_location_cache_mut().set(name, path);
+                }
                 return self.execute_via_builtin(builtin).await;
             }
         }
@@ -408,11 +423,42 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             } else {
                 // Bash updates $_ even when the command is not found, so mirror
                 // that here before reporting the error.
-                let last_arg = Self::take_last_arg(&self.args);
-                self.shell.update_last_arg_variable(last_arg);
+                if self.record_last_arg {
+                    let last_arg = Self::take_last_arg(&self.args);
+                    self.shell.update_last_arg_variable(last_arg);
+                }
 
                 if let Some(post_execute) = self.post_execute {
                     let _ = post_execute(&mut self.shell);
+                }
+
+                // Bash hands a command it cannot find to `command_not_found_handle`, when one is
+                // defined, run in a subshell with the command and its arguments; its status is
+                // the command's.
+                if let Some(handler) = self.shell.funcs().get(NOT_FOUND_HANDLER).cloned() {
+                    let mut subshell = self.shell.clone();
+                    // The handler does not handle the commands it cannot find itself.
+                    subshell.undefine_func(NOT_FOUND_HANDLER);
+                    let context = ExecutionContext {
+                        shell: &mut subshell,
+                        command_name: NOT_FOUND_HANDLER.to_owned(),
+                        params: self.params,
+                    };
+                    let status = match invoke_shell_function(handler, context, &self.args).await {
+                        Ok(spawned) => match spawned.wait().await? {
+                            crate::results::ExecutionWaitResult::Completed(result) => {
+                                result.exit_code
+                            }
+                            crate::results::ExecutionWaitResult::Stopped(..) => {
+                                ExecutionResult::stopped().exit_code
+                            }
+                        },
+                        Err(error) => {
+                            let _ = subshell.display_error(&mut subshell.stderr(), &error);
+                            error.into_result(&subshell).exit_code
+                        }
+                    };
+                    return Ok(ExecutionResult::from(status).into());
                 }
 
                 Err(ErrorKind::CommandNotFound(self.command_name).into())
@@ -427,6 +473,14 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     /// command, suitable for recording into `$_`.
     fn take_last_arg(args: &[CommandArg]) -> Option<String> {
         args.last().map(ToString::to_string)
+    }
+
+    /// The last argument of a command that has run, moved out of its arguments for `$_`.
+    fn into_last_arg(mut args: Vec<CommandArg>) -> Option<String> {
+        args.pop().map(|arg| match arg {
+            CommandArg::String(arg) => arg,
+            arg @ CommandArg::Assignment(_) => arg.to_string(),
+        })
     }
 
     async fn execute_via_builtin(
@@ -472,7 +526,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         command_name: String,
         args: Vec<CommandArg>,
     ) -> ExecutionSpawnResult {
-        let last_arg = Self::take_last_arg(&args);
+        // The stage's shell ends with the builtin, recording no `$_` (see
+        // [`Shell::stage_command`]).
         let join_handle = tokio::task::spawn_blocking(move || {
             let cmd_context = ExecutionContext {
                 shell: &mut shell,
@@ -481,12 +536,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             };
 
             let rt = tokio::runtime::Handle::current();
-            let result = rt.block_on(execute_builtin_command(&builtin, cmd_context, args));
-
-            // Update $_ after command execution.
-            shell.update_last_arg_variable(last_arg);
-
-            result
+            rt.block_on(execute_builtin_command(&builtin, cmd_context, args))
         });
 
         ExecutionSpawnResult::StartedTask(join_handle)
@@ -500,7 +550,8 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         command_name: String,
         args: Vec<CommandArg>,
     ) -> Result<ExecutionSpawnResult, error::Error> {
-        let last_arg = Self::take_last_arg(&args);
+        // The stage's shell ends with the builtin, recording no `$_` (see
+        // [`Shell::stage_command`]).
         let cmd_context = ExecutionContext {
             shell: &mut shell,
             command_name,
@@ -508,10 +559,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         };
 
         let result = execute_builtin_command(&builtin, cmd_context, args).await;
-
-        // Update $_ after command execution (mirrors the native path, which does this regardless of
-        // the builtin's success).
-        shell.update_last_arg_variable(last_arg);
 
         // Propagate errors the same way the native `StartedTask` does: the error surfaces when the
         // pipeline waits on this stage, not swallowed into a `Completed` result.
@@ -523,7 +570,10 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         builtin: builtins::Registration<SE>,
     ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
-        let last_arg = Self::take_last_arg(&self.args);
+        // The builtin takes its arguments, so `$_` gets its own copy of the last.
+        let last_arg = self
+            .record_last_arg
+            .then(|| Self::take_last_arg(&self.args));
         #[cfg(any(target_arch = "wasm32", test))]
         let mut cleanup = crate::shell::FrameGuard::new(
             &mut shell,
@@ -544,7 +594,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         let result = execute_builtin_command(&builtin, cmd_context, self.args).await;
 
         // Update $_ after command execution.
-        shell.update_last_arg_variable(last_arg);
+        if let Some(last_arg) = last_arg {
+            shell.update_last_arg_variable(last_arg);
+        }
 
         #[cfg(not(any(target_arch = "wasm32", test)))]
         if let Some(post_execute) = self.post_execute {
@@ -561,7 +613,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         func_registration: functions::Registration,
     ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
-        let last_arg = Self::take_last_arg(&self.args);
         #[cfg(any(target_arch = "wasm32", test))]
         let mut cleanup = crate::shell::FrameGuard::new(
             &mut shell,
@@ -585,8 +636,11 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // $_ is reset *after* the function body runs, to the last argument of
         // the invocation (or the function name itself if zero args). Any
         // mutations made inside the body are overwritten — this matches bash,
-        // where the caller observes only the invocation's last argument.
-        shell.update_last_arg_variable(last_arg);
+        // where the caller observes only the invocation's last argument. It
+        // takes that argument, which the call no longer needs.
+        if self.record_last_arg {
+            shell.update_last_arg_variable(Self::into_last_arg(self.args));
+        }
 
         #[cfg(not(any(target_arch = "wasm32", test)))]
         if let Some(post_execute) = self.post_execute {
@@ -598,7 +652,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 
     fn execute_via_external(self, path: &Path) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
-        let last_arg = Self::take_last_arg(&self.args);
 
         let cmd_context = ExecutionContext {
             shell: &mut shell,
@@ -615,8 +668,11 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             &self.args[1..],
         );
 
-        // Update $_ after command execution.
-        shell.update_last_arg_variable(last_arg);
+        // Update $_ after command execution, with the last argument, which the process has
+        // been given.
+        if self.record_last_arg {
+            shell.update_last_arg_variable(Self::into_last_arg(self.args));
+        }
 
         if let Some(post_execute) = self.post_execute {
             let _ = post_execute(&mut shell);
@@ -722,6 +778,11 @@ pub(crate) fn execute_external_command(
                 sys::terminal::move_self_to_foreground()?;
             }
 
+            #[cfg(target_arch = "wasm32")]
+            if spawn_err.kind() == std::io::ErrorKind::Unsupported {
+                return Err(unexecutable(context.shell, context.command_name));
+            }
+
             if spawn_err.kind() == std::io::ErrorKind::NotFound {
                 if !context.shell.working_dir().exists() {
                     Err(
@@ -741,6 +802,24 @@ pub(crate) fn execute_external_command(
     }
 }
 
+/// Why command `name` cannot run on WASI, which cannot start processes: a path that names
+/// nothing or a directory fails as `execve` fails on it; a file is refused.
+#[cfg(target_arch = "wasm32")]
+fn unexecutable(shell: &Shell<impl extensions::ShellExtensions>, name: String) -> error::Error {
+    if !name.contains('/') {
+        return error::ErrorKind::ExecutingFilesUnsupported(name).into();
+    }
+    let path = shell.absolute_path(std::path::Path::new(&name));
+    match std::fs::metadata(&path) {
+        Err(_) => error::ErrorKind::CannotExecutePath(name, error::NO_SUCH_FILE),
+        Ok(metadata) if metadata.is_dir() => {
+            error::ErrorKind::CannotExecutePath(name, "Is a directory")
+        }
+        Ok(_) => error::ErrorKind::ExecutingFilesUnsupported(name),
+    }
+    .into()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     builtin: &builtins::Registration<SE>,
@@ -749,6 +828,8 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
 ) -> Result<ExecutionResult, error::Error> {
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
+    let interactive = context.shell.options().interactive;
+    let command_name = context.command_name.clone();
     #[cfg(target_arch = "wasm32")]
     let services = context.shell.execution_services();
 
@@ -760,7 +841,12 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     (services.yield_now)().await;
 
     match result {
-        Ok(result) => Ok(result),
+        Ok(mut result) => {
+            if mark_errors_fatal && !interactive && special_builtin_failed(&command_name, &result) {
+                result.next_control_flow = crate::results::ExecutionControlFlow::ExitShell;
+            }
+            Ok(result)
+        }
         Err(e) => {
             // Broken pipe errors should silently return the appropriate exit code
             if let Some(io_err) = e.as_io_error() {
@@ -807,6 +893,9 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
         if let Some(outcome) = deliver_pending_traps(shell, &params, triggering_status).await? {
             return Ok(outcome);
         }
+        // A program is a child of the shell that ran it. Its CHLD trap runs once the command
+        // is done, with its redirections undone, as in bash.
+        process::child_exited();
         result
     } else {
         process::apply_trap_dispositions(context.shell.traps());
@@ -849,9 +938,12 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
         {
             if process::pipe_disposition() != PipeDisposition::Default {
                 let mut stderr = params.stderr(shell);
+                let prefix = shell.diagnostic_prefix();
                 let diagnostic = stderr
                     .async_io()
-                    .write_all(format!("{command_name}: write error: Broken pipe\n").as_bytes())
+                    .write_all(
+                        format!("{prefix}{command_name}: write error: Broken pipe\n").as_bytes(),
+                    )
                     .await;
                 if let Err(error) = diagnostic {
                     if error.kind() != std::io::ErrorKind::BrokenPipe {
@@ -885,6 +977,13 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
             return Ok(outcome);
         }
     }
+    if mark_errors_fatal
+        && !shell.options().interactive
+        && let Ok(result) = &mut result
+        && special_builtin_failed(&command_name, result)
+    {
+        result.next_control_flow = crate::results::ExecutionControlFlow::ExitShell;
+    }
     result.map_err(|error| {
         if mark_errors_fatal {
             error.into_fatal()
@@ -894,16 +993,45 @@ async fn execute_wasm_builtin<SE: extensions::ShellExtensions>(
     })
 }
 
+/// Whether a special builtin failed in a way that ends a non-interactive POSIX-mode shell, as in
+/// bash: a usage error, an invalid name or a readonly variable, but not an operational failure
+/// (`shift` past the end, `trap` of an unknown signal).
+fn special_builtin_failed(name: &str, result: &ExecutionResult) -> bool {
+    let status = u8::from(result.exit_code);
+    if status == 0
+        || !matches!(
+            result.next_control_flow,
+            crate::results::ExecutionControlFlow::Normal
+        )
+    {
+        return false;
+    }
+    match name {
+        "set" | "unset" | "export" | "readonly" | "times" => true,
+        // `return` outside a function, and `exit` with a status that is not a number.
+        "shift" | "trap" | "return" | "exit" => status == 2,
+        _ => false,
+    }
+}
+
 /// Runs handlers for caught signals that arrived while the current command ran. Returns the
-/// handler's result when it changes control flow (for example `exit`).
+/// handler's result when it changes control flow (for example `exit`). A signal whose own
+/// handler is running waits for it to return.
 #[cfg(target_arch = "wasm32")]
-async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
+pub(crate) async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
     shell: &mut Shell<SE>,
     params: &ExecutionParameters,
     triggering_status: u8,
 ) -> Result<Option<ExecutionResult>, error::Error> {
     use crate::execution::process::{self, signals};
-    while let Some(signal_number) = process::take_pending_trap() {
+    loop {
+        let busy = |signal: u8| {
+            crate::traps::TrapSignal::try_from(i32::from(signal))
+                .is_ok_and(|signal| shell.call_stack().is_trap_signal_active(signal))
+        };
+        let Some(signal_number) = process::take_pending_trap(busy) else {
+            break;
+        };
         shell.set_last_exit_status(triggering_status);
         let _handling = (signal_number == signals::PIPE).then(process::handling_pipe);
         let signal: crate::traps::TrapSignal = i32::from(signal_number).try_into()?;
@@ -916,17 +1044,31 @@ async fn deliver_pending_traps<SE: extensions::ShellExtensions>(
     Ok(None)
 }
 
+/// The function bash runs for a command it cannot find.
+const NOT_FOUND_HANDLER: &str = "command_not_found_handle";
+
 pub(crate) async fn invoke_shell_function(
     function: functions::Registration,
     mut context: ExecutionContext<'_, impl extensions::ShellExtensions>,
     args: &[CommandArg],
 ) -> Result<ExecutionSpawnResult, error::Error> {
     let ast::FunctionBody(body, redirects) = &function.definition().body;
+    // A call bash would have run without forking runs the body's last command that way.
+    let no_fork_call = std::mem::take(&mut context.shell.no_fork_call);
 
-    // Apply any redirects specified at function definition-time.
+    // Apply any redirects specified at function definition-time. Bash names the line the body
+    // starts on when one fails.
     if let Some(redirects) = redirects {
+        let position = context.shell.current_position();
+        context
+            .shell
+            .set_current_position(ast::SourceLocation::location(body).map(|span| span.start));
         for redirect in &redirects.0 {
             interp::setup_redirect(context.shell, &mut context.params, redirect).await?;
+        }
+        context.shell.set_current_position(position);
+        if redirects.0.iter().any(interp::redirects_stdin) {
+            context.params.stdin_redirected = true;
         }
     }
 
@@ -945,19 +1087,79 @@ pub(crate) async fn invoke_shell_function(
     // so the parameters are passed through by shared reference rather than cloned. This prevents
     // direct mutation of the caller's `ExecutionParameters` open-file table, though the function
     // may still change the shell's persistent open files via builtins (e.g. `exec`).
+    // `break` in a function body does not reach the caller's loops.
+    let caller_loop_depth = std::mem::take(&mut context.shell.loop_depth);
+    // Unless functions inherit it (`set -T`), the caller's RETURN trap is put aside while the
+    // function runs, as in bash, and comes back when it returns if the function set none.
+    let return_trap = if context
+        .shell
+        .options()
+        .shell_functions_inherit_debug_and_return_traps
+    {
+        None
+    } else {
+        let saved = context
+            .shell
+            .traps()
+            .get_handler(traps::TrapSignal::Return)
+            .cloned();
+        if saved.is_some() {
+            context
+                .shell
+                .traps_mut()
+                .remove_handlers(traps::TrapSignal::Return);
+        }
+        saved
+    };
+    // `local -` in the body saves the options, which come back when it returns.
+    let option_saves = context.shell.local_option_saves.len();
+    // The body expands the aliases in effect where the function was defined.
+    let caller_aliases = context.shell.alias_scope.replace(function.aliases());
+    let outer_no_fork = context.shell.no_fork;
+    if no_fork_call {
+        context.shell.no_fork = interp::NoFork::for_function(body);
+    }
     #[cfg(any(target_arch = "wasm32", test))]
     let result = {
         let mut frame = crate::shell::FrameGuard::new(context.shell, Shell::leave_function, None);
-        let result = body.execute(frame.shell(), &context.params).await;
+        let result = match debug_trap_on_entry(frame.shell(), &context.params).await {
+            Ok(()) => body.execute(frame.shell(), &context.params).await,
+            Err(error) => Err(error),
+        };
+        let result = report_in_function(frame.shell(), &context.params, result);
         frame.finish()?;
         result
     };
     #[cfg(not(any(target_arch = "wasm32", test)))]
     let result = {
-        let result = body.execute(context.shell, &context.params).await;
+        let result = match debug_trap_on_entry(context.shell, &context.params).await {
+            Ok(()) => body.execute(context.shell, &context.params).await,
+            Err(error) => Err(error),
+        };
+        let result = report_in_function(context.shell, &context.params, result);
         context.shell.leave_function()?;
         result
     };
+    context.shell.no_fork = outer_no_fork;
+    context.shell.alias_scope = caller_aliases;
+    context.shell.loop_depth = caller_loop_depth;
+    context.shell.restore_local_options(option_saves);
+
+    // The RETURN trap runs as the function returns when the function set it (or, with
+    // functrace, inherited it), as in bash.
+    if context.shell.traps().handles(traps::TrapSignal::Return) {
+        let _ = context.shell.run_return_trap(&context.params).await;
+    }
+    if let Some(saved) = return_trap
+        && !context.shell.traps().handles(traps::TrapSignal::Return)
+    {
+        context.shell.traps_mut().register_handler(
+            traps::TrapSignal::Return,
+            saved.command,
+            saved.source_info,
+        );
+    }
+    context.shell.status_before_return = None;
 
     // Get the actual execution result from the body of the function.
     let mut result = result?;
@@ -977,15 +1179,36 @@ pub(crate) async fn invoke_shell_function(
     Ok(result.into())
 }
 
+/// Reports an error that leaves a function body while the body's line is still current, as bash
+/// reports it where it happens (an arithmetic error in `$(( ))` abandons the whole command, but
+/// names the body's line, not the call's).
+fn report_in_function(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    result: Result<ExecutionResult, error::Error>,
+) -> Result<ExecutionResult, error::Error> {
+    match result {
+        Err(error) if !error.is_reported() => {
+            let _ = shell.display_error(&mut params.stderr(shell), &error);
+            Err(error.into_reported())
+        }
+        result => result,
+    }
+}
+
 pub(crate) async fn invoke_command_in_subshell_and_get_output(
     shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
     s: String,
+    backquoted: bool,
 ) -> Result<String, error::Error> {
     // Instantiate a subshell to run the command in.
     let mut subshell = shell.clone();
     #[cfg(target_arch = "wasm32")]
     subshell.traps_mut().reset_pipe_for_subshell();
+    // It runs only an EXIT trap it sets itself, when it ends.
+    #[cfg(target_arch = "wasm32")]
+    subshell.traps_mut().reset_exit_for_subshell();
 
     // Command substitutions don't inherit errexit by default. Only inherit it when
     // command_subst_inherits_errexit is enabled, otherwise disable errexit in the subshell.
@@ -1006,17 +1229,55 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
         let (mut reader, writer) = openfiles::open_mem_pipe();
         params.set_fd(OpenFiles::STDOUT_FD, writer);
 
-        let mut output_str = String::new();
-        let (cmd_result, output_result) = futures::join!(
-            crate::execution::process::run_process(
-                subshell.traps().pipe_disposition(),
-                run_substitution_command(subshell, params, s)
-            ),
-            futures::io::AsyncReadExt::read_to_string(reader.async_io(), &mut output_str)
-        );
-        output_result?;
-        shell.set_last_exit_status(cmd_result?.exit_code.into());
-        Ok(output_str)
+        // It is a process of its own, with its own `$BASHPID`.
+        let numbered = interp::subshell_process(&mut subshell);
+        // The substitution's output ends when the subshell, its EXIT trap and every job still
+        // holding its output are done.
+        let command = async move {
+            let completed = std::cell::Cell::new(false);
+            let result = numbered
+                .run(async {
+                    let result =
+                        run_wasm_substitution_command(&mut subshell, &mut params, s, backquoted)
+                            .await;
+                    let result = subshell.exit_with_trap_in(result, &params).await;
+                    completed.set(true);
+                    result
+                })
+                .await;
+            if !completed.get() {
+                subshell.exit_trap_after_signal(&result, &params).await;
+            }
+            result
+        };
+        // At most `MAX_SUBSTITUTION_BYTES` are kept; past that the reader closes, so the
+        // substitution's writers get SIGPIPE, and the substitution fails.
+        let read = async move {
+            use futures::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let count = reader.async_io().read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>((output, false));
+                }
+                if output.len() + count > openfiles::MAX_SUBSTITUTION_BYTES {
+                    drop(reader);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+        };
+        let (cmd_result, output_result) = futures::join!(command, read);
+        let (output, truncated) = output_result?;
+        let status = cmd_result?.exit_code.into();
+        if truncated {
+            shell.set_last_exit_status(1);
+            return Err(error::ErrorKind::SubstitutionTooLarge.into());
+        }
+        shell.set_last_exit_status(status);
+        // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`).
+        Ok(crate::rawbytes::decode_vec(output))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1027,7 +1288,8 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
         let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
 
-        let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
+        let cmd_join_handle =
+            tokio::spawn(run_substitution_command(subshell, params, s, backquoted));
 
         let output_str = async_reader.read_to_string().await?;
 
@@ -1045,24 +1307,172 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     }
 }
 
+/// Runs a command string in the shell itself rather than a copy of it, as bash runs a
+/// `${ command; }` substitution, and returns what it wrote to its standard output.
+pub(crate) async fn invoke_command_in_current_shell_and_get_output(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: String,
+) -> Result<String, error::Error> {
+    let mut params = params.clone();
+
+    // The output is kept byte for byte, not required to be UTF-8 (see `rawbytes`). The command
+    // and the read of its output run together, so output larger than the pipe cannot stall it.
+    // As for `$( )`, at most `MAX_SUBSTITUTION_BYTES` are kept; past that the reader closes, and
+    // the substitution fails.
+    #[cfg(target_arch = "wasm32")]
+    let (cmd_result, output) = {
+        let (mut reader, writer) = openfiles::open_mem_pipe();
+        params.set_fd(OpenFiles::STDOUT_FD, writer);
+        let read = async move {
+            use futures::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let count = reader.async_io().read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>((output, false));
+                }
+                if output.len() + count > openfiles::MAX_SUBSTITUTION_BYTES {
+                    drop(reader);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+        };
+        let (cmd_result, output_result) =
+            futures::join!(run_command_string(shell, params, command), read);
+        let (output, truncated) = output_result?;
+        if truncated {
+            shell.set_last_exit_status(1);
+            return Err(error::ErrorKind::SubstitutionTooLarge.into());
+        }
+        (cmd_result, crate::rawbytes::decode_vec(output))
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let (cmd_result, output) = {
+        let (reader, writer) = std::io::pipe()?;
+        params.set_fd(OpenFiles::STDOUT_FD, writer.into());
+        let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
+        let (cmd_result, output) = futures::join!(
+            run_command_string(shell, params, command),
+            async_reader.read_to_string()
+        );
+        (cmd_result, output?)
+    };
+
+    shell.set_last_exit_status(cmd_result?.exit_code.into());
+    Ok(output)
+}
+
+/// Runs a command string in the shell itself, as a `${| command; }` substitution does, and
+/// returns the value it left in `REPLY`, which is local to it.
+pub(crate) async fn invoke_command_in_current_shell_for_reply(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    command: String,
+) -> Result<String, error::Error> {
+    const REPLY: &str = "REPLY";
+    let saved = shell
+        .env()
+        .get(REPLY)
+        .map(|(scope, var)| (scope, var.clone()));
+    shell.env_mut().unset(REPLY)?;
+
+    let result = run_command_string(shell, params.clone(), command).await;
+
+    let value = shell
+        .env_str(REPLY)
+        .map(|v| v.into_owned())
+        .unwrap_or_default();
+    shell.env_mut().unset(REPLY)?;
+    if let Some((scope, var)) = saved {
+        shell.env_mut().add(REPLY, var, scope)?;
+    }
+
+    shell.set_last_exit_status(result?.exit_code.into());
+    Ok(value)
+}
+
+/// Runs a command string with the given parameters, which it owns, so its output closes when it
+/// finishes.
+async fn run_command_string(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: ExecutionParameters,
+    command: String,
+) -> Result<ExecutionResult, error::Error> {
+    let parse_result = shell.parse_string(command.as_str());
+    let source_info = crate::SourceInfo::from("main");
+    shell
+        .run_parsed_result(parse_result, Some(&command), &source_info, &params)
+        .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_wasm_substitution_command(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
+    command: String,
+    backquoted: bool,
+) -> Result<ExecutionResult, error::Error> {
+    run_substitution_command_in(shell, params, command, backquoted).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn run_substitution_command(
     mut shell: Shell<impl extensions::ShellExtensions>,
     mut params: ExecutionParameters,
     command: String,
+    backquoted: bool,
 ) -> Result<ExecutionResult, error::Error> {
-    // Parse the string into a whole shell program.
-    let parse_result = shell.parse_string(command);
+    run_substitution_command_in(&mut shell, &mut params, command, backquoted).await
+}
+
+async fn run_substitution_command_in(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &mut ExecutionParameters,
+    command: String,
+    backquoted: bool,
+) -> Result<ExecutionResult, error::Error> {
+    // Parse the string into a whole shell program. Bash runs a `$( )` from its command printed
+    // back (see `brush_parser::print_comsub`), so its lines are numbered as that text has them;
+    // backquotes run as written.
+    let command = if backquoted {
+        command
+    } else {
+        brush_parser::reprint_comsub_text(&command, &shell.parser_options()).unwrap_or(command)
+    };
+    let parse_result = shell.parse_string(command.as_str());
+
+    // A command that does not parse (a prompt's, or one in backquotes, read only as it runs) is
+    // reported as bash reports a substitution's: from `command substitution`, its lines numbered
+    // on from the command it is part of.
+    if let Err(error) = &parse_result {
+        let lines = brush_parser::bash_diagnostic(error, &command, &shell.parser_options());
+        let error = error::Error::from(error::ErrorKind::SyntaxError {
+            origin: "command substitution".to_owned(),
+            lines: error::shift_diagnostic_lines(lines, shell.line_number().saturating_sub(1)),
+        });
+        let _ = shell.display_error(&mut params.stderr(shell), &error);
+        return Ok(ExecutionResult::new(2));
+    }
 
     // Check for a command that is only an input redirection ("< file").
     // If detected, emulate `cat file` to stdout and return immediately.
     // If we failed to parse, then we'll fall below and handle it there.
     if let Ok(program) = &parse_result {
         if let Some(redir) = try_unwrap_bare_input_redir_program(program) {
-            interp::setup_redirect(&mut shell, &mut params, redir).await?;
+            // A file that cannot be read is reported and fails the substitution (status 1), as
+            // in bash; it does not end the command using the substitution.
+            if let Err(error) = interp::setup_redirect(shell, params, redir).await {
+                let _ = shell.display_error(&mut params.stderr(shell), &error);
+                return Ok(ExecutionResult::general_error());
+            }
             #[cfg(target_arch = "wasm32")]
-            futures::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell)).await?;
+            futures::io::copy(&mut params.stdin(shell), &mut params.stdout(shell)).await?;
             #[cfg(not(target_arch = "wasm32"))]
-            std::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell))?;
+            std::io::copy(&mut params.stdin(shell), &mut params.stdout(shell))?;
             return Ok(ExecutionResult::new(0));
         }
     }
@@ -1070,10 +1480,49 @@ async fn run_substitution_command(
     // TODO(source-info): review this
     let source_info = crate::SourceInfo::from("main");
 
+    // The substitution's lines are numbered on from the command it is part of.
+    shell.begin_nested_code();
+
+    // `set -v` echoes the here-documents of a `$( )` each time it runs, as bash reads them
+    // again from the command printed back.
+    if !backquoted && shell.options().print_shell_input_lines {
+        use std::io::Write as _;
+        let lines: Vec<&str> = command.lines().collect();
+        let mut stderr = params.stderr(shell);
+        for (first, last) in interp::here_document_lines(&command) {
+            for line in lines.get(first - 1..last).unwrap_or_default() {
+                let _ = writeln!(stderr, "{line}");
+            }
+        }
+    }
+
+    // Its last command may run in place of the substitution's process, as bash's does.
+    shell.exec_last = Some(if backquoted {
+        interp::CommandString::Backquoted
+    } else {
+        interp::CommandString::Substitution
+    });
+
     // Handle the parse result using default shell behavior.
-    shell
-        .run_parsed_result(parse_result, &source_info, &params)
-        .await
+    let result = shell
+        .run_parsed_result(parse_result, Some(&command), &source_info, params)
+        .await;
+    shell.exec_last = None;
+    result
+}
+
+/// Runs the DEBUG trap as a function starts, as bash does when the function inherits it
+/// (`set -T`): `BASH_COMMAND` still names the command that called it.
+async fn debug_trap_on_entry(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+) -> Result<(), error::Error> {
+    if shell.traps().handles(traps::TrapSignal::Debug) {
+        shell
+            .invoke_trap_handler(traps::TrapSignal::Debug, params)
+            .await?;
+    }
+    Ok(())
 }
 
 // Detects a subshell command that consists solely of a single input redirection

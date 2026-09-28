@@ -20,6 +20,16 @@ impl<SE: extensions::ShellExtensions, S: shell_builder::IsComplete> ShellBuilder
         let profile = std::mem::take(&mut options.profile);
         let rc = std::mem::take(&mut options.rc);
 
+        // A word printed back writes `$'...'` as the text it stands for, as bash does.
+        brush_parser::ast::set_ansi_c_decoder(|text| {
+            let (bytes, _) = crate::escape::expand_backslash_escapes(
+                text,
+                crate::escape::EscapeExpansionMode::AnsiCQuotes,
+            )
+            .ok()?;
+            String::from_utf8(bytes).ok()
+        });
+
         // Construct the shell.
         let mut shell = Shell::new(options)?;
 
@@ -251,13 +261,27 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             funcs: functions::FunctionEnv::default(),
             options: options::RuntimeOptions::default(),
             jobs: jobs::JobManager::default(),
-            aliases: HashMap::default(),
+            aliases: std::sync::Arc::default(),
             last_exit_status: 0,
             last_exit_status_change_count: 0,
-            last_pipeline_statuses: vec![0],
+            last_pipeline_statuses: vec![],
             depth: 0,
+            subshell_level: 0,
+            process_depth: 0,
+            trace_level: 0,
+            exit_trace_level: 0,
+            pending_input: None,
+            debug_trap_ran: false,
+            stage_command: false,
+            prompt_guard: None,
+            paren_subshell: false,
+            stage_subshell: false,
+            no_fork: crate::interp::NoFork::default(),
+            exec_last: None,
+            nameref_warnings: None,
+            no_fork_call: false,
             name: None,
-            args: vec![],
+            args: std::sync::Arc::default(),
             version: None,
             product_display_str: None,
             call_stack: callstack::CallStack::new(),
@@ -267,11 +291,22 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             program_location_cache: pathcache::PathCache::default(),
             last_stopwatch_time: std::time::SystemTime::now(),
             last_stopwatch_offset: 0,
+            loop_depth: 0,
+            nesting: 0,
+            programs: std::sync::Arc::default(),
+            command_unit: None,
+            alias_units: HashMap::new(),
+            programs_started: 0,
+            alias_scope: None,
+            status_before_return: None,
+            local_option_saves: Vec::new(),
             parser_impl: crate::parser::ParserImpl::default(),
             key_bindings: None,
             history: None,
             processes: crate::process_table::ProcessTable::default(),
             own_pid: None,
+            started_pid: None,
+            last_background_pid: None,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
         }

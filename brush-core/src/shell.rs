@@ -47,6 +47,8 @@ mod traps;
 pub use builder::{CreateOptions, ShellBuilder, ShellBuilderState};
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) use callstack::FrameGuard;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use callstack::{MAX_NESTING, STACK_RESERVE};
 pub use initscripts::{ProfileLoadBehavior, RcLoadBehavior};
 pub use state::ShellState;
 
@@ -89,8 +91,8 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     jobs: jobs::JobManager,
 
-    /// Shell aliases.
-    aliases: HashMap<String, String>,
+    /// Shell aliases, shared with the shell's clones until one of them changes them.
+    aliases: std::sync::Arc<HashMap<String, String>>,
 
     /// The status of the last completed command.
     last_exit_status: u8,
@@ -106,11 +108,87 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Clone depth from the original ancestor shell.
     depth: usize,
 
+    /// `BASH_SUBSHELL`: how many subshells this one is nested in. A simple command run as a
+    /// pipeline stage does not count, and a new shell process (`bash -c`) starts at 0, as in bash.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) subshell_level: usize,
+
+    /// The clone depth of the shell process this one belongs to (see
+    /// [`Self::start_command_string_mode`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) process_depth: usize,
+
+    /// How many more times xtrace repeats PS4's first character: one for each `eval`, command or
+    /// process substitution and trap handler the command runs in, as bash counts its nested
+    /// parsers. Subshells and pipeline stages do not add one.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) trace_level: usize,
+
+    /// The trace level the EXIT trap runs at: one more than where this subshell started, or none
+    /// for the shell process itself.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) exit_trace_level: usize,
+
+    /// Whether the shell that started this pipeline stage already ran its simple command's DEBUG
+    /// trap, as bash does before it forks the stage.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) debug_trap_ran: bool,
+
+    /// Whether this shell is a pipeline stage whose command is a simple command it has yet to
+    /// run. Bash runs that command in the stage's process and exits without recording its last
+    /// argument in `$_`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) stage_command: bool,
+
+    /// Checks the text a prompt string (`PS4`, `${x@P}`) expands before any of its expansions
+    /// run (see [`Self::set_prompt_guard`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    prompt_guard: Option<PromptGuard>,
+
+    /// The text of the program about to run as read input (a command string, `eval`'d text or a
+    /// sourced file), which `set -v` echoes line by line as the program reaches it. The program
+    /// takes it when it starts, so command substitutions inside it echo nothing of their own.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) pending_input: Option<std::sync::Arc<str>>,
+
+    /// Bash's `SUBSHELL_PAREN`: this shell is a `( list )` subshell, and not a pipeline stage or
+    /// background command started inside one. `exec` there leaves `SHLVL` as it is.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) paren_subshell: bool,
+
+    /// Bash's `SUBSHELL_PIPE`: this shell is a pipeline stage, and not a `( list )` subshell or
+    /// background command started inside one. A command substitution there runs its last command
+    /// in a process of its own, so `SHLVL` stays as it is.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) stage_subshell: bool,
+
+    /// The simple command bash would run without forking, as `exec` does (see
+    /// [`crate::interp::NoFork`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) no_fork: crate::interp::NoFork,
+
+    /// Whether the next program is a command string whose last command bash runs without
+    /// forking (see [`Self::exec_last_command`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) exec_last: Option<crate::interp::CommandString>,
+
+    /// The warnings a circular name reference gets from an arithmetic expression being evaluated
+    /// (see [`Self::note_circular_nameref`]), held until the expression is done; `None` when no
+    /// evaluation collects them.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) nameref_warnings: Option<String>,
+
+    /// Whether the function about to be called runs its last command without forking, as the
+    /// call itself would have been (see [`crate::interp::NoFork`]).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) no_fork_call: bool,
+
     /// Shell name
     name: Option<String>,
 
-    /// Positional shell arguments (not including shell name).
-    args: Vec<String>,
+    /// Positional shell arguments (not including shell name), shared with the shell's clones
+    /// until one of them changes them.
+    args: std::sync::Arc<Vec<String>>,
 
     /// Shell version
     version: Option<String>,
@@ -140,6 +218,48 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Last "SECONDS" offset requested.
     last_stopwatch_offset: u32,
 
+    /// How many loops enclose the command running now. `break` and `continue` outside any loop
+    /// are diagnosed rather than obeyed. A function body and a `( ... )` subshell start at 0; a
+    /// command substitution and `eval` see their caller's loops, as in bash.
+    pub(crate) loop_depth: usize,
+
+    /// How many lists (function bodies, compound commands, substitutions, `eval`, `source`)
+    /// enclose the command running now. On WASM, nesting deeper than the stack can hold is
+    /// refused (see `interp`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) nesting: usize,
+
+    /// Builtins that stand for programs a Linux system has as files in `/bin` and `/usr/bin`
+    /// (see `builtin_registry`): the embedder runs such a program in-process.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    programs: std::sync::Arc<HashMap<String, builtins::ProgramKind>>,
+
+    /// The top-level command running now, as (program, index): an alias defined while it runs
+    /// is not expanded until a later one, as bash reads a whole command before running any of it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    command_unit: Option<(u64, usize)>,
+
+    /// The top-level command each alias was defined in (see `command_unit`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    alias_units: HashMap<String, (u64, usize)>,
+
+    /// How many programs this shell has begun running; numbers `command_unit`s.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    programs_started: u64,
+
+    /// While a function body runs, the aliases in effect where the function was defined: bash
+    /// expands aliases as it reads the definition, not as the body runs.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) alias_scope: Option<std::sync::Arc<HashMap<String, String>>>,
+
+    /// The status before a `return` ran, which the RETURN trap sees as `$?`, as in bash.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) status_before_return: Option<u8>,
+
+    /// `set -o` options saved by `local -`, restored when the saving function returns.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) local_option_saves: Vec<Vec<(&'static str, bool)>>,
+
     /// Parser implementation to use.
     #[cfg_attr(feature = "serde", serde(skip))]
     parser_impl: crate::parser::ParserImpl,
@@ -159,6 +279,14 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     own_pid: Option<crate::process_table::Pid>,
 
+    /// `$$` of a shell started as a new process (`bash -c`); `None` keeps the session's.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    started_pid: Option<crate::process_table::Pid>,
+
+    /// `$!`: the number of the last background job's last process, kept by subshells.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    last_background_pid: Option<crate::sys::process::ProcessId>,
+
     /// Registered processes for the stages of this background job's pipeline, in stage order.
     #[cfg(target_arch = "wasm32")]
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -167,7 +295,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
-        Self {
+        let shell = Self {
             execution_services: self.execution_services,
             error_formatter: self.error_formatter.clone(),
             traps: self.traps.clone(),
@@ -176,7 +304,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             env: self.env.clone(),
             funcs: self.funcs.clone(),
             options: self.options.clone(),
-            jobs: jobs::JobManager::new(),
+            jobs: self.jobs.listing_copy(),
             aliases: self.aliases.clone(),
             last_exit_status: self.last_exit_status,
             last_exit_status_change_count: self.last_exit_status_change_count,
@@ -199,15 +327,45 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             program_location_cache: self.program_location_cache.clone(),
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
+            loop_depth: self.loop_depth,
+            nesting: self.nesting,
+            programs: self.programs.clone(),
+            command_unit: self.command_unit,
+            alias_units: self.alias_units.clone(),
+            programs_started: self.programs_started,
+            alias_scope: self.alias_scope.clone(),
+            status_before_return: None,
+            local_option_saves: self.local_option_saves.clone(),
             parser_impl: self.parser_impl,
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
             depth: self.depth + 1,
+            subshell_level: self.subshell_level + 1,
+            process_depth: self.process_depth,
+            trace_level: self.trace_level,
+            exit_trace_level: self.trace_level + 1,
+            pending_input: None,
+            debug_trap_ran: false,
+            stage_command: false,
+            prompt_guard: self.prompt_guard,
+            paren_subshell: self.paren_subshell,
+            stage_subshell: self.stage_subshell,
+            no_fork: self.no_fork,
+            exec_last: None,
+            nameref_warnings: None,
+            no_fork_call: false,
             processes: self.processes.clone(),
             own_pid: self.own_pid,
+            started_pid: self.started_pid,
+            last_background_pid: self.last_background_pid,
             #[cfg(target_arch = "wasm32")]
             pending_stage_processes: std::collections::VecDeque::new(),
+        };
+        // A subshell reseeds RANDOM before its first value, as bash does.
+        if let Some((_, random)) = shell.env.get_raw("RANDOM") {
+            random.dynamic_state().enter_subshell();
         }
+        shell
     }
 }
 
@@ -232,6 +390,30 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Marks this shell clone as running as numbered process `pid`.
     pub const fn set_own_pid(&mut self, pid: crate::process_table::Pid) {
         self.own_pid = Some(pid);
+    }
+
+    /// Makes `pid` this shell's `$$`, as for a new shell process (`bash -c`); its subshells keep
+    /// it.
+    pub const fn set_shell_pid(&mut self, pid: crate::process_table::Pid) {
+        self.started_pid = Some(pid);
+    }
+
+    /// `$!`: the number of the last process started in the background, if any. Waiting for or
+    /// disowning the job does not change it.
+    pub const fn last_background_pid(&self) -> Option<crate::sys::process::ProcessId> {
+        self.last_background_pid
+    }
+
+    /// Records the last process started in the background, as `$!`.
+    pub const fn set_last_background_pid(&mut self, pid: crate::sys::process::ProcessId) {
+        self.last_background_pid = Some(pid);
+    }
+
+    /// This shell's `$$`: the session's shell number, or its own if it was started as a new
+    /// shell process.
+    pub fn shell_pid(&self) -> crate::process_table::Pid {
+        self.started_pid
+            .unwrap_or_else(|| self.processes.shell_pid())
     }
 
     /// Hands this background job the registered processes of its pipeline's stages.
@@ -278,7 +460,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
-            args: options.shell_args.unwrap_or_default(),
+            args: std::sync::Arc::new(options.shell_args.unwrap_or_default()),
             version: options.shell_version,
             product_display_str: options.shell_product_display_str,
             working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
@@ -290,10 +472,6 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
         // Add in any open files provided.
         shell.open_files.update_from(options.fds.into_iter());
-
-        // TODO(patterns): Without this a script that sets extglob will fail because we
-        // parse the entire script with the same settings.
-        shell.options.extended_globbing = true;
 
         // If requested, seed parameters from environment.
         if !options.do_not_inherit_env {
@@ -331,10 +509,86 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         self.call_stack.increment_current_line_offset(delta);
     }
 
+    /// Notes the status before `return` runs: the RETURN trap sees it as `$?`, as in bash.
+    pub const fn note_status_before_return(&mut self) {
+        self.status_before_return = Some(self.last_exit_status);
+    }
+
+    /// Runs the RETURN trap as a function or sourced script returns, with `$?` the status before
+    /// any `return` that ended it, as in bash.
+    pub(crate) async fn run_return_trap(
+        &mut self,
+        params: &crate::ExecutionParameters,
+    ) -> Result<(), error::Error> {
+        let status = self
+            .status_before_return
+            .take()
+            .unwrap_or(self.last_exit_status);
+        let saved = self.last_exit_status;
+        self.last_exit_status = status;
+        let result = self
+            .invoke_trap_handler(crate::traps::TrapSignal::Return, params)
+            .await;
+        self.last_exit_status = saved;
+        result.map(|_| ())
+    }
+
+    /// Numbers the code about to run in this frame on from the command running now, as bash
+    /// numbers `eval`'d code and command substitutions: their first line is that command's line.
+    /// Returns the shift, to undo with [`Self::end_nested_code`].
+    pub fn begin_nested_code(&mut self) -> usize {
+        let shift = self
+            .call_stack
+            .current_frame()
+            .and_then(|frame| frame.current.as_ref())
+            .map_or(0, |position| position.line.saturating_sub(1));
+        self.call_stack.increment_current_line_offset(shift);
+        // Bash reads the code with a parser of its own, one xtrace level deeper.
+        self.trace_level += 1;
+        shift
+    }
+
+    /// Undoes [`Self::begin_nested_code`].
+    pub fn end_nested_code(&mut self, shift: usize) {
+        self.call_stack.decrement_current_line_offset(shift);
+        self.trace_level = self.trace_level.saturating_sub(1);
+    }
+
     /// Updates the currently executing command in the shell.
     pub fn set_current_cmd(&mut self, cmd: &impl brush_parser::ast::Node) {
         self.call_stack
             .set_current_pos(cmd.location().map(|span| span.start));
+    }
+
+    /// Shifts the line numbers of the current frame by `delta` (see
+    /// [`crate::callstack::Frame::line_shift`]).
+    pub(crate) fn shift_lines(&mut self, delta: isize) {
+        self.call_stack.shift_lines(delta);
+    }
+
+    /// The position the current command is numbered by (see [`Self::set_current_position`]).
+    pub(crate) fn current_position(&self) -> Option<std::sync::Arc<crate::SourcePosition>> {
+        self.call_stack
+            .current_frame()
+            .and_then(|frame| frame.current.clone())
+    }
+
+    /// Whether this shell is a subshell, a pipeline stage, a substitution or a background job of
+    /// the shell process it belongs to (bash's `subshell_environment`), and not that process
+    /// itself (a `bash -c` child is a process of its own).
+    pub const fn in_subshell_environment(&self) -> bool {
+        self.depth > self.process_depth
+    }
+
+    /// Numbers the current command by `position` (its `LINENO`, and the line its diagnostics
+    /// name), when known.
+    pub(crate) fn set_current_position(
+        &mut self,
+        position: Option<std::sync::Arc<crate::SourcePosition>>,
+    ) {
+        if position.is_some() {
+            self.call_stack.set_current_pos(position);
+        }
     }
 
     /// Updates the `$_` shell variable (last-argument of the previous simple
@@ -417,11 +671,11 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
     /// Returns the keywords that are reserved by the shell.
     pub(crate) fn get_keywords(&self) -> impl IntoIterator<Item = &str> {
-        if self.options.sh_mode {
-            keywords::SH_MODE_KEYWORDS.iter().copied()
-        } else {
-            keywords::KEYWORDS.iter().copied()
-        }
+        // In the order bash lists them.
+        keywords::IN_BASH_ORDER
+            .iter()
+            .copied()
+            .filter(|keyword| self.is_keyword(keyword))
     }
 
     /// Checks if the given string is a keyword reserved in this shell.
@@ -440,7 +694,184 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     pub(crate) const fn last_exit_status_change_count(&self) -> usize {
         self.last_exit_status_change_count
     }
+
+    /// Empties the call stack, for a copy of this shell that stands for a newly started shell
+    /// process (whose line numbers and function names start afresh).
+    pub fn reset_call_stack(&mut self) {
+        self.call_stack = crate::callstack::CallStack::new();
+    }
+
+    /// Sets the check an embedder that validates code before the shell runs it applies to a
+    /// prompt string's text (`PS4`, `${x@P}`), whose command substitutions the shell would run.
+    /// The check sees the text before any of it is expanded; an `Err` holds the complete
+    /// diagnostic to print, and the prompt is then refused: `${x@P}` fails with status 2, and
+    /// `PS4` is used as written.
+    pub const fn set_prompt_guard(&mut self, guard: Option<PromptGuard>) {
+        self.prompt_guard = guard;
+    }
+
+    /// The prompt check an embedder set (see [`Self::set_prompt_guard`]).
+    pub(crate) const fn prompt_guard(&self) -> Option<PromptGuard> {
+        self.prompt_guard
+    }
+
+    /// How many loops enclose the command running now (see the field's documentation).
+    pub const fn loop_depth(&self) -> usize {
+        self.loop_depth
+    }
+
+    /// Defines an alias as the `alias` builtin does: it is not expanded until the next top-level
+    /// command, since bash has already read the rest of the current one.
+    pub fn define_alias(&mut self, name: String, value: String) {
+        match self.command_unit {
+            Some(unit) => self.alias_units.insert(name.clone(), unit),
+            None => self.alias_units.remove(&name),
+        };
+        std::sync::Arc::make_mut(&mut self.aliases).insert(name, value);
+    }
+
+    /// Whether the alias `name` may be expanded in the command running now.
+    pub(crate) fn alias_in_effect(&self, name: &str) -> bool {
+        self.command_unit.is_none() || self.alias_units.get(name) != self.command_unit.as_ref()
+    }
+
+    /// The value alias `name` expands to in the command running now, if it is expanded there:
+    /// in a function body, the aliases where the function was defined; elsewhere, the aliases
+    /// defined before this top-level command, when `expand_aliases` is on.
+    pub(crate) fn alias_for_expansion(&self, name: &str) -> Option<&str> {
+        match &self.alias_scope {
+            Some(scope) => scope.get(name),
+            None if self.options.expand_aliases && self.alias_in_effect(name) => {
+                self.aliases.get(name)
+            }
+            None => None,
+        }
+        .map(String::as_str)
+    }
+
+    /// The aliases a function defined now expands in its body (see `alias_scope`).
+    pub(crate) fn aliases_for_definition(&self) -> std::sync::Arc<HashMap<String, String>> {
+        std::sync::Arc::new(
+            self.aliases
+                .keys()
+                .filter_map(|name| {
+                    self.alias_for_expansion(name)
+                        .map(|value| (name.clone(), value.to_owned()))
+                })
+                .collect(),
+        )
+    }
+
+    /// Marks the start of a program's top-level commands; returns its number and the unit it
+    /// interrupts, to restore with [`Self::end_program`].
+    pub(crate) const fn begin_program(&mut self) -> (u64, Option<(u64, usize)>) {
+        self.programs_started += 1;
+        (self.programs_started, self.command_unit)
+    }
+
+    /// Marks the start of top-level command `index` of program `program`.
+    pub(crate) const fn begin_command_unit(&mut self, program: u64, index: usize) {
+        self.command_unit = Some((program, index));
+    }
+
+    /// Restores the unit a program interrupted.
+    pub(crate) const fn end_program(&mut self, previous: Option<(u64, usize)>) {
+        self.command_unit = previous;
+    }
+
+    /// Saves the `set -o` options, as `local -` does, to restore when the function running now
+    /// returns.
+    pub fn save_options_locally(&mut self) {
+        let saved = crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
+            .iter()
+            .map(|option| (option.name, option.definition.get(&self.options)))
+            .collect();
+        self.local_option_saves.push(saved);
+    }
+
+    /// Restores the options the first `local -` since `mark` saved, and forgets the saves since.
+    pub(crate) fn restore_local_options(&mut self, mark: usize) {
+        if let Some(saved) = self.local_option_saves.get(mark).cloned() {
+            let options = crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO);
+            for (name, value) in saved {
+                if let Some(definition) = options.get(name) {
+                    definition.set(&mut self.options, value);
+                }
+            }
+        }
+        self.local_option_saves.truncate(mark);
+    }
+
+    /// Whether a trap handler is running.
+    pub fn running_trap_handler(&self) -> bool {
+        self.call_stack
+            .iter()
+            .any(|frame| frame.frame_type.is_trap_handler())
+    }
+
+    /// Sets the shell's name: `$0`, and the name its diagnostics start with, outside a script.
+    pub fn set_shell_name(&mut self, name: impl Into<String>) {
+        self.name = Some(name.into());
+    }
+
+    /// Sets `POSIXLY_CORRECT=y` while posix mode is on and unsets it when it goes off, as bash
+    /// does when `set -o posix` changes.
+    pub fn sync_posixly_correct(&mut self) -> Result<(), error::Error> {
+        if self.options.posix_mode {
+            self.env
+                .set_global("POSIXLY_CORRECT", crate::variables::ShellVariable::new("y"))?;
+        } else {
+            self.env.unset("POSIXLY_CORRECT")?;
+        }
+        Ok(())
+    }
+
+    /// The name diagnostics start with: the shell's name (`$0`), as bash uses -- except while
+    /// sourcing a file, where bash names the file being sourced instead, and in a function, where
+    /// it names the file the function came from (`environment` for one imported from the
+    /// environment). `source`/`.` does not itself change `$0` (see
+    /// [`Self::current_shell_name`]), but bash's own diagnostics from within a sourced file are
+    /// still that file's name, not `$0`.
+    pub fn diagnostic_name(&self) -> String {
+        // As bash's: `BASH_SOURCE[0]`, the source of the running function or script, else `$0`.
+        for frame in self.call_stack.iter() {
+            match &frame.frame_type {
+                crate::callstack::FrameType::Function(call)
+                    if !call.function.source().source.is_empty() =>
+                {
+                    return call.function.source().source.clone();
+                }
+                frame_type if frame_type.is_run_script() || frame_type.is_sourced_script() => {
+                    return frame_type.name().into_owned();
+                }
+                _ => (),
+            }
+        }
+        self.name.clone().unwrap_or_else(|| "bash".to_owned())
+    }
+
+    /// The prefix bash puts on a diagnostic: `NAME: line N: ` in a script or command string,
+    /// `NAME: ` in an interactive shell, where NAME is `$0`.
+    pub fn diagnostic_prefix(&self) -> String {
+        let name = self.diagnostic_name();
+        if self.options.interactive {
+            return format!("{name}: ");
+        }
+        format!("{name}: line {}: ", self.line_number())
+    }
+
+    /// The line the current command is on (`$LINENO`).
+    pub(crate) fn line_number(&self) -> usize {
+        self.call_stack
+            .current_frame()
+            .and_then(|frame| frame.current_line())
+            .unwrap_or(1)
+    }
 }
+
+/// A check of a prompt string's text before the shell expands it (see
+/// [`Shell::set_prompt_guard`]): `Err` holds the complete diagnostic to print.
+pub type PromptGuard = fn(&str) -> Result<(), String>;
 
 /// Snapshot of the state the last command left behind: `$?`, `PIPESTATUS`, and `$_`.
 ///
@@ -459,7 +890,7 @@ pub struct SavedCommandStatus {
 impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns the number of the logical process this shell runs as (`$$` for the main shell).
     pub fn own_pid(&self) -> crate::process_table::Pid {
-        self.own_pid.unwrap_or_else(|| self.processes.shell_pid())
+        self.own_pid.unwrap_or_else(|| self.shell_pid())
     }
 
     /// Returns whether or not this shell is a subshell.
@@ -504,7 +935,7 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 
     /// Returns a mutable reference to the shell's aliases.
     pub fn aliases_mut(&mut self) -> &mut HashMap<String, String> {
-        &mut self.aliases
+        std::sync::Arc::make_mut(&mut self.aliases)
     }
 
     /// Returns the shell's job manager.
@@ -595,6 +1026,11 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
         self.depth
     }
 
+    /// Returns `BASH_SUBSHELL`: how many subshells this one is nested in, as bash counts them.
+    pub fn subshell_level(&self) -> usize {
+        self.subshell_level
+    }
+
     /// Returns the call stack for the shell.
     pub fn call_stack(&self) -> &crate::callstack::CallStack {
         &self.call_stack
@@ -608,6 +1044,19 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns a mutable reference to the shell's history, if it exists.
     pub fn history_mut(&mut self) -> Option<&mut crate::history::History> {
         self.history.as_mut()
+    }
+
+    /// Returns a mutable reference to the shell's history, creating an empty one first if none
+    /// exists yet. The `history` *builtin* works on the list regardless of the `history` -o
+    /// option's state in real bash -- the option only gates automatic recording (each executed
+    /// command becoming an entry, which happens entirely in the interactive layer and is
+    /// unaffected by this): `history -s foo; history` prints the entry it just added under
+    /// `bash -c` even though `set -o history` there reports off. This is what gives the builtin
+    /// that same always-available list without flipping the option (and so without the
+    /// `SHELLOPTS`/`set -o`/`$-` divergence flipping it would cause).
+    pub fn history_or_init_mut(&mut self) -> &mut crate::history::History {
+        self.history
+            .get_or_insert_with(crate::history::History::default)
     }
 
     /// Returns the shell's official version string (if available).

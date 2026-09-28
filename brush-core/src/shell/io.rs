@@ -8,17 +8,19 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
     /// Returns a value that can be used to write to the shell's currently configured
     /// standard output stream using `write!` et al.
     pub fn stdout(&self) -> impl std::io::Write + 'static {
-        self.open_files.try_stdout().cloned().unwrap_or_else(|| {
-            ioutils::FailingReaderWriter::new("standard output not available").into()
-        })
+        self.open_files
+            .try_stdout()
+            .cloned()
+            .unwrap_or_else(|| ioutils::FailingReaderWriter::new("Bad file descriptor").into())
     }
 
     /// Returns a value that can be used to write to the shell's currently configured
     /// standard error stream using `write!` et al.
     pub fn stderr(&self) -> impl std::io::Write + 'static {
-        self.open_files.try_stderr().cloned().unwrap_or_else(|| {
-            ioutils::FailingReaderWriter::new("standard error not available").into()
-        })
+        self.open_files
+            .try_stderr()
+            .cloned()
+            .unwrap_or_else(|| ioutils::FailingReaderWriter::new("Bad file descriptor").into())
     }
 
     /// Outputs `set -x` style trace output for a command. Intentionally does not return
@@ -34,15 +36,24 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         params: &crate::interp::ExecutionParameters,
         command: S,
     ) {
-        // Expand the PS4 prompt variable to get our prefix.
-        let mut prefix = self
-            .as_mut()
-            .expand_prompt_var("PS4", "")
-            .await
-            .unwrap_or_default();
+        // Expand the PS4 prompt variable to get our prefix, with xtrace off as bash does, so the
+        // commands PS4 runs are not traced (each of which would expand PS4 again). A PS4 that
+        // cannot be expanded is reported and used as written, as in bash.
+        let xtrace = std::mem::replace(&mut self.options.print_commands_and_arguments, false);
+        let expanded = self.as_mut().expand_prompt_var("PS4", "").await;
+        self.options.print_commands_and_arguments = xtrace;
+        let mut prefix = match expanded {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                let _ = self.display_error(&mut params.stderr(self), &error);
+                self.env_str("PS4")
+                    .map(|ps4| ps4.into_owned())
+                    .unwrap_or_default()
+            }
+        };
 
         // Add additional depth-based prefixes using the first character of PS4.
-        let additional_depth = self.call_stack.script_source_depth() + self.depth;
+        let additional_depth = self.call_stack.script_source_depth() + self.trace_level;
         if let Some(c) = prefix.chars().next() {
             for _ in 0..additional_depth {
                 prefix.insert(0, c);
@@ -81,8 +92,12 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         err: &error::Error,
     ) -> Result<(), error::Error> {
         use crate::extensions::ErrorFormatter as _;
+        if err.is_reported() {
+            return Ok(());
+        }
         let str = self.error_formatter.format_error(err, self);
-        write!(file, "{str}")?;
+        // A name or value in the message holds the bytes it stands for (see `rawbytes`).
+        file.write_all(&crate::rawbytes::encode(&str))?;
 
         Ok(())
     }

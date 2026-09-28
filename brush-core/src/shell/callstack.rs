@@ -2,6 +2,22 @@
 
 use crate::{ExecutionParameters, callstack, env, error, functions, trace_categories};
 
+/// How many programs and lists may nest (see `Shell::nesting`). Each level costs up to about
+/// 2.3 KiB of Wasmtime's 512 KiB native stack, which the component cannot observe, so this count
+/// is what keeps that stack from running out; 160 leaves room for the commands the innermost
+/// list runs.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const MAX_NESTING: usize = 160;
+
+/// Shadow stack a function call leaves for everything below it: the deepest command it may run
+/// without calling further. Above [`STACK_RESERVE`], so a recursing function reports the function.
+#[cfg(target_arch = "wasm32")]
+const FUNCTION_STACK_RESERVE: usize = 320 * 1024;
+
+/// Shadow stack any nested execution leaves for the commands it runs (see `sys::wasm::stack`).
+#[cfg(target_arch = "wasm32")]
+pub(crate) const STACK_RESERVE: usize = 256 * 1024;
+
 #[cfg(any(target_arch = "wasm32", test))]
 type FrameCleanup<SE> = fn(&mut crate::Shell<SE>) -> Result<(), error::Error>;
 
@@ -90,8 +106,28 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
     /// Updates the shell's internal tracking state to reflect that command
     /// string mode is being started.
+    ///
+    /// A shell running a command string is a shell process of its own, as `bash -c` is: it is
+    /// in no subshell (`BASH_SUBSHELL` is 0), xtrace starts at PS4's own level, and an error
+    /// that ends it exits with `bash -c`'s status.
     pub fn start_command_string_mode(&mut self) {
-        self.call_stack.push_command_string();
+        let name = self.name.clone().unwrap_or_else(|| "bash".to_owned());
+        self.call_stack.push_command_string(&name);
+        self.process_depth = self.depth;
+        self.subshell_level = 0;
+        self.trace_level = 0;
+        self.exit_trace_level = 0;
+        self.paren_subshell = false;
+        self.stage_subshell = false;
+        self.no_fork = crate::interp::NoFork::default();
+    }
+
+    /// Marks the next program the shell runs as a command string that ends the shell, as
+    /// `bash -c` runs one. When its last command is a simple command naming a program, and
+    /// nothing (a trap, a redirection) needs the shell after it, bash runs the program in place
+    /// of the shell, as `exec` does: the program sees `SHLVL` one lower.
+    pub const fn exec_last_command(&mut self) {
+        self.exec_last = Some(crate::interp::CommandString::Script);
     }
 
     /// Updates the shell's internal tracking state to reflect that command
@@ -151,10 +187,30 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         args: impl IntoIterator<Item = String>,
         _params: &ExecutionParameters,
     ) -> Result<(), error::Error> {
-        if let Some(max_call_depth) = self.options.max_function_call_depth
-            && self.call_stack.function_call_depth() >= max_call_depth
+        // As bash: `FUNCNEST`, when a positive number, limits the nesting, and exceeding it ends
+        // a non-interactive shell.
+        let depth = self.call_stack.function_call_depth();
+        let funcnest = self
+            .env
+            .get_str("FUNCNEST", self)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0);
+        if let Some(max_call_depth) = funcnest.or(self.options.max_function_call_depth)
+            && depth >= max_call_depth
         {
-            return Err(error::ErrorKind::MaxFunctionCallDepthExceeded.into());
+            let kind = error::ErrorKind::MaxFunctionCallDepthExceeded(name.to_owned(), depth);
+            return Err(error::Error::from(kind).into_fatal());
+        }
+        // A call the stack cannot hold ends the shell the same way, rather than trapping.
+        // A few lists short of the limit, so a recursing function is reported by name before its
+        // body's compound commands reach it.
+        #[cfg(target_arch = "wasm32")]
+        if self.nesting + 8 >= MAX_NESTING
+            || crate::sys::wasm::stack::remaining() < FUNCTION_STACK_RESERVE
+        {
+            let kind = error::ErrorKind::FunctionNestingTooDeep(name.to_owned(), depth);
+            return Err(error::Error::from(kind).into_fatal());
         }
 
         if tracing::enabled!(target: trace_categories::FUNCTIONS, tracing::Level::DEBUG) {
@@ -218,21 +274,58 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         for frame in self.call_stack.iter_mut() {
             match frame.frame_type {
                 // Function calls always shadow positional parameters.
-                crate::callstack::FrameType::Function(..) => return &mut frame.args,
+                crate::callstack::FrameType::Function(..) => {
+                    return std::sync::Arc::make_mut(&mut frame.args);
+                }
                 // Executed scripts always shadow positional parameters.
-                _ if frame.frame_type.is_run_script() => return &mut frame.args,
+                _ if frame.frame_type.is_run_script() => {
+                    return std::sync::Arc::make_mut(&mut frame.args);
+                }
                 // Sourced scripts shadow positional parameters if they have arguments.
                 _ if frame.frame_type.is_sourced_script() && !frame.args.is_empty() => {
-                    return &mut frame.args;
+                    return std::sync::Arc::make_mut(&mut frame.args);
                 }
                 _ => (),
             }
         }
 
-        &mut self.args
+        std::sync::Arc::make_mut(&mut self.args)
     }
 }
 
 fn repeated_char_str(c: char, count: usize) -> String {
     (0..count).map(|_| c).collect()
+}
+
+#[cfg(test)]
+mod shared_state_tests {
+    use crate::Shell;
+
+    #[test]
+    fn a_clone_shares_positional_parameters_and_aliases_until_it_changes_them()
+    -> Result<(), crate::Error> {
+        let mut shell: Shell = Shell::new(crate::CreateOptions::default())?;
+        shell
+            .current_shell_args_mut()
+            .extend(["one".to_owned(), "two".to_owned()]);
+        shell.define_alias("g".into(), "echo parent".into());
+
+        // A subshell or a pipeline stage starts as a clone that copies neither.
+        let mut clone = shell.clone();
+        assert!(std::ptr::eq(
+            shell.current_shell_args().as_ptr(),
+            clone.current_shell_args().as_ptr()
+        ));
+        assert!(std::ptr::eq(shell.aliases(), clone.aliases()));
+
+        // Its changes stay its own.
+        clone.current_shell_args_mut().remove(0);
+        clone.define_alias("g".into(), "echo clone".into());
+        assert_eq!(shell.current_shell_args(), ["one", "two"]);
+        assert_eq!(clone.current_shell_args(), ["two"]);
+        let alias = |shell: &Shell| shell.aliases().get("g").cloned();
+        assert_eq!(alias(&shell).as_deref(), Some("echo parent"));
+        assert_eq!(alias(&clone).as_deref(), Some("echo clone"));
+        Ok(())
+    }
 }

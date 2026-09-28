@@ -105,7 +105,20 @@ pub(super) fn split_fields(ifs: &str, expansion: Expansion) -> Vec<WordField> {
                                     SplitState::AfterDelimiter
                                 }
                             }
-                            // The run's one hard delimiter: absorbed, nothing emitted.
+                            // The run's one hard delimiter: absorbed, nothing emitted. Bash
+                            // absorbs only the first byte of a multibyte one here, so its
+                            // other bytes begin the next field (see `rawbytes`).
+                            (SplitState::AfterWhitespace, false) if c.len_utf8() > 1 => {
+                                let mut buffer = [0; 4];
+                                let rest: String = c
+                                    .encode_utf8(&mut buffer)
+                                    .bytes()
+                                    .skip(1)
+                                    .map(crate::rawbytes::byte_char)
+                                    .collect();
+                                current_field.0.push(ExpansionPiece::Splittable(rest));
+                                SplitState::InField
+                            }
                             (SplitState::AfterWhitespace, false) => SplitState::AfterDelimiter,
                             // A second hard delimiter, or one at the very start: it
                             // closes a field that never got any content.
@@ -165,6 +178,25 @@ mod tests {
             .into_iter()
             .map(|field| field.0)
             .collect()
+    }
+
+    #[test]
+    fn multibyte_delimiter_after_whitespace_leaves_its_other_bytes() {
+        // Bash absorbs only the first byte of a multibyte delimiter that follows whitespace.
+        let rest = crate::rawbytes::decode(&[0xa9]).into_owned();
+        assert_eq!(
+            split(" é", vec![vec![s("a é b")]]),
+            vec![vec![s("a")], vec![s(&rest)], vec![s("b")]]
+        );
+        // Elsewhere it is one delimiter.
+        assert_eq!(
+            split(" é", vec![vec![s("aébéc")]]),
+            vec![vec![s("a")], vec![s("b")], vec![s("c")]]
+        );
+        assert_eq!(
+            split(" é", vec![vec![s(" éa")]]),
+            vec![vec![], vec![s("a")]]
+        );
     }
 
     #[test]

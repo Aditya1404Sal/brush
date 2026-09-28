@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use itertools::Itertools as _;
+
 use crate::options::RuntimeOptions;
 
 type OptionGetter = fn(shell: &RuntimeOptions) -> bool;
@@ -91,11 +93,13 @@ pub fn options(kind: ShellOptionKind) -> ShellOptionSet {
 }
 
 impl ShellOptionSet {
-    /// Returns an iterator over the options defined in this set.
+    /// Returns an iterator over the options defined in this set, sorted by name as bash lists
+    /// them.
     pub fn iter(&self) -> impl Iterator<Item = ShellOption> {
         self.inner
             .iter()
             .map(|(&name, definition)| ShellOption { name, definition })
+            .sorted_by_key(|option| option.name)
     }
 
     /// Returns the option with the given name, if it exists.
